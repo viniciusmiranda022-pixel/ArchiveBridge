@@ -4,6 +4,12 @@ Processo definido pela **seção 9 do runbook**: os ADRs abaixo são criados
 neste diretório e aprovados em pull request pelo gate indicado.
 **O código do produto só começa após a aprovação de ADR-0001 a ADR-0008.**
 
+> [!IMPORTANT]
+> **O merge de um ADR não equivale à aprovação da decisão.** O fechamento
+> de cada gate segue a [matriz de fechamento](gate-closure-matrix.md):
+> aprovador real, data, evidência/parecer e ressalvas registrados no ADR —
+> sem acúmulo automático de papéis e sem delegação informal.
+
 ## ADRs obrigatórios antes do código
 
 Todos redigidos com status **proposto**, fiéis ao runbook; a aprovação formal
@@ -37,7 +43,9 @@ cabe ao gate indicado (ver "Como criar um ADR", passo 4).
    consequências explícitas são devolvidas.
 3. Abra PR referenciando a linha correspondente da tabela acima e marque o
    gate de aprovação como revisor.
-4. Após o merge, atualize o status na tabela (`pendente` → `aprovado`,
-   com link).
+4. A mudança de status para `aprovado` só ocorre no PR que anexa a
+   evidência do gate, registrando no ADR: aprovador real, data,
+   evidência/parecer e eventuais condições — conforme a
+   [matriz de fechamento](gate-closure-matrix.md).
 5. ADR aprovado é imutável: mudanças exigem um novo ADR que o substitua
    (campo "Substitui / substituído por").
