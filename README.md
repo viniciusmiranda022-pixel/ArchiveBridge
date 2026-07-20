@@ -28,6 +28,7 @@ Confidencial — engenharia e segurança):
 | Conversor determinístico | [`tools/convert_runbook.py`](tools/convert_runbook.py) |
 | Testes da conversão | [`tests/test_runbook_conversion.py`](tests/test_runbook_conversion.py) |
 | Processo de decisão arquitetural | [`docs/adr/`](docs/adr/README.md) |
+| Exportação EV multiversão (revisão arquitetural) | [`docs/ev/`](docs/ev/README.md) |
 
 ## Estado do projeto
 
@@ -39,7 +40,10 @@ será executado exatamente uma vez, em repositório limpo, depois disso.
 Próximos passos:
 
 1. Ler os capítulos 1 a 5 do runbook e registrar dúvidas como ADR.
-2. Redigir e aprovar ADR-0001 a ADR-0008 (ver [`docs/adr/README.md`](docs/adr/README.md)).
+2. Aprovar os ADRs obrigatórios — conjunto emendado: **0001–0003,
+   0005–0008 e 0013** (o ADR-0004 foi substituído pelo ADR-0013 —
+   exportação EV multiversão; ver [`docs/adr/README.md`](docs/adr/README.md)
+   e [`docs/ev/`](docs/ev/README.md)).
 3. Executar o scaffolding da seção 10.1 e iniciar os épicos da Parte VI.
 
 ## Regenerando a documentação

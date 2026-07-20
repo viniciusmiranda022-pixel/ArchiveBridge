@@ -1,7 +1,16 @@
 # Plano de PoC — Aspose.Email como engine primária de PST (ADR-0004)
 
-- **Status do plano:** proposto (o plano não aprova o gate; apenas o
-  estrutura)
+> [!IMPORTANT]
+> **Arquivado (2026-07-20):** o ADR-0004 foi substituído pelo
+> [ADR-0013](0013-exportacao-ev-multiversao.md) — o Enterprise Vault
+> extrai e segmenta os PSTs na origem, e o Aspose saiu do caminho
+> crítico. Este plano deixa de estar no caminho crítico e é mantido como
+> registro; o pacote de execução (PR #4, fechado sem merge) permanece
+> recuperável em `refs/pull/4/head`. Reutilizável se a ingestão de PSTs
+> pré-existentes acima do hard limit (§17) exigir uma engine PST no
+> futuro (novo ADR).
+
+- **Status do plano:** arquivado (não está no caminho crítico)
 - **Gate atendido:** item 1 do gate do [ADR-0004](0004-aspose-email-engine-primaria.md)
   (PoC de biblioteca). Licença (item 2) e parecer jurídico (item 3) correm
   em paralelo e **não** são cobertos por este plano.

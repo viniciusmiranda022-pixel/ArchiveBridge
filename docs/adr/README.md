@@ -20,11 +20,13 @@ cabe ao gate indicado (ver "Como criar um ADR", passo 4).
 | [ADR-0001](0001-monolito-modular-e-workers-isolados.md) | Monólito modular + workers separados | arquiteto + tech lead | proposto |
 | [ADR-0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | .NET 10 LTS e política de atualização | segurança + plataforma | proposto |
 | [ADR-0003](0003-azure-sql-e-service-bus-premium.md) | Azure SQL + Service Bus Premium | arquitetura + FinOps | proposto |
-| [ADR-0004](0004-aspose-email-engine-primaria.md) | Aspose como writer/splitter primário | PoC de biblioteca, licença e jurídico | proposto (gate em aberto) |
+| [ADR-0004](0004-aspose-email-engine-primaria.md) | Aspose como writer/splitter primário | — | **substituído** pelo ADR-0013² |
 | [ADR-0005](0005-libpff-validador-independente.md) | libpff somente como verificador independente | compatibilidade e LGPL avaliadas | proposto |
 | [ADR-0006](0006-purview-adapter-ga-inicial.md) | Purview como adapter GA inicial | evidência oficial e teste em tenant controlado | proposto |
 | [ADR-0007](0007-graph-fts-bloqueado.md) | Graph FTS bloqueado | arquitetura + segurança¹ | proposto |
 | [ADR-0008](0008-isolamento-por-tenant-e-projeto.md) | Modelo de isolamento por tenant/projeto | segurança e DPO | proposto |
+
+| [ADR-0013](0013-exportacao-ev-multiversao.md) | Exportação EV multiversão por capability discovery | arquitetura + segurança | proposto |
 
 ¹ A tabela da seção 9 do runbook descreve o gate do ADR-0007 como
 "reavaliação quando archive/FTS estiverem suportados". Isso criaria um
@@ -32,6 +34,14 @@ deadlock (o scaffolding nunca começaria sem mudança da Microsoft). A
 correção de governança está na [matriz de fechamento](gate-closure-matrix.md):
 o que se aprova agora (Arquitetura + Segurança) é a decisão de **manter o
 bloqueio**; a disponibilidade futura é gatilho para novo ADR substituto.
+
+² Revisão arquitetural de 2026-07-20 (owner): o Enterprise Vault extrai e
+segmenta os PSTs na origem; o Aspose saiu do caminho crítico e o ADR-0004
+foi substituído pelo [ADR-0013](0013-exportacao-ev-multiversao.md) antes
+de aprovação. O conjunto obrigatório antes do código passa a ser
+**0001–0003, 0005–0008 e 0013** (a §9 do runbook v1.0 permanece com o
+texto original até revisão formal do DOCX; divergência registrada em
+[`docs/ev/README.md`](../ev/README.md)).
 
 ## ADRs subsequentes
 
