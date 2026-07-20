@@ -6,16 +6,19 @@ neste diretório e aprovados em pull request pelo gate indicado.
 
 ## ADRs obrigatórios antes do código
 
+Todos redigidos com status **proposto**, fiéis ao runbook; a aprovação formal
+cabe ao gate indicado (ver "Como criar um ADR", passo 4).
+
 | ADR | Decisão | Gate de aprovação | Status |
 | --- | --- | --- | --- |
-| ADR-0001 | Monólito modular + workers separados | arquiteto + tech lead | pendente |
-| ADR-0002 | .NET 10 LTS e política de atualização | segurança + plataforma | pendente |
-| ADR-0003 | Azure SQL + Service Bus Premium | arquitetura + FinOps | pendente |
-| ADR-0004 | Aspose como writer/splitter primário | PoC de biblioteca, licença e jurídico | pendente |
-| ADR-0005 | libpff somente como verificador independente | compatibilidade e LGPL avaliadas | pendente |
-| ADR-0006 | Purview como adapter GA inicial | evidência oficial e teste em tenant controlado | pendente |
-| ADR-0007 | Graph FTS bloqueado | reavaliação quando archive/FTS estiverem suportados | pendente |
-| ADR-0008 | Modelo de isolamento por tenant/projeto | segurança e DPO | pendente |
+| [ADR-0001](0001-monolito-modular-e-workers-isolados.md) | Monólito modular + workers separados | arquiteto + tech lead | proposto |
+| [ADR-0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | .NET 10 LTS e política de atualização | segurança + plataforma | proposto |
+| [ADR-0003](0003-azure-sql-e-service-bus-premium.md) | Azure SQL + Service Bus Premium | arquitetura + FinOps | proposto |
+| [ADR-0004](0004-aspose-email-engine-primaria.md) | Aspose como writer/splitter primário | PoC de biblioteca, licença e jurídico | proposto (gate em aberto) |
+| [ADR-0005](0005-libpff-validador-independente.md) | libpff somente como verificador independente | compatibilidade e LGPL avaliadas | proposto |
+| [ADR-0006](0006-purview-adapter-ga-inicial.md) | Purview como adapter GA inicial | evidência oficial e teste em tenant controlado | proposto |
+| [ADR-0007](0007-graph-fts-bloqueado.md) | Graph FTS bloqueado | reavaliação quando archive/FTS estiverem suportados | proposto |
+| [ADR-0008](0008-isolamento-por-tenant-e-projeto.md) | Modelo de isolamento por tenant/projeto | segurança e DPO | proposto |
 
 ## ADRs subsequentes
 
