@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runbook-conversion:
+    name: Testes de conversão do runbook
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Rodar os testes de conversão (stdlib, sem dependências)
+        run: python3 -m unittest tests.test_runbook_conversion -v
+
+      - name: Confirmar que docs/runbook está em dia com o conversor
+        run: |
+          python3 tools/convert_runbook.py
+          if ! git diff --quiet -- docs/runbook; then
+            echo "::error::docs/runbook diverge de tools/convert_runbook.py."
+            echo "Rode 'python3 tools/convert_runbook.py' e faça commit da saída."
+            git --no-pager diff --stat -- docs/runbook
+            exit 1
+          fi

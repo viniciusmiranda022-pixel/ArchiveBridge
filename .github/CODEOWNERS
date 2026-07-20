@@ -1,0 +1,7 @@
+# Revisão obrigatória do owner em todo o repositório.
+* @viniciusmiranda022-pixel
+
+# Documentos críticos de governança e segurança.
+/SECURITY.md @viniciusmiranda022-pixel
+/docs/adr/ @viniciusmiranda022-pixel
+/docs/source/ @viniciusmiranda022-pixel

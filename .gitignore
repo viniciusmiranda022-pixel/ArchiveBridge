@@ -1,0 +1,39 @@
+# Outlook e arquivos de correio
+*.pst
+*.ost
+*.nst
+
+# Segredos e material criptográfico
+*.sas
+*.pfx
+*.p12
+*.pem
+*.key
+.env
+.env.*
+
+# Dados e artefatos operacionais
+/landing/
+/work/
+/parts/
+/quarantine/
+/staging/
+/artifacts/
+
+# AzCopy
+.azcopy/
+**/azcopy*.log
+**/azcopy*.plan
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# .NET / Visual Studio
+.vs/
+bin/
+obj/
+TestResults/
+*.user
+*.suo
