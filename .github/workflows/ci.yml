@@ -22,8 +22,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Rodar os testes de conversão (stdlib, sem dependências)
-        run: python3 -m unittest tests.test_runbook_conversion -v
+      - name: Rodar todos os testes (stdlib, sem dependências)
+        run: python3 -m unittest discover -s tests -t . -v
 
       - name: Confirmar que docs/runbook está em dia com o conversor
         run: |

@@ -1,0 +1,8 @@
+# Artefatos da execução na VM descartável — jamais commitados.
+disposable/
+corpus/
+work/
+results/
+metrics/
+*.pst
+*.lic

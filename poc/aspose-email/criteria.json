@@ -1,0 +1,35 @@
+{
+  "$comment": "Critérios automáticos de PASS/FAIL da PoC Aspose (docs/adr/0004-poc-plan.md, seções 6-7). operationalWindowHours500Gb DEVE ser definido pelo responsável do gate antes da execução full; null bloqueia o veredito PASS da escala full.",
+  "operationalWindowHours500Gb": null,
+  "memory": {
+    "$comment": "Sem tendência proporcional ao tamanho do PST e sem crescimento contínuo. Slope medido por regressão linear sobre a série temporal de workingSetMb após o warmup.",
+    "warmupSeconds": 300,
+    "maxSustainedSlopeMbPerHour": 256,
+    "maxPeakMbPerInputGb": 64,
+    "absolutePeakFloorMb": 4096
+  },
+  "handles": {
+    "$comment": "Sem leak de handle/file descriptor.",
+    "warmupSeconds": 300,
+    "maxSustainedSlopePerHour": 50
+  },
+  "throughput": {
+    "$comment": "Throughput sustentado por janela fixa; degradação progressiva sem causa externa reprova.",
+    "windowSeconds": 300,
+    "maxLateDegradationPercent": 40,
+    "minWindowsRequired": 3
+  },
+  "split": {
+    "hardPartBytes": 21474836480,
+    "targetPartBytes": 19327352832
+  },
+  "cases": {
+    "$comment": "Cada CT emite results/<ct>-<caso>.json com status PASS|FAIL e detalhes. Todos os arquivos de resultado devem ser PASS.",
+    "required": ["ct1", "ct2", "ct3", "ct4", "ct5"]
+  },
+  "integrity": {
+    "$comment": "Original bit a bit intacto em todos os casos; sem duplicação lógica após retry.",
+    "originalHashMustMatch": true,
+    "retryMustNotDuplicate": true
+  }
+}
