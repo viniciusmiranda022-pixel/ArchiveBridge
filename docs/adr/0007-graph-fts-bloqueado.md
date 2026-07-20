@@ -2,9 +2,14 @@
 
 - **Status:** proposto
 - **Data:** 2026-07-20
-- **Gate de aprovação:** reavaliação quando archive/FTS estiverem suportados
+- **Gate de aprovação:** Arquitetura + Segurança
 - **Aprovadores:** _(pendente)_
 - **Substitui / substituído por:** —
+
+> O que este ADR aprova é a **decisão de manter o Graph FTS bloqueado no
+> primeiro release** — aprovável agora. A futura disponibilidade do Graph
+> FTS não é o gate deste ADR: é o **gatilho para um novo ADR substituto**
+> (condições da §28.3). A capability permanece `BLOCKED` até lá.
 
 ## Contexto
 
@@ -12,7 +17,9 @@ A [§28 Adapter Graph Mailbox Import/Export - trilha estratégica bloqueada](../
 
 ## Decisão
 
-O `GraphFtsTargetIngestor` é implementado como **adapter compilável, porém bloqueado**: o capability gate retorna `Blocked("GRAPH_FTS_ARCHIVE_NOT_APPROVED")` e o adapter **não é usado** para migração de PST. A habilitação só ocorre quando **todas** as condições da §28.3 forem verdadeiras (API v1.0 GA para o cenário/cloud, descoberta de archive documentada e testada, confirmação Microsoft de que FTS a partir de PST/EV é suportado, corpus de fidelidade + análise de segurança do codec FTS, throttling/custo conhecidos, Application Access Policy, consentimento aprovado, tratamento de redirect 308/409, pen-test e load test, e capability evidence aprovada pelo Change Advisory Board).
+O `GraphFtsTargetIngestor` é implementado como **adapter compilável, porém bloqueado**: o capability gate retorna `Blocked("GRAPH_FTS_ARCHIVE_NOT_APPROVED")` e o adapter **não é usado** para migração de PST no primeiro release. Esta é a decisão submetida à aprovação de Arquitetura + Segurança, com evidência = análise da documentação Microsoft confirmando que o cenário PST/FTS **não** está aprovado (§28.2).
+
+A habilitação futura da capability **não reabre este ADR**: exige um **novo ADR que o substitua**, criado quando **todas** as condições da §28.3 forem verdadeiras (API v1.0 GA para o cenário/cloud, descoberta de archive documentada e testada, confirmação Microsoft de que FTS a partir de PST/EV é suportado, corpus de fidelidade + análise de segurança do codec FTS, throttling/custo conhecidos, Application Access Policy, consentimento aprovado, tratamento de redirect 308/409, pen-test e load test, e capability evidence aprovada pelo Change Advisory Board).
 
 ## Alternativas consideradas
 
@@ -29,4 +36,4 @@ O `GraphFtsTargetIngestor` é implementado como **adapter compilável, porém bl
 
 ## Evidências
 
-Runbook [§28](../runbook/04-parte-iv-destinos-m365.md#28-adapter-graph-mailbox-importexport---trilha-estratégica-bloqueada), [§28.2](../runbook/04-parte-iv-destinos-m365.md#282-por-que-não-é-o-adapter-ga-do-pst), [§28.3](../runbook/04-parte-iv-destinos-m365.md#283-gate-de-habilitação), [§28.4](../runbook/04-parte-iv-destinos-m365.md#284-esqueleto-do-adapter-bloqueado). Referências oficiais: Graph mailbox import/export (concept e v1.0), handle archive mailbox redirects — Apêndice F. Confirmação do gate: reavaliação registrada em novo ADR quando as condições da §28.3 forem atendidas.
+Runbook [§28](../runbook/04-parte-iv-destinos-m365.md#28-adapter-graph-mailbox-importexport---trilha-estratégica-bloqueada), [§28.2](../runbook/04-parte-iv-destinos-m365.md#282-por-que-não-é-o-adapter-ga-do-pst), [§28.3](../runbook/04-parte-iv-destinos-m365.md#283-gate-de-habilitação), [§28.4](../runbook/04-parte-iv-destinos-m365.md#284-esqueleto-do-adapter-bloqueado). Referências oficiais: Graph mailbox import/export (concept e v1.0), handle archive mailbox redirects — Apêndice F. Confirmação do gate: parecer de Arquitetura + Segurança com a análise da documentação Microsoft confirmando que o cenário PST/FTS não está aprovado. Reavaliação futura: novo ADR substituto quando as condições da §28.3 forem atendidas.

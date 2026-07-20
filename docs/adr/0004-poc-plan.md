@@ -101,20 +101,48 @@ comportamento mapeável para os motivos de quarentena da §22.
 
 ## 5. Métricas registradas por caso
 
-- tempo total e por fase; throughput (itens/s e MB/s);
-- pico de memória do processo;
+- tempo total e por fase; throughput (itens/s e MB/s), incluindo
+  **throughput sustentado por janela fixa** (ex.: 5 min);
+- pico de memória do processo e **série temporal de memória** ao longo da
+  execução;
+- **contagem de handles/file descriptors** amostrada durante execuções
+  longas;
 - IOPS/padrão de acesso quando disponível;
 - contagens (pastas, itens por classe, não enumeráveis);
 - versão exata da engine, do runtime e do SO;
 - SHA-256 de entrada e de cada saída.
 
-Não há meta numérica de performance neste plano — os perfis da §46 servem
-de referência; a PoC **registra** os números para dimensionamento e o
-critério de aceite é funcional, não de velocidade, exceto o teto de
-memória: processar o PST de 100 GB não pode exigir carregar o arquivo
-inteiro em RAM.
+Metas numéricas definitivas de performance são fixadas após o primeiro
+benchmark (perfis da §46 como referência). A PoC **registra** os números
+para dimensionamento — mas fidelidade funcional sozinha não aprova o
+item 1: os critérios mínimos de viabilidade operacional da seção 6 também
+são eliminatórios. Uma biblioteca que abre e divide um PST de 500 GB e
+ainda assim leva dias, vaza memória ou exige intervenção manual é
+reprovada.
 
-## 6. Critérios de aceite do item 1 do gate
+## 6. Critérios mínimos de viabilidade operacional (eliminatórios)
+
+Registrados por caso e avaliados no relatório:
+
+1. **Memória sem tendência proporcional ao tamanho do PST** — pico e
+   série temporal de memória não podem crescer proporcionalmente ao
+   tamanho total do arquivo (streaming, não carga integral);
+2. **Sem crescimento contínuo de memória durante o split** — série
+   estabiliza; crescimento monotônico ao longo do CT-2 reprova;
+3. **Sem vazamento de handle/file descriptor** — contagem de handles
+   estável ao longo de execuções longas e entre partes;
+4. **Throughput sustentado por janela** — registrado em janelas fixas
+   (ex.: 5 min); degradação progressiva sem causa externa reprova;
+5. **PST de 500 GB dentro da janela operacional aprovada** — o CT-2 de
+   500 GB conclui dentro da janela definida pelo responsável do gate
+   antes da execução (registrada no relatório); estouro reprova;
+6. **Zero crash, hang ou intervenção manual** — em todos os casos, do
+   início ao fim, inclusive execuções de longa duração;
+7. **Reinício/retry seguro** — interromper e reexecutar não altera o
+   original (hash inalterado) e não produz duplicação lógica de itens
+   nas saídas aprovadas.
+
+## 7. Critérios de aceite do item 1 do gate
 
 O item 1 (PoC) fecha com `PASS` somente se **todos** os critérios abaixo
 forem verdadeiros:
@@ -125,14 +153,15 @@ forem verdadeiros:
 3. limites de 18 GiB/20 GB respeitados no split;
 4. anomalias falham de forma detectável e o original permanece intacto;
 5. resultados reproduzíveis (CT-4);
-6. relatório de evidência completo (seção 7) revisado pelo responsável do
+6. **todos os critérios de viabilidade operacional da seção 6 atendidos**;
+7. relatório de evidência completo (seção 8) revisado pelo responsável do
    gate registrado na [matriz de fechamento](gate-closure-matrix.md).
 
 Qualquer critério reprovado ⇒ resultado `FAIL`, com registro do defeito,
 versão testada e decisão subsequente (retestar nova versão da biblioteca ou
 avaliar SDK alternativo via novo ADR).
 
-## 7. Pacote de evidência
+## 8. Pacote de evidência
 
 - relatório PoC (`PASS`/`FAIL` por caso, com logs sanitizados);
 - script gerador do corpus + parâmetros + SHA-256 dos arquivos;
@@ -144,7 +173,7 @@ avaliar SDK alternativo via novo ADR).
 O pacote é anexado ao PR que fechar o gate do ADR-0004, junto com o
 contrato de licença (item 2) e o parecer jurídico (item 3).
 
-## 8. Fora de escopo
+## 9. Fora de escopo
 
 - Aprovar o gate (decisão do responsável registrado na matriz);
 - Licença definitiva e parecer jurídico (itens 2 e 3);

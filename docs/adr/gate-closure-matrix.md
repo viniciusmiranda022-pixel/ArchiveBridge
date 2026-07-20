@@ -28,7 +28,7 @@ Só então o `Status` do ADR muda de `proposto` para `aprovado` e a tabela de
 | [0004](0004-aspose-email-engine-primaria.md) | PoC + Licença + Jurídico | A definir | relatório de PoC ([plano](0004-poc-plan.md)), contrato e parecer | **bloqueado** |
 | [0005](0005-libpff-validador-independente.md) | Compatibilidade + LGPL | A definir | teste de compatibilidade e parecer jurídico | pendente |
 | [0006](0006-purview-adapter-ga-inicial.md) | Evidência Microsoft + tenant controlado | A definir | relatório de validação em tenant | pendente |
-| [0007](0007-graph-fts-bloqueado.md) | Reavaliação futura | A definir | capability evidence (condições da §28.3) | **bloqueado por design** |
+| [0007](0007-graph-fts-bloqueado.md) | Arquitetura + Segurança | A definir | análise da documentação Microsoft confirmando que o cenário PST/FTS não está aprovado | pendente |
 | [0008](0008-isolamento-por-tenant-e-projeto.md) | Segurança + DPO | A definir | threat model e avaliação de dados | pendente |
 
 Legenda de estado:
@@ -36,10 +36,18 @@ Legenda de estado:
 - **pendente** — aguarda o responsável exercer o gate e anexar evidência;
 - **bloqueado** — depende de artefatos externos ainda inexistentes
   (ADR-0004: relatório de PoC executado, contrato de licença, parecer
-  jurídico);
-- **bloqueado por design** — o próprio ADR determina que só será
-  reavaliado quando condições externas mudarem (ADR-0007: §28.3 do
-  runbook).
+  jurídico).
+
+### ADR-0007: decisão aprovável agora vs. capability bloqueada
+
+O que se aprova no ADR-0007 é a **decisão de manter o Graph FTS bloqueado
+e fora do primeiro release** — decisão aprovável hoje por Arquitetura +
+Segurança, com base na documentação Microsoft atual. A **capability**
+`GraphFtsArchiveImport` permanece `BLOCKED` (bloqueada por design). A
+futura disponibilidade do Graph FTS **não é o gate deste ADR**: é o
+gatilho para um **novo ADR substituto** (condições da §28.3). Assim, o
+fechamento dos oito gates — e o desbloqueio do scaffolding — não depende
+de mudança futura da Microsoft.
 
 ## Delegações formais
 
