@@ -24,6 +24,13 @@ ROOT = Path(__file__).resolve().parents[1]
 COMMITTED = ROOT / "docs" / "runbook"
 SOURCE = (ROOT / "docs" / "source" /
           "Runbook_Engenharia_Plataforma_Migracao_EV_PST_M365.docx")
+SOURCE_PDF = (ROOT / "docs" / "source" /
+              "Runbook_Engenharia_Plataforma_Migracao_EV_PST_M365.pdf")
+REPORT = COMMITTED / "conversion-report.md"
+
+# Arquivos de docs/runbook que NÃO são gerados pelo conversor e, portanto,
+# não aparecem na reconversão limpa.
+NON_GENERATED_FILES = {"conversion-report.md"}
 
 _spec = importlib.util.spec_from_file_location(
     "convert_runbook", ROOT / "tools" / "convert_runbook.py")
@@ -216,12 +223,10 @@ class TestMarkdownOutput(unittest.TestCase):
                          "numeração contínua quebrada")
 
     def test_tables_not_discarded(self):
-        gfm = sum(len(re.findall(r"^\|(?: --- \|)+ --- \|$|^\|( --- \|)+$",
-                                 text, re.M))
-                  for text in self.fx.md_files.values())
         gfm = 0
         html = 0
         for text in self.fx.md_files.values():
+            # linha separadora de cabeçalho GFM (| --- | --- |)
             gfm += len(re.findall(r"^\|(?:\s*---\s*\|)+\s*$", text, re.M))
             html += text.count("<table>")
         self.assertEqual(gfm + html, EXPECTED["tables"],
@@ -278,11 +283,37 @@ class TestReproducibility(unittest.TestCase):
                              f"docs/runbook/{rel} difere da reconversão — "
                              "rode tools/convert_runbook.py")
 
+    def test_no_obsolete_files_in_committed_runbook(self):
+        """docs/runbook não contém artefatos além dos gerados + report."""
+        fresh = {p.relative_to(self.fx.out).as_posix()
+                 for p in self.fx.out.rglob("*") if p.is_file()}
+        allowed = fresh | NON_GENERATED_FILES
+        committed = {p.relative_to(COMMITTED).as_posix()
+                     for p in COMMITTED.rglob("*") if p.is_file()}
+        extras = committed - allowed
+        self.assertEqual(extras, set(),
+                         f"arquivos obsoletos em docs/runbook: {sorted(extras)}"
+                         " — rode tools/convert_runbook.py e remova sobras")
+
     def test_manifest_source_hash_matches_docx(self):
         import hashlib
         self.assertEqual(
             self.fx.manifest["sourceSha256"],
             hashlib.sha256(SOURCE.read_bytes()).hexdigest())
+
+    def test_report_source_hashes_match_files(self):
+        """Os SHA-256 de DOCX e PDF no relatório batem com os arquivos."""
+        import hashlib
+        report = REPORT.read_text(encoding="utf-8")
+        hashes = dict(re.findall(
+            r"`([^`]+\.(?:docx|pdf))`\s*\|\s*`([0-9a-f]{64})`", report))
+        self.assertEqual(len(hashes), 2,
+                         "relatório deve listar SHA-256 de DOCX e PDF")
+        for name, declared in hashes.items():
+            path = SOURCE if name.endswith(".docx") else SOURCE_PDF
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(declared, actual,
+                             f"SHA-256 divergente para {name}")
 
 
 if __name__ == "__main__":

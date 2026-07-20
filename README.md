@@ -59,8 +59,13 @@ python3 -m unittest tests.test_runbook_conversion    # Linux/macOS
 py -3 -m unittest tests.test_runbook_conversion      # Windows
 ```
 
+Um workflow de CI (`.github/workflows/ci.yml`) roda esses testes
+automaticamente em cada push para `main` e em cada pull request, e falha se
+`docs/runbook/` divergir do conversor.
+
 ## Governança
 
 - Fluxo exclusivamente por pull request — ver [`CONTRIBUTING.md`](CONTRIBUTING.md).
 - Política de segurança e classificação — ver [`SECURITY.md`](SECURITY.md).
 - Revisão obrigatória por code owners — ver [`.github/CODEOWNERS`](.github/CODEOWNERS).
+- CI automático dos testes de conversão — ver [`.github/workflows/ci.yml`](.github/workflows/ci.yml).

@@ -40,6 +40,26 @@ referencia um único `numId` sem restart; a renderização oficial confirma a
 sequência atravessando capítulos (ex.: 1–5 no "Como usar", 36–45 na seção
 17.1, 196–215 no Apêndice F). O Markdown reproduz exatamente esses números.
 
+### Por que "parágrafos" tem dois números (1876 vs. 999)
+
+Uma varredura ingênua conta **1876** elementos `w:p` no DOCX, mas o
+conversor processa **999** parágrafos — a diferença não é perda de
+conteúdo, é o nível em que se conta:
+
+| Métrica | Valor | O que é |
+| --- | --- | --- |
+| Todos os `w:p` do documento | 1876 | Todo parágrafo, **inclusive os que vivem dentro das células de tabela** |
+| Parágrafos de primeiro nível (`w:body`) | 999 | Parágrafos filhos diretos do corpo — os body blocks do tipo parágrafo |
+| Parágrafos dentro de tabelas | 877 | Conteúdo das 27 tabelas (999 + 877 = 1876) |
+| Tabelas de primeiro nível (`w:tbl`) | 27 | Cada tabela é **um** body block; seus parágrafos internos são renderizados como células, não recontados |
+| **Body blocks processados** | **1026** | 999 parágrafos + 27 tabelas |
+
+O manifesto (`conversion-manifest.json`) e os testes operam sobre os 1026
+body blocks. Os 877 parágrafos de tabela são convertidos como células
+(GFM/HTML) dentro do bloco `table` correspondente, portanto aparecem na
+saída sem serem contados como blocos independentes — o que evitaria dupla
+contagem.
+
 ## Exceções e elementos não representáveis
 
 | Elemento | Tratamento |
