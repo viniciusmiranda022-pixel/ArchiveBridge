@@ -33,10 +33,11 @@ documento.
 
 O produto é instalado e operado **dentro da infraestrutura do cliente**:
 banco, aplicação, workers, logs, segredos, storage e backups permanecem no
-ambiente do cliente. O **Microsoft 365 / Exchange Online** continua sendo
-**externo**, pois é o **destino** da migração — alcançado apenas por
-**HTTPS de saída (443)**. Não há Control Plane SaaS; não há dependência
-obrigatória de Azure SQL, Service Bus, Blob Storage ou Key Vault.
+ambiente do cliente. O **Microsoft 365** continua sendo **externo**, pois é
+o **destino** da migração — alcançado por **HTTPS 443 de saída** aos
+endpoints Microsoft exigidos pelo adapter de destino (ver "Conectividade e
+fluxos"). Não há Control Plane SaaS; não há **assinatura Azure nem serviço
+PaaS provisionado e administrado pelo cliente**.
 
 ```text
 ┌──────────────────────────────────────────────┐
@@ -74,12 +75,40 @@ obrigatória de Azure SQL, Service Bus, Blob Storage ou Key Vault.
 - fila durável inicialmente implementada no SQL Server;
 - workers como Windows Services;
 - storage local, NAS ou SMB para PSTs e evidências;
-- nenhuma dependência obrigatória de Azure SQL, Service Bus, Blob Storage
-  ou Key Vault;
-- apenas comunicação HTTPS de saída para o Microsoft 365;
+- **nenhuma dependência obrigatória de assinatura Azure ou serviço PaaS
+  provisionado e administrado pelo cliente** (Azure SQL, Service Bus, Key
+  Vault etc.); adapters Microsoft **poderão utilizar infraestrutura
+  temporária fornecida pelo próprio serviço de destino** (ex.: o Azure
+  Storage temporário do Purview, acessado por URL SAS — sem exigir
+  assinatura Azure do cliente);
+- **nenhuma porta de entrada publicada na internet**; conectividade externa
+  somente por **HTTPS 443 de saída** aos endpoints Microsoft exigidos pelo
+  adapter (ver "Conectividade e fluxos");
 - Azure e brokers externos poderão existir futuramente **apenas como
   adapters opcionais**;
 - não criar scaffolding ou código antes da aprovação deste ADR revisado.
+
+## Conectividade e fluxos
+
+**Regra:** o ArchiveBridge **não publica portas de entrada vindas da
+internet**. A única conectividade externa é **HTTPS 443 de saída** para os
+endpoints Microsoft requeridos pelo adapter de destino, incluindo:
+
+- **Microsoft Entra ID** (autenticação/token, quando aplicável);
+- **Exchange Online**;
+- **Microsoft Graph**;
+- **Microsoft Purview**;
+- o **Azure Storage temporário fornecido pela Microsoft** para importação
+  de PST (upload via **AzCopy** para área temporária, autenticado por **URL
+  SAS**) — **não** exige assinatura Azure do cliente; é infraestrutura do
+  próprio serviço de destino.
+
+**Comunicação interna** (dentro da infra do cliente) é restrita por
+**allowlist** e documentada em uma **matriz de fluxos e portas**, cobrindo:
+worker ↔ Enterprise Vault; Control Plane ↔ SQL Server; workers ↔ SQL
+Server; workers ↔ NAS/SMB; navegadores internos ↔ Portal; autenticação com
+AD local ou Entra ID; adapters ↔ endpoints Microsoft necessários. A matriz
+de fluxos/portas é entregue com a implantação (não neste ADR).
 
 ## Componentes on-premises
 
@@ -135,6 +164,17 @@ essa abordagem é mais simples, barata e operável. Um **broker local poderá
 ser adicionado futuramente como adapter opcional**, caso os testes
 demonstrem que o SQL Server virou gargalo — **não** é requisito inicial.
 
+> **Contrato de correção da fila.** Como o broker foi retirado, a garantia
+> contra dupla execução, job preso, dupla importação, lease expirado,
+> starvation, crescimento de Inbox/Outbox/DLQ e inconsistência em failover é
+> responsabilidade do produto e está especificada em
+> [`evidence/0003-parecer-fila-sql-onprem.md`](evidence/0003-parecer-fila-sql-onprem.md)
+> (aquisição atômica; lease/heartbeat/recuperação; idempotência/dedup;
+> Outbox/Inbox; retry/backoff/DLQ; retenção; failover; teste de
+> concorrência multi-worker; critério objetivo para broker opcional). Nota:
+> DPAPI por máquina só serve ao **perfil de nó único**; HA exige mecanismo
+> de segredos multi-nó.
+
 ## Perfis de implantação
 
 | Perfil | Composição | Uso |
@@ -151,9 +191,11 @@ Contas de serviço/gMSA; mínimo privilégio; TLS interno; certificados do
 cliente; BitLocker nos workers; ACL exclusiva nos diretórios de staging;
 WDAC/App Control; Defender ou EDR corporativo; bloqueio de execução nos
 diretórios de dados; **nenhuma porta de entrada vinda da internet**;
-somente saída HTTPS para Microsoft 365; rotação de certificados; **logs sem
-assunto ou corpo de e-mail**; limpeza segura do staging após retenção;
-backup e DR sob controle do cliente.
+somente saída HTTPS 443 aos endpoints Microsoft exigidos pelo adapter
+(Entra ID, Exchange Online, Graph, Purview e o Azure Storage temporário da
+Microsoft); rotação de certificados; **logs sem assunto ou corpo de
+e-mail**; limpeza segura do staging após retenção; backup e DR sob controle
+do cliente.
 
 ## Alternativas consideradas
 
