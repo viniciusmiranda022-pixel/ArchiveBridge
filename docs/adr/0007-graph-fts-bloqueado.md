@@ -1,10 +1,33 @@
 # ADR-0007 — Graph Mailbox Import/Export como adapter condicional; rota PST/EV → FTS não habilitada no release inicial
 
-- **Status:** proposto _(evidência anexada; aguardando revisão do Decision Owner)_
-- **Data:** 2026-07-20
+- **Status:** aceito pelo Decision Owner em 2026-07-21; vigência no
+  repositório a partir do merge do PR #9.
+- **Data:** 2026-07-20 (proposto) · 2026-07-21 (aceito pelo Decision Owner)
 - **Gate de aprovação:** Decision Owner + revisão Segurança/Arquitetura
-- **Aprovadores:** _(pendente)_
 - **Substitui / substituído por:** —
+
+## Registro de aceitação
+
+- **Decision Owner:** Vinicius Miranda — **decisão de aceitação em
+  2026-07-21**, após revisão da evidência ao longo de sucessivas iterações.
+  **Vigência/publicação no repositório:** a partir do **merge do PR #9**.
+- **Fluxo de fechamento (dois PRs):** a evidência foi anexada e mergeada
+  pelo **PR #8** (ADR então `proposto`); o **flip para `aceito`** ocorre
+  neste **PR #9** — modalidade de PR de aceite separado prevista na
+  [matriz](gate-closure-matrix.md), com a evidência já no `main`.
+- **Revisão executada (Segurança/Arquitetura):** análise documental
+  revalidada em 2026-07-21 em
+  [`evidence/0007-evidencia-microsoft-bloqueio.md`](evidence/0007-evidencia-microsoft-bloqueio.md)
+  — a análise que sustenta a decisão. Não havendo revisor distinto, a
+  competência é exercida/aceita pelo Decision Owner (exceção de bootstrap na
+  [matriz](gate-closure-matrix.md)).
+- **Evidence Owner:** Engenharia ArchiveBridge.
+- **Escopo aceito:** o Graph permanece **adapter condicional**
+  (`GraphFtsTargetAdapter`, `CONDITIONAL`); **apenas** a rota
+  PST/EV → FTS → Graph fica em `GraphFtsImportFromPstEv =
+  BLOCKED_PENDING_EVIDENCE`. **Não** é bloqueio global do Graph. A promoção
+  futura segue o ciclo definido (config versionada + capability evidence);
+  novo ADR só se mudar contrato, segurança ou arquitetura.
 
 > **Escopo do bloqueio.** O Graph Mailbox Import/Export **não** é removido
 > nem bloqueado globalmente como destino: permanece um **adapter
@@ -30,21 +53,6 @@ Graph Mailbox Import/Export
 Essa rota permanece **não habilitada no primeiro release** por ausência de
 caminho Microsoft documentado (nas fontes analisadas) e de certificação
 interna de fidelidade, escala, idempotência, segurança e operação.
-
-## Evidência anexada (aguardando aceitação)
-
-- **Evidência:** análise documental revalidada em 2026-07-21 em
-  [`evidence/0007-evidencia-microsoft-bloqueio.md`](evidence/0007-evidencia-microsoft-bloqueio.md),
-  produzida pela engenharia (Evidence Owner: Engenharia ArchiveBridge).
-- **Conclusão da evidência:** o Graph Mailbox Import/Export é v1.0 válido; o
-  bloqueio é mantido **especificamente** para a rota PST/EV → FTS → Graph,
-  porque a importação exige FTS e **não foi identificado, nas fontes
-  Microsoft analisadas**, um caminho documentado para produzir FTS a partir
-  de PST/EV. O suporte a archives tem divergência documental a validar em
-  tenant (não declarado como consolidado).
-- **Status:** o Decision Owner (Vinicius Miranda) **ainda revisará** a
-  evidência antes da aceitação formal; o status **não** foi alterado para
-  `aceito`.
 
 ## Contexto
 

@@ -30,8 +30,18 @@ Ao fechar um gate, o ADR correspondente deve registrar:
 4. **Condições e ressalvas**, se houver.
 
 Só então o `Status` do ADR muda de `proposto` para `aceito` e a tabela de
-`README.md` é atualizada — no mesmo PR que anexa a evidência. **Nenhum ADR
-tem o status alterado nesta matriz.**
+`README.md` é atualizada. **Nenhum ADR tem o status alterado nesta matriz.**
+
+**Onde ocorre o flip de status.** O padrão é fazê-lo **no mesmo PR que
+anexa a evidência**. Admite-se, porém, um **PR de aceite separado** quando
+a evidência **já está no `main`** (anexada por um PR anterior) e o Decision
+Owner autoriza a aceitação em momento posterior — refletindo o fluxo real
+*evidência → revisão → aceite*. Nesse caso, o PR de aceite **deve
+referenciar explicitamente** a evidência já mergeada e o registro de
+aceitação no ADR aponta os dois PRs (o que anexou a evidência e o que fez o
+flip). Um gate só conta para o desbloqueio do scaffolding quando **evidência
+registrada + status `aceito`** coexistem no `main`, independentemente de
+terem entrado em um ou dois PRs.
 
 ## Matriz
 
@@ -43,7 +53,7 @@ tem o status alterado nesta matriz.**
 | [0004](0004-aspose-email-engine-primaria.md) | — | — | — | — | **substituído** pelo [ADR-0013](0013-exportacao-ev-multiversao.md) em 2026-07-20, antes de aprovação |
 | [0005](0005-libpff-validador-independente.md) | Vinicius Miranda | Jurídico | análise de compatibilidade e licença LGPL | a atribuir | proposto |
 | [0006](0006-purview-adapter-ga-inicial.md) | Vinicius Miranda | responsável técnico pelo tenant | relatório de validação do Purview | a atribuir | proposto |
-| [0007](0007-graph-fts-bloqueado.md) | Vinicius Miranda | Segurança/Arquitetura | evidência do bloqueio PST/EV → Graph — [evidência](evidence/0007-evidencia-microsoft-bloqueio.md) (anexada, revalidada 2026-07-21) | Engenharia | proposto (evidência em revisão) |
+| [0007](0007-graph-fts-bloqueado.md) | Vinicius Miranda | Segurança/Arquitetura | evidência da rota PST/EV → FTS → Graph — `GraphFtsImportFromPstEv = BLOCKED_PENDING_EVIDENCE` (Graph permanece adapter condicional; sem bloqueio global) — [evidência](evidence/0007-evidencia-microsoft-bloqueio.md) | Engenharia | **aceito** pelo Decision Owner em 2026-07-21 (vigência no merge do PR #9) |
 | [0008](0008-isolamento-por-tenant-e-projeto.md) | Vinicius Miranda | Segurança/Privacidade | threat model e avaliação de dados | a atribuir | proposto |
 | [0013](0013-exportacao-ev-multiversao.md) | Vinicius Miranda | Dev + Segurança | revisão técnica do capability discovery e dos adapters | a atribuir | proposto |
 

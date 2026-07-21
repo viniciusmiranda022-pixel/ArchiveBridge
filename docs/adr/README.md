@@ -28,7 +28,7 @@ Miranda.
 | [ADR-0004](0004-aspose-email-engine-primaria.md) | Aspose como writer/splitter primário | — | **substituído** pelo ADR-0013² |
 | [ADR-0005](0005-libpff-validador-independente.md) | libpff somente como verificador independente | Jurídico | proposto |
 | [ADR-0006](0006-purview-adapter-ga-inicial.md) | Purview como adapter GA inicial | responsável técnico pelo tenant | proposto |
-| [ADR-0007](0007-graph-fts-bloqueado.md) | Graph como adapter condicional; rota PST/EV → FTS não habilitada | Segurança/Arquitetura¹ | proposto (evidência anexada) |
+| [ADR-0007](0007-graph-fts-bloqueado.md) | Graph como adapter condicional; rota PST/EV → FTS não habilitada | Segurança/Arquitetura¹ | **aceito** |
 | [ADR-0008](0008-isolamento-por-tenant-e-projeto.md) | Modelo de isolamento por tenant/projeto | Segurança/Privacidade | proposto |
 | [ADR-0013](0013-exportacao-ev-multiversao.md) | Exportação EV multiversão por capability discovery | Dev + Segurança | proposto |
 
@@ -64,9 +64,11 @@ texto original até revisão formal do DOCX; divergência registrada em
    consequências explícitas são devolvidas.
 3. Abra PR referenciando a linha correspondente da tabela acima e indique
    os revisores necessários (competência específica, quando o tema exigir).
-4. A mudança de status para `aceito` só ocorre no PR que anexa a evidência
-   do gate, registrando no ADR: Decision Owner e data, revisores e
-   pareceres, evidência e o Evidence Owner que a produziu, e eventuais
-   condições — conforme a [matriz de fechamento](gate-closure-matrix.md).
+4. A mudança de status para `aceito` registra no ADR: Decision Owner e
+   data, revisores e pareceres, evidência e o Evidence Owner que a produziu,
+   e eventuais condições. O flip ocorre **no mesmo PR que anexa a
+   evidência** ou, quando a evidência **já está no `main`**, em um **PR de
+   aceite separado** que a referencie explicitamente — conforme a
+   [matriz de fechamento](gate-closure-matrix.md).
 5. ADR aceito é imutável: mudanças exigem um novo ADR que o substitua
    (campo "Substitui / substituído por").
