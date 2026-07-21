@@ -1,20 +1,22 @@
 # ADR-0007 — Graph Mailbox Import/Export como adapter condicional; rota PST/EV → FTS não habilitada no release inicial
 
-- **Status:** aceito _(efetivado no merge deste PR pelo Decision Owner)_
-- **Data:** 2026-07-20 (proposto) · 2026-07-21 (aceito)
+- **Status:** aceito pelo Decision Owner em 2026-07-20 (proposto) ·
+  2026-07-21 (aceito); vigência no repositório a partir do merge do PR #9.
+- **Data:** 2026-07-20 (proposto) · 2026-07-21 (decisão do Decision Owner)
 - **Gate de aprovação:** Decision Owner + revisão Segurança/Arquitetura
 - **Substitui / substituído por:** —
 
 ## Registro de aceitação
 
-- **Decision Owner:** Vinicius Miranda — aceitação formal efetivada com o
-  merge do PR que faz o flip de status (data: 2026-07-21), após revisão da
-  evidência ao longo de sucessivas iterações.
-- **Revisão necessária (Segurança/Arquitetura):** análise documental
+- **Decision Owner:** Vinicius Miranda — **decisão de aceitação em
+  2026-07-21**, após revisão da evidência ao longo de sucessivas iterações.
+  **Vigência/publicação no repositório:** a partir do **merge do PR #9**.
+- **Revisão executada (Segurança/Arquitetura):** análise documental
   revalidada em 2026-07-21 em
-  [`evidence/0007-evidencia-microsoft-bloqueio.md`](evidence/0007-evidencia-microsoft-bloqueio.md).
-  Não havendo revisor distinto, a competência é exercida/aceita pelo
-  Decision Owner (exceção de bootstrap na [matriz](gate-closure-matrix.md)).
+  [`evidence/0007-evidencia-microsoft-bloqueio.md`](evidence/0007-evidencia-microsoft-bloqueio.md)
+  — a análise que sustenta a decisão. Não havendo revisor distinto, a
+  competência é exercida/aceita pelo Decision Owner (exceção de bootstrap na
+  [matriz](gate-closure-matrix.md)).
 - **Evidence Owner:** Engenharia ArchiveBridge.
 - **Escopo aceito:** o Graph permanece **adapter condicional**
   (`GraphFtsTargetAdapter`, `CONDITIONAL`); **apenas** a rota
