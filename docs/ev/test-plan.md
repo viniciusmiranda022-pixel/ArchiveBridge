@@ -28,7 +28,7 @@ Outlook quando a família exigir; corpus de archives sintético versionado
 | T2 | Ausência de cmdlets (snap-in removido) | capability `UNSUPPORTED`; seleção cai para legado/assistido; `EV_ADAPTER_UNRESOLVED` quando aplicável |
 | T3 | Exportação de archive pequeno | PSTs Unicode segmentados; contagens = relatório; SHA-256 e vínculo ao archive |
 | T4 | Exportação de archive grande (múltiplas partes) | todas as partes ≤ tamanho-alvo; soma de itens = relatório; nenhuma parte corrompida |
-| T5 | Segmentação dos PSTs | limites de `-MaxPSTSizeMB` respeitados (500–51200; default 18432) |
+| T5 | Segmentação dos PSTs | `DetectedMin/MaxPstSizeMb` medidos no build; `ArchiveBridgeOperationalTargetMb` (18432) validado dentro do intervalo detectado; configuração fora do intervalo é **rejeitada**; partes respeitam o alvo | 
 | T6 | Falha parcial (interrupção do serviço EV no meio) | estado consistente; partes incompletas marcadas, nunca aprovadas |
 | T7 | Retry após falha | conclui sem duplicar o conjunto aprovado; `retryDuplicates == 0` |
 | T8 | Interrupção do worker/conector | retomada segura; nenhuma exportação duplicada (idempotência por `ExportRequestId`) |

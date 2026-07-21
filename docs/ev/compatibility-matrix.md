@@ -17,12 +17,19 @@ certificação do adapter correspondente.
 
 ## Matriz
 
-| Versão EV | Adapter | Nível de automação | Funcionalidades suportadas | Limitações conhecidas | Status |
+Para linhas em `planejado`, as colunas **Adapter** e **Funcionalidades** são
+**candidatura/previsão**, não garantia: a família apenas habilita a
+avaliação do adapter, e o uso efetivo depende do capability discovery
+(presença real das capabilities obrigatórias) e da certificação do build.
+**Nenhuma versão é suportada pela string de versão.** As famílias 12.1–15.x
+são **candidatas** ao adapter PowerShell nativo.
+
+| Versão EV | Adapter | Nível de automação | Funcionalidades previstas (sujeitas a discovery + certificação) | Limitações conhecidas | Status |
 | --- | --- | --- | --- | --- | --- |
-| 15.x | EV PowerShell Adapter | total (automatizado) | inventário `Get-EVArchive`; exportação `Export-EVArchive` Unicode segmentada (`-MaxPSTSizeMB` 500–51200); retry nativo; relatório | a validar em laboratório por build | **planejado** |
-| 14.x | EV PowerShell Adapter | total (automatizado) | idem 15.x | a validar em laboratório por build | **planejado** |
-| 13.x | EV PowerShell Adapter | total (automatizado) | idem 15.x | a validar em laboratório por build | **planejado** |
-| 12.1–12.x (≥12.1) | EV PowerShell Adapter | total (automatizado) | idem 15.x | a validar em laboratório por build | **planejado** |
+| 15.x | EV PowerShell Adapter (candidato) | total previsto | inventário `Get-EVArchive`; exportação `Export-EVArchive` Unicode segmentada (tamanho-alvo `ArchiveBridgeOperationalTargetMb`, validado contra `DetectedMin/MaxPstSizeMb`); retry nativo; relatório — **cada item sujeito a detecção** | snap-in/cmdlet/parâmetro/permissão/Outlook podem variar por build | **planejado** |
+| 14.x | EV PowerShell Adapter (candidato) | total previsto | idem 15.x | idem 15.x | **planejado** |
+| 13.x | EV PowerShell Adapter (candidato) | total previsto | idem 15.x | idem 15.x | **planejado** |
+| 12.1–12.x (≥12.1) | EV PowerShell Adapter (candidato) | total previsto | idem 15.x | idem 15.x | **planejado** |
 | 12.0 | EV Legacy Script Adapter (família 12.0) | parcial (script certificado) | inventário e exportação conforme capacidades da família; segmentação a validar | conjunto de cmdlets/relatório difere; requer implementação própria | **planejado** |
 | 11.x | EV Legacy Script Adapter (família 11.x) | parcial (script certificado) | a definir em laboratório | exportação PowerShell limitada/ausente; possíveis dependências de Outlook | **planejado** |
 | 10.x | EV Legacy Script Adapter (família 10.x) | parcial (script certificado) | a definir em laboratório | idem 11.x, superfícies mais antigas | **planejado** |

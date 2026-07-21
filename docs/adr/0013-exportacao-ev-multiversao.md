@@ -7,6 +7,13 @@
 - **Substitui / substituído por:** substitui o [ADR-0004](0004-aspose-email-engine-primaria.md)
   (Aspose como writer/splitter primário)
 
+> **Numeração:** os números **0009–0012 estão formalmente reservados** na
+> tabela "ADRs subsequentes" do [`README.md`](README.md) (fingerprint por
+> item, assinatura de evidência/WORM, portal, DR — espelhando a seção 9 do
+> runbook). Este ADR toma o **próximo número livre após o bloco
+> reservado**, 0013 — sem lacuna sem justificativa. Não substitui nenhum
+> dos 0009–0012, que seguem reservados aos seus temas.
+
 ## Contexto
 
 O runbook já usa a automação PowerShell oficial do EV no caminho de
@@ -31,10 +38,11 @@ Plane não deve empurrar scripts arbitrários para o ambiente do cliente
 Consequências estruturais:
 
 1. **O Enterprise Vault é o responsável por extrair e segmentar os PSTs**
-   (Unicode, tamanho configurável via `-MaxPSTSizeMB`, default 18432 MB
-   conforme §16.3). O Aspose sai do caminho crítico; o ADR-0004 fica
-   **substituído** sem aprovação e a PoC correspondente sai do caminho
-   crítico (PR #4 fechado sem merge; conteúdo recuperável em
+   (Unicode, tamanho-alvo definido pela **política do ArchiveBridge** e
+   validado contra os limites **detectados** no ambiente — ver "Política
+   de tamanho de PST" abaixo). O Aspose sai do caminho crítico; o
+   ADR-0004 fica **substituído** sem aprovação e a PoC correspondente sai
+   do caminho crítico (PR #4 fechado sem merge; conteúdo recuperável em
    `refs/pull/4/head`).
 2. **Capability discovery é obrigatório** antes de qualquer seleção de
    adapter: nenhum adapter é escolhido apenas pelo número de versão
@@ -51,6 +59,13 @@ Consequências estruturais:
    após laboratório, testes e certificação do adapter por família de
    versão ([matriz](../ev/compatibility-matrix.md)). Ambiente sem adapter
    certificado opera em modo assistido ou é bloqueado (fail closed).
+6. **Versão é candidatura, não suporte**: nenhuma família é considerada
+   suportada pela string de versão. EV 12.1–15.x é a **família candidata**
+   ao adapter PowerShell nativo, **sujeita à detecção das capabilities
+   obrigatórias e à certificação do build** — protege contra snap-in
+   ausente, cmdlet indisponível, parâmetros diferentes, permissões
+   insuficientes, comportamento alterado por build e pré-requisito de
+   Outlook não atendido.
 
 ### Fluxo
 
@@ -60,7 +75,8 @@ ArchiveBridge Control Plane
 EV Capability Discovery
         ↓
 Seleção do adapter
-        ├── EV PowerShell Adapter        (EV 12.1–15.x, Export-EVArchive)
+        ├── EV PowerShell Adapter        (família candidata EV 12.1–15.x;
+        │                                  requer capabilities + build certificado)
         ├── EV Legacy Script Adapter     (famílias 10.x/11.x/12.0, por versão)
         └── Assisted Export Adapter      (sem adapter certificado)
         ↓
@@ -68,6 +84,26 @@ Exportação segmentada em PST Unicode
         ↓
 Validação, hash e upload para o Microsoft 365
 ```
+
+### Política de tamanho de PST
+
+O tamanho de segmento **não** é presumido do EV. O capability discovery
+detecta o intervalo realmente aceito no ambiente e a política do
+ArchiveBridge define o alvo, validado contra esse intervalo:
+
+| Termo | Origem | Valor |
+| --- | --- | --- |
+| `DetectedMinPstSizeMb` / `DetectedMaxPstSizeMb` | **detectado** pelo capability discovery no ambiente EV (build específico) | varia por ambiente |
+| `ArchiveBridgeOperationalTargetMb` | **política do ArchiveBridge** (margem de segurança) | `18432` |
+| `MicrosoftHardPolicyBytes` | limite duro do destino M365/Purview (referência que decidimos considerar) | `20480 MB` (20 GB) |
+
+Regras: `18432` é o **alvo operacional do produto**, escolhido para ficar
+abaixo de `MicrosoftHardPolicyBytes` com margem — **não** é um default
+nativo do EV nem uma capacidade presumida. O produto **rejeita a
+configuração** se `ArchiveBridgeOperationalTargetMb` não estiver dentro de
+`[DetectedMinPstSizeMb, DetectedMaxPstSizeMb]`; nesse caso, ajusta-se o
+alvo dentro do intervalo detectado (respeitando o limite do destino) ou o
+ambiente cai para modo assistido/bloqueio.
 
 ## Alternativas consideradas
 
@@ -112,7 +148,9 @@ Validação, hash e upload para o Microsoft 365
 
 Runbook [§15](../runbook/03-parte-iii-conectores-e-engine-pst.md#15-conector-de-origem-desenho-seguro),
 [§16](../runbook/03-parte-iii-conectores-e-engine-pst.md#16-inventário-e-exportação-do-enterprise-vault)
-(inclui `Export-EVArchive -MaxPSTSizeMB` 500–51200, default 18432 MB);
+(§16.3 documenta `-MaxPSTSizeMB` no intervalo 500–51200 para a versão
+coberta — o discovery detecta o intervalo real por ambiente; `18432` é o
+alvo operacional do ArchiveBridge, não um default do EV);
 referência oficial Veritas — Apêndice F. Divergência com §18.1/§20.3
 registrada em [`docs/ev/README.md`](../ev/README.md) (o DOCX v1.0
 permanece fonte da conversão até revisão formal do documento).

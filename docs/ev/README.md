@@ -13,7 +13,8 @@ ArchiveBridge Control Plane
 EV Capability Discovery
         ↓
 Seleção do adapter
-        ├── EV PowerShell Adapter        (EV 12.1–15.x, Export-EVArchive)
+        ├── EV PowerShell Adapter        (família candidata 12.1–15.x;
+        │                                  requer capabilities + build certificado)
         ├── EV Legacy Script Adapter     (famílias 10.x/11.x/12.0)
         └── Assisted Export Adapter      (sem adapter certificado)
         ↓
@@ -61,7 +62,7 @@ divergência), esta revisão registra:
 | Runbook v1.0 | Revisão (ADR-0013) |
 | --- | --- |
 | §18.1: Aspose.Email como engine primária (abrir, enumerar, criar, dividir) | Aspose fora do caminho crítico; EV segmenta na origem |
-| §20.3: split simples por tamanho com Aspose | segmentação por `Export-EVArchive -MaxPSTSizeMB` (§16.3, mantida) |
+| §20.3: split simples por tamanho com Aspose | segmentação nativa do EV via `Export-EVArchive`; alvo = `ArchiveBridgeOperationalTargetMb` validado contra o intervalo detectado (não um default presumido do EV) |
 | §16: assume host EV único com snap-in disponível | capability discovery multiversão + famílias legadas + modo assistido |
 | §17: ingestão de PST pré-existente com engine para split | decisão **adiada** para novo ADR; cenário acima do hard limit bloqueado ou assistido |
 

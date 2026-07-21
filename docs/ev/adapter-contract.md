@@ -54,7 +54,7 @@ public interface IEvExportAdapter
 | --- | --- |
 | Descoberta | resultado determinístico para o mesmo estado do EV; IDs opacos; nenhum dado de conteúdo |
 | Pré-requisitos | valida permissões, disco, Outlook (quando a família exige), exceções do exporter (§16.4); qualquer item reprovado bloqueia com código específico |
-| Exportação | **idempotente por `ExportRequestId`**: reinvocar com o mesmo ID não cria segunda exportação; saída segmentada em **PST Unicode** com tamanho-alvo configurável (default do produto 18432 MB, §16.3) |
+| Exportação | **idempotente por `ExportRequestId`**: reinvocar com o mesmo ID não cria segunda exportação; saída segmentada em **PST Unicode** com tamanho-alvo = `ArchiveBridgeOperationalTargetMb` (política do produto, `18432`), **validado contra `[DetectedMinPstSizeMb, DetectedMaxPstSizeMb]`** do ambiente antes de exportar — ver [capability-discovery.md](capability-discovery.md); não é um default do EV |
 | Progresso | monotônico; unidades normalizadas (itens e/ou bytes); nunca expõe assunto/corpo |
 | Cancelamento | após cancelar, `GetProgress` converge para estado terminal `CANCELLED`; artefatos parciais ficam marcados, nunca aprovados |
 | Retry | **não pode duplicar o conjunto aprovado**: partes já validadas/aprovadas são preservadas ou substituídas atomicamente, nunca somadas |
