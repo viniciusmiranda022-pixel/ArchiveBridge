@@ -1,15 +1,32 @@
 # ADR-0007 — Graph Mailbox Import/Export (FTS) bloqueado
 
-- **Status:** proposto
-- **Data:** 2026-07-20
-- **Gate de aprovação:** Arquitetura + Segurança
-- **Aprovadores:** _(pendente)_
+- **Status:** aceito _(efetivado no merge deste PR pelo Decision Owner)_
+- **Data:** 2026-07-20 (proposto) · 2026-07-21 (aceito)
+- **Gate de aprovação:** Decision Owner + revisão Segurança/Arquitetura
 - **Substitui / substituído por:** —
 
 > O que este ADR aprova é a **decisão de manter o Graph FTS bloqueado no
 > primeiro release** — aprovável agora. A futura disponibilidade do Graph
 > FTS não é o gate deste ADR: é o **gatilho para um novo ADR substituto**
 > (condições da §28.3). A capability permanece `BLOCKED` até lá.
+
+## Registro de aceitação
+
+- **Decision Owner:** Vinicius Miranda — aceitação formal efetivada com o
+  merge do PR que anexa a evidência (data: 2026-07-21).
+- **Revisão necessária (Segurança/Arquitetura):** análise da documentação
+  Microsoft em
+  [`evidence/0007-evidencia-microsoft-bloqueio.md`](evidence/0007-evidencia-microsoft-bloqueio.md),
+  produzida pela engenharia; conclui que a documentação oficial sustenta o
+  bloqueio (a API usa FTS, não recebe PST; cenário documentado é outro;
+  descoberta de archive amadurecendo; EWS depreciado). Não havendo revisor
+  distinto, a competência é exercida/aceita pelo Decision Owner (exceção de
+  bootstrap na [matriz](gate-closure-matrix.md)).
+- **Evidence Owner:** Engenharia ArchiveBridge.
+- **Escopo da aceitação:** aceita-se **manter o bloqueio**; a capability
+  `GraphFtsArchiveImport` permanece `BLOCKED`. Reavaliação futura exige
+  novo ADR substituto (§28.3) — a evidência é datada e deve ser revalidada
+  nesse momento.
 
 ## Contexto
 
