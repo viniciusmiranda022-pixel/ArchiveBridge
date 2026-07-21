@@ -48,7 +48,7 @@ terem entrado em um ou dois PRs.
 | ADR | Decision Owner | Revisores necessários | Evidência requerida | Evidence Owner | Status |
 | --- | --- | --- | --- | --- | --- |
 | [0001](0001-monolito-modular-e-workers-isolados.md) | Vinicius Miranda | Dev/Tech Lead | parecer arquitetural — [evidência](evidence/0001-parecer-arquitetural.md) | Engenharia | **aceito** (merge de 2026-07-21) |
-| [0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | Vinicius Miranda | Dev + Segurança | política de runtime, atualização e patching — [evidência](evidence/0002-politica-runtime-patching.md) | Engenharia | proposto (evidência anexada) |
+| [0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | Vinicius Miranda | Dev + Segurança | política de runtime, atualização e patching — [evidência](evidence/0002-politica-runtime-patching.md) (publicada pelo PR #12); R1–R3 = condições de operação contínua; SDK/Target Framework/runtime implantado distintos | Engenharia | **aceito** pelo Decision Owner em 2026-07-21 (vigência no merge deste PR) |
 | [0003](0003-azure-sql-e-service-bus-premium.md) | Vinicius Miranda | Dev/Cloud ou FinOps | estimativa inicial de custos Azure | a atribuir | proposto |
 | [0004](0004-aspose-email-engine-primaria.md) | — | — | — | — | **substituído** pelo [ADR-0013](0013-exportacao-ev-multiversao.md) em 2026-07-20, antes de aprovação |
 | [0005](0005-libpff-validador-independente.md) | Vinicius Miranda | Jurídico | análise de compatibilidade e licença LGPL | a atribuir | proposto |

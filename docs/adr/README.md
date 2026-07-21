@@ -23,7 +23,7 @@ Miranda.
 | ADR | Decisão | Revisores necessários | Status |
 | --- | --- | --- | --- |
 | [ADR-0001](0001-monolito-modular-e-workers-isolados.md) | Monólito modular + workers separados | Dev/Tech Lead | **aceito** |
-| [ADR-0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | .NET 10 LTS e política de atualização | Dev + Segurança | proposto |
+| [ADR-0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | .NET 10 LTS e política de atualização | Dev + Segurança | **aceito** |
 | [ADR-0003](0003-azure-sql-e-service-bus-premium.md) | Azure SQL + Service Bus Premium | Dev/Cloud ou FinOps | proposto |
 | [ADR-0004](0004-aspose-email-engine-primaria.md) | Aspose como writer/splitter primário | — | **substituído** pelo ADR-0013² |
 | [ADR-0005](0005-libpff-validador-independente.md) | libpff somente como verificador independente | Jurídico | proposto |
