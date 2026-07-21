@@ -1,10 +1,21 @@
 # ADR-0002 — .NET 10 LTS e política de atualização de dependências
 
-- **Status:** proposto
+- **Status:** proposto _(evidência anexada; aguardando revisão do Decision Owner)_
 - **Data:** 2026-07-20
-- **Gate de aprovação:** segurança + plataforma
+- **Gate de aprovação:** Decision Owner + revisão Dev + Segurança
 - **Aprovadores:** _(pendente)_
 - **Substitui / substituído por:** —
+
+> **Evidência anexada (aguardando aceitação).** Política de runtime,
+> atualização e patching em
+> [`evidence/0002-politica-runtime-patching.md`](evidence/0002-politica-runtime-patching.md)
+> (Evidence Owner: Engenharia). Define runtime .NET 10 LTS pinado, gestão
+> central de pacotes com restore determinístico, atualização por PR com
+> scan de vulnerabilidade + SBOM, e patching de imagem (mensal + CVE
+> crítico); registra R1–R3 como condições de operação contínua. O Decision
+> Owner **ainda revisará** antes da aceitação formal; o status **não** foi
+> alterado para `aceito`. O flip ocorrerá **neste mesmo PR** após
+> autorização.
 
 ## Contexto
 
