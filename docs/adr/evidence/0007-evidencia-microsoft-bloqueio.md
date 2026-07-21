@@ -44,16 +44,28 @@ Import/Export é uma superfície válida:
 
 1. **É v1.0.** `createImportSession` e `exportItems` possuem documentação
    em Microsoft Graph **v1.0** (refs. 201–203).
-2. **Cobre archive mailboxes.** A documentação declara suporte a mailboxes
-   **primary, shared e archive** (refs. 201–202). Não se afirma aqui que o
-   suporte a archive esteja em beta.
-3. **A permissão existe.** `MailboxItem.ImportExport.All` está **documentada
+2. **A permissão existe.** `MailboxItem.ImportExport.All` está **documentada
    e disponível** (refs. 202–203). Seu caráter altamente privilegiado é
    tratado como **risco de segurança** (seção 5), não como ausência de
    suporte.
-4. **Redirects de auto-expanding archive** (ref. 204) podem envolver
-   superfícies ainda em evolução, mas isso **não** permite generalizar que
-   todo o suporte a archive seja beta.
+
+### 3.1 Divergência da documentação sobre archive mailboxes
+
+O suporte a **archive mailboxes** **não** é um fato consolidado: há
+divergência na própria documentação Microsoft, registrada aqui como
+capability a validar (não como suporte integral confirmado):
+
+| Fonte | O que declara |
+| --- | --- |
+| Página conceitual (ref. 201) | suporte a mailboxes **primary, shared e archive** |
+| Visão geral operacional v1.0 (ref. 202) e endpoint v1.0 de mailbox discovery | atualmente listam **somente primary e shared** |
+| Tratamento explícito de **auto-expanding archives** (ref. 204) | aparece em documentação **beta** |
+
+**Conclusão de capability:** o suporte operacional completo a archives —
+especialmente **auto-expanding archives e redirects** — é uma capability
+que **exige validação em tenant** antes de ser declarada; não se afirma
+aqui suporte integral a archives como consolidado. Esta divergência **não
+altera** a razão principal do bloqueio (seção 4), mas soma-se a ela.
 
 ## 4. Por que o ArchiveBridge mantém o bloqueio (escopo específico)
 
@@ -77,29 +89,46 @@ Ou seja: a superfície é válida; o que falta é o **produtor PST/EV → FTS
 oficialmente suportado e certificado**. Sem ele, o adapter não pode ser o
 caminho GA de migração de PST/EV.
 
+### 4.1 Dois níveis distintos de "suportado"
+
+| Nível | Significado | Situação PST/EV → Graph |
+| --- | --- | --- |
+| **Caminho oficialmente documentado e suportado pela Microsoft** | a Microsoft documenta e suporta a operação | **inexistente** para converter PST/EV em FTS |
+| **Implementação certificada internamente pelo ArchiveBridge** | o produto implementa, testa e certifica o caminho (fidelidade, escala, idempotência) | **não realizada** — dependeria, primeiro, de um caminho oficial |
+
+Sem o primeiro nível, o segundo não se sustenta. O bloqueio decorre da
+ausência do caminho oficial Microsoft, não de falta de esforço interno.
+
 ## 5. Risco de segurança da permissão privilegiada
 
 `MailboxItem.ImportExport.All` é consentimento **application-wide**
 altamente privilegiado. Habilitar o adapter sem um produtor FTS suportado
-e certificado exporia esse escopo por um fluxo não homologado — risco
-tratado como controle de segurança (Application Access Policy, escopo
-mínimo, capability evidence aprovada) quando/se o caminho for reavaliado.
-O caráter privilegiado é **risco a mitigar**, não prova de ausência de
-suporte da API.
+e certificado exporia esse escopo por um fluxo não homologado.
+
+Controle de acesso application-only recomendado quando/se o caminho for
+reavaliado: **Exchange Online RBAC for Applications**, com o papel
+**`Application MailboxItem.ImportExport`** e **management scope restrito às
+mailboxes da onda** — ao invés do mecanismo legado Application Access
+Policy, que **não** deve ser adotado em novas implantações. O escopo mínimo
+e a capability evidence aprovada permanecem obrigatórios. O caráter
+privilegiado é **risco a mitigar**, não prova de ausência de suporte da
+API.
 
 ## 6. Recomendação
 
-> O Microsoft Graph Mailbox Import/Export é uma superfície v1.0 válida e
-> oferece suporte a archive mailboxes. Entretanto, o ArchiveBridge mantém
-> bloqueado o uso dessa API como adapter para migração PST/Enterprise
-> Vault, pois o contrato de importação exige FTS e não existe caminho
-> oficial documentado e certificado para converter PST ou exportação do EV
-> em FTS com fidelidade e suporte adequados.
+> O Graph Mailbox Import/Export é uma superfície v1.0 válida. Entretanto, o
+> ArchiveBridge mantém `GraphFtsArchiveImport = BLOCKED` para migração
+> PST/Enterprise Vault porque a importação exige FTS produzido em formato
+> compatível e não existe caminho Microsoft documentado para converter PST
+> ou exportação do EV em FTS. Adicionalmente, o suporte operacional
+> completo a archives deverá ser confirmado por validação em tenant diante
+> da divergência atual da documentação Microsoft.
 
-A capability `GraphFtsArchiveImport` permanece **`BLOCKED`**. A razão
-registrada do bloqueio é a **ausência de um produtor PST/EV → FTS
-oficialmente suportado e certificado** (não a inexistência da API nem
-suporte a archive). A **aceitação formal** é ato do Decision Owner
-(Vinicius Miranda) e efetiva-se com o merge do PR que anexa esta evidência
-e altera o status do ADR-0007 para `aceito`. Reavaliação futura ocorre por
-**novo ADR substituto** (§28.3).
+A razão registrada do bloqueio é a **ausência de um caminho Microsoft
+documentado para produzir FTS a partir de PST/EV** (não a inexistência da
+API). Some-se a isso a **divergência de documentação sobre archives**
+(seção 3.1), que exige **validação em tenant** — especialmente para
+auto-expanding archives e redirects. A **aceitação formal** é ato do
+Decision Owner (Vinicius Miranda) e efetiva-se com o merge do PR que anexa
+esta evidência e altera o status do ADR-0007 para `aceito`. Reavaliação
+futura ocorre por **novo ADR substituto** (§28.3).

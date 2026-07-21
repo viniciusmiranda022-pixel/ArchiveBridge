@@ -8,9 +8,11 @@
 
 > O que este ADR aprova é a **decisão de manter bloqueado o uso do Graph
 > Mailbox Import/Export como adapter de migração PST/Enterprise Vault** —
-> aprovável agora. A superfície Graph FTS é v1.0 válida e suporta archive
-> mailboxes; o bloqueio é específico à ausência de um produtor PST/EV → FTS
-> oficialmente suportado e certificado. A capability
+> aprovável agora. A superfície Graph FTS é v1.0 válida; o bloqueio é
+> específico à ausência de um **caminho Microsoft documentado para produzir
+> FTS a partir de PST/EV**. O suporte operacional completo a **archives**
+> tem divergência de documentação e **exige validação em tenant**
+> (auto-expanding archives e redirects). A capability
 > `GraphFtsArchiveImport` permanece `BLOCKED`; a reavaliação futura é
 > gatilho para um **novo ADR substituto** (§28.3).
 
@@ -19,10 +21,11 @@
 - **Evidência:** análise documental revalidada em 2026-07-21 em
   [`evidence/0007-evidencia-microsoft-bloqueio.md`](evidence/0007-evidencia-microsoft-bloqueio.md),
   produzida pela engenharia (Evidence Owner: Engenharia ArchiveBridge).
-- **Conclusão da evidência:** o Graph Mailbox Import/Export é v1.0 válido e
-  suporta archive mailboxes; o bloqueio é mantido **especificamente** para
-  o caminho PST/EV → Graph, porque o contrato de importação exige FTS e não
-  há produtor PST/EV → FTS oficialmente suportado e certificado.
+- **Conclusão da evidência:** o Graph Mailbox Import/Export é v1.0 válido; o
+  bloqueio é mantido **especificamente** para o caminho PST/EV → Graph,
+  porque a importação exige FTS e não há caminho Microsoft documentado para
+  produzir FTS a partir de PST/EV. O suporte a archives tem divergência
+  documental a validar em tenant (não declarado como consolidado).
 - **Status:** o Decision Owner (Vinicius Miranda) **ainda revisará** a
   evidência corrigida antes da aceitação formal; o status **não** foi
   alterado para `aceito`.
