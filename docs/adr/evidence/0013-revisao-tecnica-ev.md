@@ -31,14 +31,21 @@ Especificações em [`docs/ev/`](../../ev/README.md):
 | --- | --- | --- |
 | Capability discovery **obrigatório** antes da seleção | capability-discovery §Regras (1–5); seleção consome só o relatório | **OK** |
 | Nenhum adapter escolhido pelo número de versão | discovery detecta capacidades; `UNKNOWN` = fail closed | **OK** |
-| Contrato comum `IEvExportAdapter` idêntico a todos | adapter-contract (9 operações + taxonomia única) | **OK** |
+| Contrato comum `IEvExportAdapter` idêntico a todos | adapter-contract (8 operações + taxonomia única) | **OK** |
 | Sem PowerShell arbitrário do Control Plane | legacy-framework: scripts assinados, allowlist, JSON | **OK** |
 | Suporte só após laboratório/certificação por família | compatibility-matrix (compatível/testado/certificado) | **OK** |
 | Ambiente sem adapter certificado = assistido/bloqueio | discovery §Seleção; matriz linha "assistido" | **OK** |
-| Segmentação = política do produto validada por discovery | política de tamanho de PST (Detected*/OperationalTarget) | **OK** |
+| Segmentação = política do produto validada por discovery | política de tamanho de PST (Detected*/OperationalTarget) | **CONDICIONAL** (ver L2) |
 
 A especificação é **coerente com a decisão**. Nada de crítico contradiz o
 ADR.
+
+**Segmentação (CONDICIONAL):** a arquitetura e o contrato do discovery
+estão definidos. A capability de segmentação **não poderá ser certificada
+nem habilitada** até que a **obtenção read-only** de `DetectedMinPstSizeMb`
+e `DetectedMaxPstSizeMb` seja **comprovada por família no laboratório**
+(lacuna L2). Isso **não impede** a futura aceitação do ADR-0013 — é uma
+**condição de certificação e habilitação**, não de aceitação da decisão.
 
 ## 3. Pontos fortes
 
@@ -79,9 +86,9 @@ laboratório → certificado` da matriz de compatibilidade.
 
 ## 6. Recomendação
 
-As especificações de `docs/ev/` **implementam fielmente** a decisão do
-ADR-0013 e estão **tecnicamente sólidas** para servir de base à
-implementação. Recomenda-se **aceitar o ADR-0013**, com as lacunas L1–L6
+As especificações de `docs/ev/` **documentam e materializam
+arquiteturalmente** a decisão do ADR-0013 e estão **tecnicamente sólidas**
+para servir de base à implementação. Recomenda-se **aceitar o ADR-0013**, com as lacunas L1–L6
 registradas como **condições de certificação** (não de aceitação da
 decisão): elas são resolvidas por família no laboratório, não reabrem a
 arquitetura.
