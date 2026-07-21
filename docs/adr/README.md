@@ -64,9 +64,11 @@ texto original até revisão formal do DOCX; divergência registrada em
    consequências explícitas são devolvidas.
 3. Abra PR referenciando a linha correspondente da tabela acima e indique
    os revisores necessários (competência específica, quando o tema exigir).
-4. A mudança de status para `aceito` só ocorre no PR que anexa a evidência
-   do gate, registrando no ADR: Decision Owner e data, revisores e
-   pareceres, evidência e o Evidence Owner que a produziu, e eventuais
-   condições — conforme a [matriz de fechamento](gate-closure-matrix.md).
+4. A mudança de status para `aceito` registra no ADR: Decision Owner e
+   data, revisores e pareceres, evidência e o Evidence Owner que a produziu,
+   e eventuais condições. O flip ocorre **no mesmo PR que anexa a
+   evidência** ou, quando a evidência **já está no `main`**, em um **PR de
+   aceite separado** que a referencie explicitamente — conforme a
+   [matriz de fechamento](gate-closure-matrix.md).
 5. ADR aceito é imutável: mudanças exigem um novo ADR que o substitua
    (campo "Substitui / substituído por").

@@ -1,8 +1,8 @@
 # ADR-0007 — Graph Mailbox Import/Export como adapter condicional; rota PST/EV → FTS não habilitada no release inicial
 
-- **Status:** aceito pelo Decision Owner em 2026-07-20 (proposto) ·
-  2026-07-21 (aceito); vigência no repositório a partir do merge do PR #9.
-- **Data:** 2026-07-20 (proposto) · 2026-07-21 (decisão do Decision Owner)
+- **Status:** aceito pelo Decision Owner em 2026-07-21; vigência no
+  repositório a partir do merge do PR #9.
+- **Data:** 2026-07-20 (proposto) · 2026-07-21 (aceito pelo Decision Owner)
 - **Gate de aprovação:** Decision Owner + revisão Segurança/Arquitetura
 - **Substitui / substituído por:** —
 
@@ -11,6 +11,10 @@
 - **Decision Owner:** Vinicius Miranda — **decisão de aceitação em
   2026-07-21**, após revisão da evidência ao longo de sucessivas iterações.
   **Vigência/publicação no repositório:** a partir do **merge do PR #9**.
+- **Fluxo de fechamento (dois PRs):** a evidência foi anexada e mergeada
+  pelo **PR #8** (ADR então `proposto`); o **flip para `aceito`** ocorre
+  neste **PR #9** — modalidade de PR de aceite separado prevista na
+  [matriz](gate-closure-matrix.md), com a evidência já no `main`.
 - **Revisão executada (Segurança/Arquitetura):** análise documental
   revalidada em 2026-07-21 em
   [`evidence/0007-evidencia-microsoft-bloqueio.md`](evidence/0007-evidencia-microsoft-bloqueio.md)

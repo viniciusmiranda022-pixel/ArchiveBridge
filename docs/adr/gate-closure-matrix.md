@@ -30,8 +30,18 @@ Ao fechar um gate, o ADR correspondente deve registrar:
 4. **Condições e ressalvas**, se houver.
 
 Só então o `Status` do ADR muda de `proposto` para `aceito` e a tabela de
-`README.md` é atualizada — no mesmo PR que anexa a evidência. **Nenhum ADR
-tem o status alterado nesta matriz.**
+`README.md` é atualizada. **Nenhum ADR tem o status alterado nesta matriz.**
+
+**Onde ocorre o flip de status.** O padrão é fazê-lo **no mesmo PR que
+anexa a evidência**. Admite-se, porém, um **PR de aceite separado** quando
+a evidência **já está no `main`** (anexada por um PR anterior) e o Decision
+Owner autoriza a aceitação em momento posterior — refletindo o fluxo real
+*evidência → revisão → aceite*. Nesse caso, o PR de aceite **deve
+referenciar explicitamente** a evidência já mergeada e o registro de
+aceitação no ADR aponta os dois PRs (o que anexou a evidência e o que fez o
+flip). Um gate só conta para o desbloqueio do scaffolding quando **evidência
+registrada + status `aceito`** coexistem no `main`, independentemente de
+terem entrado em um ou dois PRs.
 
 ## Matriz
 
