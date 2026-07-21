@@ -1,11 +1,22 @@
 # ADR-0013 — Exportação Enterprise Vault multiversão por capability discovery
 
-- **Status:** proposto
+- **Status:** proposto _(evidência anexada; aguardando revisão do Decision Owner)_
 - **Data:** 2026-07-20
-- **Gate de aprovação:** Arquitetura + Segurança
+- **Gate de aprovação:** Decision Owner + revisão Dev + Segurança
 - **Aprovadores:** _(pendente)_
 - **Substitui / substituído por:** substitui o [ADR-0004](0004-aspose-email-engine-primaria.md)
   (Aspose como writer/splitter primário)
+
+> **Evidência anexada (aguardando aceitação).** Revisão técnica de
+> `docs/ev/` em
+> [`evidence/0013-revisao-tecnica-ev.md`](evidence/0013-revisao-tecnica-ev.md)
+> (Evidence Owner: Engenharia). Conclui que as especificações **documentam
+> e materializam arquiteturalmente** a decisão e são tecnicamente sólidas;
+> registra as lacunas L1–L6 como **condições de certificação** (por
+> família, no laboratório), não de aceitação da decisão. A capability de
+> **segmentação** fica **CONDICIONAL** até a obtenção read-only dos limites
+> ser comprovada por família (L2). O Decision Owner **ainda revisará** antes da
+> aceitação formal; o status **não** foi alterado para `aceito`.
 
 > **Numeração:** os números **0009–0012 estão formalmente reservados** na
 > tabela "ADRs subsequentes" do [`README.md`](README.md) (fingerprint por

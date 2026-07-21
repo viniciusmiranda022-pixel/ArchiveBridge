@@ -55,7 +55,7 @@ terem entrado em um ou dois PRs.
 | [0006](0006-purview-adapter-ga-inicial.md) | Vinicius Miranda | responsável técnico pelo tenant | relatório de validação do Purview | a atribuir | proposto |
 | [0007](0007-graph-fts-bloqueado.md) | Vinicius Miranda | Segurança/Arquitetura | evidência da rota PST/EV → FTS → Graph — `GraphFtsImportFromPstEv = BLOCKED_PENDING_EVIDENCE` (Graph permanece adapter condicional; sem bloqueio global) — [evidência](evidence/0007-evidencia-microsoft-bloqueio.md) | Engenharia | **aceito** pelo Decision Owner em 2026-07-21 (vigência no merge do PR #9) |
 | [0008](0008-isolamento-por-tenant-e-projeto.md) | Vinicius Miranda | Segurança/Privacidade | threat model e avaliação de dados | a atribuir | proposto |
-| [0013](0013-exportacao-ev-multiversao.md) | Vinicius Miranda | Dev + Segurança | revisão técnica do capability discovery e dos adapters | a atribuir | proposto |
+| [0013](0013-exportacao-ev-multiversao.md) | Vinicius Miranda | Dev + Segurança | revisão técnica do capability discovery e dos adapters — [evidência](evidence/0013-revisao-tecnica-ev.md) | Engenharia | proposto (evidência anexada) |
 
 Legenda de estado:
 
