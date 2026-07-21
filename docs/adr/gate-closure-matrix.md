@@ -1,43 +1,67 @@
-# Matriz de fechamento dos gates de aprovação (ADR-0001 a ADR-0008)
+# Matriz de fechamento dos gates de aprovação
 
 Princípio de governança: **o merge dos documentos ADR não equivale à
-aprovação das decisões.** Cada gate é fechado por um responsável real, com
-evidência, e ninguém acumula automaticamente os papéis de arquiteto,
-segurança, plataforma, FinOps, jurídico e DPO — salvo **delegação formal**
-registrada nesta matriz (quem delegou, para quem, escopo e data).
+aprovação das decisões.** Não é necessário um aprovador diferente por ADR;
+o objetivo é identificar **quais revisões e evidências são realmente
+necessárias** antes de o Decision Owner aceitar formalmente cada decisão.
+
+## Quatro papéis distintos
+
+| Papel | O que é | Quem |
+| --- | --- | --- |
+| **Decision Owner** | decisão final do produto sobre a arquitetura; aceita ou não o ADR | **Vinicius Miranda** (todos os ADRs) |
+| **Revisores necessários** | revisão especializada, **apenas quando o tema exige** competência específica (técnica ou jurídica) | por ADR (coluna abaixo) |
+| **Evidence Owner** | produz o teste, relatório, parecer ou validação exigido pelo gate; pode ser outra pessoa | atribuído ao iniciar a evidência |
+| **Aprovação formal** | ocorre **somente depois** de as evidências mínimas e revisões estarem registradas; muda o `Status` do ADR | ato do Decision Owner |
+
+Estes quatro papéis são deliberadamente separados: **decidir** (Decision
+Owner), **revisar** (especialista, quando necessário), **produzir a
+evidência** (Evidence Owner) e **aprovar formalmente** (Decision Owner,
+após evidências) são atos distintos e não se presumem uns aos outros.
 
 ## Registro obrigatório de cada aprovação
 
 Ao fechar um gate, o ADR correspondente deve registrar:
 
-1. **Aprovador real** (nome/identidade de quem exerceu o papel);
-2. **Data da aprovação**;
-3. **Evidência ou parecer** (link para documento, relatório, contrato ou PR);
+1. **Decision Owner** e **data** da aceitação formal;
+2. **Revisores** que participaram (quando exigidos) e seus pareceres;
+3. **Evidência** anexada (link para relatório, teste, parecer, contrato ou PR)
+   e o **Evidence Owner** que a produziu;
 4. **Condições e ressalvas**, se houver.
 
-Só então o `Status` do ADR muda de `proposto` para `aprovado` e a tabela de
-`README.md` é atualizada — no mesmo PR que anexa a evidência.
+Só então o `Status` do ADR muda de `proposto` para `aceito` e a tabela de
+`README.md` é atualizada — no mesmo PR que anexa a evidência. **Nenhum ADR
+tem o status alterado nesta matriz.**
 
 ## Matriz
 
-| ADR | Gate | Responsável | Evidência exigida | Estado |
-| --- | --- | --- | --- | --- |
-| [0001](0001-monolito-modular-e-workers-isolados.md) | Arquiteto + Tech Lead | A definir | parecer técnico | pendente |
-| [0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | Segurança + Plataforma | A definir | parecer de runtime e patching | pendente |
-| [0003](0003-azure-sql-e-service-bus-premium.md) | Arquitetura + FinOps | A definir | estimativa de custos | pendente |
-| [0004](0004-aspose-email-engine-primaria.md) | — (não mais aplicável) | — | — | **substituído** pelo [ADR-0013](0013-exportacao-ev-multiversao.md) em 2026-07-20, antes de aprovação |
-| [0005](0005-libpff-validador-independente.md) | Compatibilidade + LGPL | A definir | teste de compatibilidade e parecer jurídico | pendente |
-| [0006](0006-purview-adapter-ga-inicial.md) | Evidência Microsoft + tenant controlado | A definir | relatório de validação em tenant | pendente |
-| [0007](0007-graph-fts-bloqueado.md) | Arquitetura + Segurança | A definir | análise da documentação Microsoft confirmando que o cenário PST/FTS não está aprovado | pendente |
-| [0008](0008-isolamento-por-tenant-e-projeto.md) | Segurança + DPO | A definir | threat model e avaliação de dados | pendente |
-| [0013](0013-exportacao-ev-multiversao.md) | Arquitetura + Segurança | A definir | parecer sobre o ADR, o contrato `IEvExportAdapter` e a especificação de capability discovery | pendente |
+| ADR | Decision Owner | Revisores necessários | Evidência requerida | Evidence Owner | Status |
+| --- | --- | --- | --- | --- | --- |
+| [0001](0001-monolito-modular-e-workers-isolados.md) | Vinicius Miranda | Dev/Tech Lead | parecer arquitetural | a atribuir | proposto |
+| [0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | Vinicius Miranda | Dev + Segurança | política de runtime, atualização e patching | a atribuir | proposto |
+| [0003](0003-azure-sql-e-service-bus-premium.md) | Vinicius Miranda | Dev/Cloud ou FinOps | estimativa inicial de custos Azure | a atribuir | proposto |
+| [0004](0004-aspose-email-engine-primaria.md) | — | — | — | — | **substituído** pelo [ADR-0013](0013-exportacao-ev-multiversao.md) em 2026-07-20, antes de aprovação |
+| [0005](0005-libpff-validador-independente.md) | Vinicius Miranda | Jurídico | análise de compatibilidade e licença LGPL | a atribuir | proposto |
+| [0006](0006-purview-adapter-ga-inicial.md) | Vinicius Miranda | responsável técnico pelo tenant | relatório de validação do Purview | a atribuir | proposto |
+| [0007](0007-graph-fts-bloqueado.md) | Vinicius Miranda | Segurança/Arquitetura | evidência Microsoft que sustenta o bloqueio | a atribuir | proposto |
+| [0008](0008-isolamento-por-tenant-e-projeto.md) | Vinicius Miranda | Segurança/Privacidade | threat model e avaliação de dados | a atribuir | proposto |
+| [0013](0013-exportacao-ev-multiversao.md) | Vinicius Miranda | Dev + Segurança | revisão técnica do capability discovery e dos adapters | a atribuir | proposto |
 
 Legenda de estado:
 
-- **pendente** — aguarda o responsável exercer o gate e anexar evidência;
+- **proposto** — decisão registrada, aguardando as revisões necessárias e a
+  evidência requerida antes da aceitação formal do Decision Owner;
+- **aceito** — Decision Owner aceitou formalmente após revisões e evidência
+  registradas (nenhum ADR está neste estado ainda);
 - **substituído** — ADR retirado antes de aprovação por decisão registrada;
-  o gate correspondente deixa de existir e o ADR substituto entra na
-  matriz com gate próprio.
+  o ADR substituto entra na matriz com seus próprios revisores/evidência.
+
+Sobre os **revisores necessários**: são exigidos apenas quando o tema pede
+competência específica; não implicam uma pessoa distinta por ADR. O mesmo
+revisor pode cobrir vários ADRs, e o Decision Owner pode exercer um papel de
+revisão quando detiver a competência — o que a matriz garante é que a
+competência necessária foi efetivamente exercida e registrada, não que os
+papéis sejam pessoas diferentes.
 
 ### ADR-0007: decisão aprovável agora vs. capability bloqueada
 
@@ -47,8 +71,8 @@ Segurança, com base na documentação Microsoft atual. A **capability**
 `GraphFtsArchiveImport` permanece `BLOCKED` (bloqueada por design). A
 futura disponibilidade do Graph FTS **não é o gate deste ADR**: é o
 gatilho para um **novo ADR substituto** (condições da §28.3). Assim, o
-fechamento dos oito gates — e o desbloqueio do scaffolding — não depende
-de mudança futura da Microsoft.
+fechamento dos gates vigentes — e o desbloqueio do scaffolding — não
+depende de mudança futura da Microsoft.
 
 ## Delegações formais
 

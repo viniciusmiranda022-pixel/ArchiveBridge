@@ -6,27 +6,31 @@ neste diretório e aprovados em pull request pelo gate indicado.
 
 > [!IMPORTANT]
 > **O merge de um ADR não equivale à aprovação da decisão.** O fechamento
-> de cada gate segue a [matriz de fechamento](gate-closure-matrix.md):
-> aprovador real, data, evidência/parecer e ressalvas registrados no ADR —
-> sem acúmulo automático de papéis e sem delegação informal.
+> de cada gate segue a [matriz de fechamento](gate-closure-matrix.md), que
+> separa quatro papéis: **Decision Owner** (decisão final — Vinicius
+> Miranda em todos os ADRs), **Revisores necessários** (só quando o tema
+> exige competência específica), **Evidence Owner** (produz a evidência) e
+> **aprovação formal** (ato do Decision Owner, somente após evidência e
+> revisões registradas).
 
 ## ADRs obrigatórios antes do código
 
-Todos redigidos com status **proposto**, fiéis ao runbook; a aprovação formal
-cabe ao gate indicado (ver "Como criar um ADR", passo 4).
+Todos com status **proposto**; a coluna abaixo lista os **revisores
+necessários** por ADR (não um aprovador distinto por documento — ver a
+[matriz](gate-closure-matrix.md)). O Decision Owner de todos é Vinicius
+Miranda.
 
-| ADR | Decisão | Gate de aprovação | Status |
+| ADR | Decisão | Revisores necessários | Status |
 | --- | --- | --- | --- |
-| [ADR-0001](0001-monolito-modular-e-workers-isolados.md) | Monólito modular + workers separados | arquiteto + tech lead | proposto |
-| [ADR-0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | .NET 10 LTS e política de atualização | segurança + plataforma | proposto |
-| [ADR-0003](0003-azure-sql-e-service-bus-premium.md) | Azure SQL + Service Bus Premium | arquitetura + FinOps | proposto |
+| [ADR-0001](0001-monolito-modular-e-workers-isolados.md) | Monólito modular + workers separados | Dev/Tech Lead | proposto |
+| [ADR-0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | .NET 10 LTS e política de atualização | Dev + Segurança | proposto |
+| [ADR-0003](0003-azure-sql-e-service-bus-premium.md) | Azure SQL + Service Bus Premium | Dev/Cloud ou FinOps | proposto |
 | [ADR-0004](0004-aspose-email-engine-primaria.md) | Aspose como writer/splitter primário | — | **substituído** pelo ADR-0013² |
-| [ADR-0005](0005-libpff-validador-independente.md) | libpff somente como verificador independente | compatibilidade e LGPL avaliadas | proposto |
-| [ADR-0006](0006-purview-adapter-ga-inicial.md) | Purview como adapter GA inicial | evidência oficial e teste em tenant controlado | proposto |
-| [ADR-0007](0007-graph-fts-bloqueado.md) | Graph FTS bloqueado | arquitetura + segurança¹ | proposto |
-| [ADR-0008](0008-isolamento-por-tenant-e-projeto.md) | Modelo de isolamento por tenant/projeto | segurança e DPO | proposto |
-
-| [ADR-0013](0013-exportacao-ev-multiversao.md) | Exportação EV multiversão por capability discovery | arquitetura + segurança | proposto |
+| [ADR-0005](0005-libpff-validador-independente.md) | libpff somente como verificador independente | Jurídico | proposto |
+| [ADR-0006](0006-purview-adapter-ga-inicial.md) | Purview como adapter GA inicial | responsável técnico pelo tenant | proposto |
+| [ADR-0007](0007-graph-fts-bloqueado.md) | Graph FTS bloqueado | Segurança/Arquitetura¹ | proposto |
+| [ADR-0008](0008-isolamento-por-tenant-e-projeto.md) | Modelo de isolamento por tenant/projeto | Segurança/Privacidade | proposto |
+| [ADR-0013](0013-exportacao-ev-multiversao.md) | Exportação EV multiversão por capability discovery | Dev + Segurança | proposto |
 
 ¹ A tabela da seção 9 do runbook descreve o gate do ADR-0007 como
 "reavaliação quando archive/FTS estiverem suportados". Isso criaria um
@@ -58,11 +62,11 @@ texto original até revisão formal do DOCX; divergência registrada em
    sequencial, quatro dígitos).
 2. Preencha todas as seções; decisões sem alternativas consideradas ou sem
    consequências explícitas são devolvidas.
-3. Abra PR referenciando a linha correspondente da tabela acima e marque o
-   gate de aprovação como revisor.
-4. A mudança de status para `aprovado` só ocorre no PR que anexa a
-   evidência do gate, registrando no ADR: aprovador real, data,
-   evidência/parecer e eventuais condições — conforme a
-   [matriz de fechamento](gate-closure-matrix.md).
-5. ADR aprovado é imutável: mudanças exigem um novo ADR que o substitua
+3. Abra PR referenciando a linha correspondente da tabela acima e indique
+   os revisores necessários (competência específica, quando o tema exigir).
+4. A mudança de status para `aceito` só ocorre no PR que anexa a evidência
+   do gate, registrando no ADR: Decision Owner e data, revisores e
+   pareceres, evidência e o Evidence Owner que a produziu, e eventuais
+   condições — conforme a [matriz de fechamento](gate-closure-matrix.md).
+5. ADR aceito é imutável: mudanças exigem um novo ADR que o substitua
    (campo "Substitui / substituído por").
