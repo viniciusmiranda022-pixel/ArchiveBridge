@@ -16,9 +16,11 @@ primeiro release).
 
 > [!NOTE]
 > Análise documental **datada (revalidada em 2026-07-21)**. A evolução da
-> API ou o surgimento de um produtor PST/EV → FTS oficialmente suportado
-> são gatilho para um **novo ADR substituto** (condições da §28.3), não
-> para a reabertura deste.
+> API ou o surgimento de um produtor PST/EV → FTS documentado alimentam o
+> **ciclo de promoção** da capability `GraphFtsImportFromPstEv`
+> (`BLOCKED_PENDING_EVIDENCE → CANDIDATE → CERTIFIED → ENABLED`, ver
+> [ADR-0007](../0007-graph-fts-bloqueado.md)); um **novo ADR** só é
+> necessário se mudar contrato, segurança ou arquitetura do adapter.
 
 ## 1. Pergunta objetiva
 
@@ -78,26 +80,29 @@ Mailbox Import/Export em geral:
 2. **O cenário documentado é outro.** A importação prevê itens compatíveis
    com o formato **produzido por `exportItems`** (round-trip da própria
    família de APIs), não PST/EV (refs. 201, 203).
-3. **Não há produtor oficial PST/EV → FTS.** Não existe mecanismo Microsoft
-   documentado para **converter PST ou itens do Enterprise Vault em FTS
-   suportado**.
+3. **Nenhum produtor PST/EV → FTS identificado nas fontes analisadas.**
+   Não foi identificado, nas fontes oficiais Microsoft analisadas e datadas
+   nesta evidência, um caminho documentado para **converter PST ou
+   exportação do Enterprise Vault em FTS compatível com a API**.
 4. **Sem evidência de fidelidade, escala, idempotência e suporte
    comercial** para essa conversão — condições que a §28.3 exige antes de
    qualquer habilitação.
 
-Ou seja: a superfície é válida; o que falta é o **produtor PST/EV → FTS
-oficialmente suportado e certificado**. Sem ele, o adapter não pode ser o
-caminho GA de migração de PST/EV.
+Ou seja: a superfície é válida; o que **não foi identificado nas fontes
+analisadas** é um produtor PST/EV → FTS documentado e suportado. Sem ele, o
+adapter não pode ser, hoje, o caminho de migração de PST/EV.
 
 ### 4.1 Dois níveis distintos de "suportado"
 
 | Nível | Significado | Situação PST/EV → Graph |
 | --- | --- | --- |
-| **Caminho oficialmente documentado e suportado pela Microsoft** | a Microsoft documenta e suporta a operação | **inexistente** para converter PST/EV em FTS |
-| **Implementação certificada internamente pelo ArchiveBridge** | o produto implementa, testa e certifica o caminho (fidelidade, escala, idempotência) | **não realizada** — dependeria, primeiro, de um caminho oficial |
+| **Caminho oficialmente documentado pela Microsoft** | a Microsoft documenta e suporta a operação | **não identificado nas fontes analisadas** |
+| **Implementação certificada internamente pelo ArchiveBridge** | o produto implementa, testa e certifica o caminho (fidelidade, escala, idempotência) | **não implementado nem certificado internamente** |
 
-Sem o primeiro nível, o segundo não se sustenta. O bloqueio decorre da
-ausência do caminho oficial Microsoft, não de falta de esforço interno.
+Enquanto o primeiro nível não for identificado/documentado, o segundo não
+se sustenta. O bloqueio decorre da **ausência, nas fontes analisadas**, de
+um caminho oficial Microsoft — não de uma afirmação universal de
+inexistência.
 
 ## 5. Risco de segurança da permissão privilegiada
 
@@ -116,19 +121,27 @@ API.
 
 ## 6. Recomendação
 
-> O Graph Mailbox Import/Export é uma superfície v1.0 válida. Entretanto, o
-> ArchiveBridge mantém `GraphFtsArchiveImport = BLOCKED` para migração
-> PST/Enterprise Vault porque a importação exige FTS produzido em formato
-> compatível e não existe caminho Microsoft documentado para converter PST
-> ou exportação do EV em FTS. Adicionalmente, o suporte operacional
-> completo a archives deverá ser confirmado por validação em tenant diante
-> da divergência atual da documentação Microsoft.
+> O Graph Mailbox Import/Export é uma superfície v1.0 válida e permanece um
+> **adapter condicional** (`GraphFtsTargetAdapter`, `CONDITIONAL`).
+> Entretanto, o ArchiveBridge mantém a rota PST/EV → FTS → Graph
+> (`GraphFtsImportFromPstEv`) em **`BLOCKED_PENDING_EVIDENCE`** porque a
+> importação exige FTS produzido em formato compatível e **não foi
+> identificado, nas fontes Microsoft analisadas e datadas nesta evidência,
+> um caminho documentado** para converter PST ou exportação do EV em FTS,
+> nem há certificação interna de fidelidade, escala, idempotência,
+> segurança e operação. Adicionalmente, o suporte operacional completo a
+> archives deverá ser confirmado por validação em tenant diante da
+> divergência atual da documentação Microsoft.
 
-A razão registrada do bloqueio é a **ausência de um caminho Microsoft
-documentado para produzir FTS a partir de PST/EV** (não a inexistência da
-API). Some-se a isso a **divergência de documentação sobre archives**
-(seção 3.1), que exige **validação em tenant** — especialmente para
-auto-expanding archives e redirects. A **aceitação formal** é ato do
-Decision Owner (Vinicius Miranda) e efetiva-se com o merge do PR que anexa
-esta evidência e altera o status do ADR-0007 para `aceito`. Reavaliação
-futura ocorre por **novo ADR substituto** (§28.3).
+A razão registrada do bloqueio é a **ausência, nas fontes analisadas, de um
+caminho Microsoft documentado para produzir FTS a partir de PST/EV** (não a
+inexistência da API nem bloqueio global do Graph). Some-se a isso a
+**divergência de documentação sobre archives** (seção 3.1), que exige
+**validação em tenant** — especialmente auto-expanding archives e
+redirects. O adapter é **condicional**: a promoção de
+`GraphFtsImportFromPstEv` segue o ciclo `BLOCKED_PENDING_EVIDENCE →
+CANDIDATE → CERTIFIED → ENABLED` (ver [ADR-0007](../0007-graph-fts-bloqueado.md)
+e [catálogo](../target-adapter-catalog.md)); um **novo ADR** só é
+necessário se mudar contrato, segurança ou arquitetura. A **aceitação
+formal** deste ADR é ato do Decision Owner (Vinicius Miranda) e efetiva-se
+com o merge do PR.
