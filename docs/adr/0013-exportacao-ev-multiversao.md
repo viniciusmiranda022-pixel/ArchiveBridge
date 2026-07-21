@@ -1,22 +1,33 @@
 # ADR-0013 — Exportação Enterprise Vault multiversão por capability discovery
 
-- **Status:** proposto _(evidência anexada; aguardando revisão do Decision Owner)_
-- **Data:** 2026-07-20
+- **Status:** aceito pelo Decision Owner em 2026-07-21; vigência no
+  repositório a partir do merge deste PR de aceite.
+- **Data:** 2026-07-20 (proposto) · 2026-07-21 (aceito pelo Decision Owner)
 - **Gate de aprovação:** Decision Owner + revisão Dev + Segurança
-- **Aprovadores:** _(pendente)_
 - **Substitui / substituído por:** substitui o [ADR-0004](0004-aspose-email-engine-primaria.md)
   (Aspose como writer/splitter primário)
 
-> **Evidência anexada (aguardando aceitação).** Revisão técnica de
-> `docs/ev/` em
-> [`evidence/0013-revisao-tecnica-ev.md`](evidence/0013-revisao-tecnica-ev.md)
-> (Evidence Owner: Engenharia). Conclui que as especificações **documentam
-> e materializam arquiteturalmente** a decisão e são tecnicamente sólidas;
-> registra as lacunas L1–L6 como **condições de certificação** (por
-> família, no laboratório), não de aceitação da decisão. A capability de
-> **segmentação** fica **CONDICIONAL** até a obtenção read-only dos limites
-> ser comprovada por família (L2). O Decision Owner **ainda revisará** antes da
-> aceitação formal; o status **não** foi alterado para `aceito`.
+## Registro de aceitação
+
+- **Decision Owner:** Vinicius Miranda — **decisão de aceitação em
+  2026-07-21**. Vigência/publicação: a partir do merge deste PR.
+- **Revisão executada (Dev + Segurança):** revisão técnica de `docs/ev/` em
+  [`evidence/0013-revisao-tecnica-ev.md`](evidence/0013-revisao-tecnica-ev.md)
+  (Evidence Owner: Engenharia), **publicada pelo PR #10**. Não havendo
+  revisor distinto, a competência é exercida/aceita pelo Decision Owner
+  (exceção de bootstrap na [matriz](gate-closure-matrix.md)).
+- **Condições obrigatórias de implementação/certificação (não de
+  aceitação):** as lacunas **L1–L6** da evidência permanecem obrigatórias e
+  são resolvidas por família no laboratório (assinatura/revogação de
+  scripts; sondagem read-only dos limites; esquema do `EvExportReport`;
+  custódia no modo assistido; permissões mínimas por família; concorrência
+  entre ondas).
+- **Segmentação:** mantida **`CONDICIONAL`** — não é certificada nem
+  habilitada até a obtenção **read-only** de `DetectedMin/MaxPstSizeMb` ser
+  **comprovada por família** (L2).
+- **Fluxo de fechamento (dois PRs):** evidência publicada pelo PR #10 (ADR
+  então `proposto`); flip para `aceito` neste PR — modalidade de PR de
+  aceite separado prevista na [matriz](gate-closure-matrix.md).
 
 > **Numeração:** os números **0009–0012 estão formalmente reservados** na
 > tabela "ADRs subsequentes" do [`README.md`](README.md) (fingerprint por

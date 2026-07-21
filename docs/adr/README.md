@@ -30,7 +30,7 @@ Miranda.
 | [ADR-0006](0006-purview-adapter-ga-inicial.md) | Purview como adapter GA inicial | responsável técnico pelo tenant | proposto |
 | [ADR-0007](0007-graph-fts-bloqueado.md) | Graph como adapter condicional; rota PST/EV → FTS não habilitada | Segurança/Arquitetura¹ | **aceito** |
 | [ADR-0008](0008-isolamento-por-tenant-e-projeto.md) | Modelo de isolamento por tenant/projeto | Segurança/Privacidade | proposto |
-| [ADR-0013](0013-exportacao-ev-multiversao.md) | Exportação EV multiversão por capability discovery | Dev + Segurança | proposto |
+| [ADR-0013](0013-exportacao-ev-multiversao.md) | Exportação EV multiversão por capability discovery | Dev + Segurança | **aceito** |
 
 ¹ A tabela da seção 9 do runbook descreve o gate do ADR-0007 como
 "reavaliação quando archive/FTS estiverem suportados". Isso criaria um
