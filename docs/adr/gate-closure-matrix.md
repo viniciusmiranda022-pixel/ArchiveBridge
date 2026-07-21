@@ -43,7 +43,7 @@ tem o status alterado nesta matriz.**
 | [0004](0004-aspose-email-engine-primaria.md) | — | — | — | — | **substituído** pelo [ADR-0013](0013-exportacao-ev-multiversao.md) em 2026-07-20, antes de aprovação |
 | [0005](0005-libpff-validador-independente.md) | Vinicius Miranda | Jurídico | análise de compatibilidade e licença LGPL | a atribuir | proposto |
 | [0006](0006-purview-adapter-ga-inicial.md) | Vinicius Miranda | responsável técnico pelo tenant | relatório de validação do Purview | a atribuir | proposto |
-| [0007](0007-graph-fts-bloqueado.md) | Vinicius Miranda | Segurança/Arquitetura | evidência Microsoft que sustenta o bloqueio — [evidência](evidence/0007-evidencia-microsoft-bloqueio.md) | Engenharia | **aceito** (merge de 2026-07-21) |
+| [0007](0007-graph-fts-bloqueado.md) | Vinicius Miranda | Segurança/Arquitetura | evidência do bloqueio PST/EV → Graph — [evidência](evidence/0007-evidencia-microsoft-bloqueio.md) (anexada, revalidada 2026-07-21) | Engenharia | proposto (evidência em revisão) |
 | [0008](0008-isolamento-por-tenant-e-projeto.md) | Vinicius Miranda | Segurança/Privacidade | threat model e avaliação de dados | a atribuir | proposto |
 | [0013](0013-exportacao-ev-multiversao.md) | Vinicius Miranda | Dev + Segurança | revisão técnica do capability discovery e dos adapters | a atribuir | proposto |
 

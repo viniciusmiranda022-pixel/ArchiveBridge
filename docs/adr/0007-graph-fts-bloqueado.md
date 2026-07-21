@@ -1,32 +1,31 @@
 # ADR-0007 — Graph Mailbox Import/Export (FTS) bloqueado
 
-- **Status:** aceito _(efetivado no merge deste PR pelo Decision Owner)_
-- **Data:** 2026-07-20 (proposto) · 2026-07-21 (aceito)
+- **Status:** proposto _(evidência anexada; aguardando revisão do Decision Owner)_
+- **Data:** 2026-07-20
 - **Gate de aprovação:** Decision Owner + revisão Segurança/Arquitetura
+- **Aprovadores:** _(pendente)_
 - **Substitui / substituído por:** —
 
-> O que este ADR aprova é a **decisão de manter o Graph FTS bloqueado no
-> primeiro release** — aprovável agora. A futura disponibilidade do Graph
-> FTS não é o gate deste ADR: é o **gatilho para um novo ADR substituto**
-> (condições da §28.3). A capability permanece `BLOCKED` até lá.
+> O que este ADR aprova é a **decisão de manter bloqueado o uso do Graph
+> Mailbox Import/Export como adapter de migração PST/Enterprise Vault** —
+> aprovável agora. A superfície Graph FTS é v1.0 válida e suporta archive
+> mailboxes; o bloqueio é específico à ausência de um produtor PST/EV → FTS
+> oficialmente suportado e certificado. A capability
+> `GraphFtsArchiveImport` permanece `BLOCKED`; a reavaliação futura é
+> gatilho para um **novo ADR substituto** (§28.3).
 
-## Registro de aceitação
+## Evidência anexada (aguardando aceitação)
 
-- **Decision Owner:** Vinicius Miranda — aceitação formal efetivada com o
-  merge do PR que anexa a evidência (data: 2026-07-21).
-- **Revisão necessária (Segurança/Arquitetura):** análise da documentação
-  Microsoft em
+- **Evidência:** análise documental revalidada em 2026-07-21 em
   [`evidence/0007-evidencia-microsoft-bloqueio.md`](evidence/0007-evidencia-microsoft-bloqueio.md),
-  produzida pela engenharia; conclui que a documentação oficial sustenta o
-  bloqueio (a API usa FTS, não recebe PST; cenário documentado é outro;
-  descoberta de archive amadurecendo; EWS depreciado). Não havendo revisor
-  distinto, a competência é exercida/aceita pelo Decision Owner (exceção de
-  bootstrap na [matriz](gate-closure-matrix.md)).
-- **Evidence Owner:** Engenharia ArchiveBridge.
-- **Escopo da aceitação:** aceita-se **manter o bloqueio**; a capability
-  `GraphFtsArchiveImport` permanece `BLOCKED`. Reavaliação futura exige
-  novo ADR substituto (§28.3) — a evidência é datada e deve ser revalidada
-  nesse momento.
+  produzida pela engenharia (Evidence Owner: Engenharia ArchiveBridge).
+- **Conclusão da evidência:** o Graph Mailbox Import/Export é v1.0 válido e
+  suporta archive mailboxes; o bloqueio é mantido **especificamente** para
+  o caminho PST/EV → Graph, porque o contrato de importação exige FTS e não
+  há produtor PST/EV → FTS oficialmente suportado e certificado.
+- **Status:** o Decision Owner (Vinicius Miranda) **ainda revisará** a
+  evidência corrigida antes da aceitação formal; o status **não** foi
+  alterado para `aceito`.
 
 ## Contexto
 

@@ -1,81 +1,105 @@
-# Evidência Microsoft do bloqueio do Graph FTS — gate do ADR-0007
+# Evidência do bloqueio do Graph FTS para PST/EV — gate do ADR-0007
 
 Evidência requerida pelo gate do
 [ADR-0007](../0007-graph-fts-bloqueado.md) (Graph Mailbox Import/Export /
-FTS mantido bloqueado no primeiro release).
+FTS mantido bloqueado **como adapter de migração PST/Enterprise Vault** no
+primeiro release).
 
 - **Tipo:** análise da documentação oficial Microsoft (revisão
   Segurança/Arquitetura)
 - **Produzido por (Evidence Owner):** Engenharia ArchiveBridge, sob direção
   do Decision Owner
-- **Data da análise:** 2026-07-21 · **Documentação de referência:** estado
-  citado no runbook (Apêndice F, refs. 201–205), consolidado em 2026-07-20
-- **Natureza:** a análise **sustenta a decisão de manter o bloqueio**; não
-  é a aceitação formal (ato do Decision Owner — ver "Recomendação").
+- **Data da análise / revalidação documental:** 2026-07-21
+- **Natureza:** a análise **sustenta a decisão de manter o bloqueio do
+  caminho PST/EV → Graph**; não é a aceitação formal (ato do Decision
+  Owner — ver "Recomendação").
 
 > [!NOTE]
-> Esta é uma análise documental datada. A disponibilidade futura do Graph
-> FTS **não** reabre este ADR — ela é gatilho para um **novo ADR
-> substituto** (condições da §28.3). A evidência deve ser revalidada se e
-> quando esse novo ADR for aberto.
+> Análise documental **datada (revalidada em 2026-07-21)**. A evolução da
+> API ou o surgimento de um produtor PST/EV → FTS oficialmente suportado
+> são gatilho para um **novo ADR substituto** (condições da §28.3), não
+> para a reabertura deste.
 
 ## 1. Pergunta objetiva
 
-A documentação oficial atual autoriza usar a API Graph Mailbox
-Import/Export (FTS) como caminho de **importação de PST para o Online
-Archive** do Microsoft 365, em v1.0 GA, para o cenário deste produto?
+Existe caminho **oficialmente documentado e certificado** para usar a API
+Graph Mailbox Import/Export como adapter de **migração de PST legado ou de
+export do Enterprise Vault** para o Microsoft 365, com fidelidade e suporte
+adequados?
 
 ## 2. Fontes analisadas (Apêndice F)
 
-| Ref. | Documento | O que estabelece |
-| --- | --- | --- |
-| 201 | [Graph mailbox import/export — concept](https://learn.microsoft.com/en-us/graph/mailbox-import-export-concept-overview) | visão conceitual; cenário-alvo é reimportar dados **exportados pela própria família de APIs**, em formato FTS |
-| 202 | [Graph mailbox import/export — API v1.0](https://learn.microsoft.com/en-us/graph/api/resources/mailbox-import-export-api-overview?view=graph-rest-1.0) | superfície v1.0; recursos e escopo publicados |
-| 203 | [Import Exchange mailbox item com FTS](https://learn.microsoft.com/en-us/graph/import-exchange-mailbox-item) | o payload de importação é **FTS (Fast Transfer Stream)**, não MIME/MSG/PST |
-| 204 | [Archive mailbox redirects](https://learn.microsoft.com/en-us/graph/handle-archive-mailbox-redirects) | descoberta/redirect de archive (308, `ErrorArchiveFolderMovedPermanently`) documentada em superfície ainda de amadurecimento |
-| 205 | [EWS deprecation](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/deprecation-of-ews-exchange-online) | EWS em depreciação — não é alternativa de longo prazo |
+| Ref. | Documento |
+| --- | --- |
+| 201 | [Graph mailbox import/export — concept](https://learn.microsoft.com/en-us/graph/mailbox-import-export-concept-overview) |
+| 202 | [Graph mailbox import/export — API v1.0](https://learn.microsoft.com/en-us/graph/api/resources/mailbox-import-export-api-overview?view=graph-rest-1.0) |
+| 203 | [Import Exchange mailbox item com FTS](https://learn.microsoft.com/en-us/graph/import-exchange-mailbox-item) |
+| 204 | [Archive mailbox redirects](https://learn.microsoft.com/en-us/graph/handle-archive-mailbox-redirects) |
+| 205 | [EWS deprecation](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/deprecation-of-ews-exchange-online) |
 
-## 3. Análise
+## 3. O que a documentação atual **suporta** (não é objeto de bloqueio)
 
-Os fatos documentados sustentam, cada um de forma independente, que o
-cenário PST→archive **não está aprovado** por esta API hoje (§28.2 do
-runbook):
+Registrado para não incorrer em subafirmação — o Graph Mailbox
+Import/Export é uma superfície válida:
 
-1. **A API não recebe PST.** O item importado é FTS (ref. 203). Usar a API
-   para PSTs exigiria implementar/usar um produtor de Fast Transfer Stream
-   completo e **demonstrar suporte** — o que a documentação não confere.
-2. **O cenário documentado é outro.** A concepção (ref. 201) descreve
-   reimportar dados **exportados pela mesma família de APIs**, não ingerir
-   PST legado ou export de Enterprise Vault.
-3. **Descoberta de archive ainda amadurecendo.** O tratamento de
-   redirects de archive (ref. 204) não está consolidado para o fluxo
-   pretendido; a §28.1 registra que páginas de redirect usam superfícies
-   beta.
-4. **Sem garantia de escala/limites.** A documentação não fixa
-   throttling/limites adequados a centenas de milhões de itens (§28.2);
-   consentimento application-wide é altamente privilegiado (risco de
-   segurança).
-5. **EWS não é rota alternativa.** Está em depreciação (ref. 205).
+1. **É v1.0.** `createImportSession` e `exportItems` possuem documentação
+   em Microsoft Graph **v1.0** (refs. 201–203).
+2. **Cobre archive mailboxes.** A documentação declara suporte a mailboxes
+   **primary, shared e archive** (refs. 201–202). Não se afirma aqui que o
+   suporte a archive esteja em beta.
+3. **A permissão existe.** `MailboxItem.ImportExport.All` está **documentada
+   e disponível** (refs. 202–203). Seu caráter altamente privilegiado é
+   tratado como **risco de segurança** (seção 5), não como ausência de
+   suporte.
+4. **Redirects de auto-expanding archive** (ref. 204) podem envolver
+   superfícies ainda em evolução, mas isso **não** permite generalizar que
+   todo o suporte a archive seja beta.
 
-Nenhuma das fontes autoriza o cenário; várias o contraindicam. Não foi
-encontrada evidência oficial que **habilite** o uso pretendido em v1.0 GA.
+## 4. Por que o ArchiveBridge mantém o bloqueio (escopo específico)
 
-## 4. Risco de segurança de não bloquear
+O bloqueio é **específico ao uso do Graph como caminho direto de ingestão
+de PST legado ou PST exportado pelo Enterprise Vault** — não ao Graph
+Mailbox Import/Export em geral:
 
-Habilitar o adapter sem suporte oficial exigiria consentimento
-application-wide de `MailboxItem.ImportExport(.All)` — permissão altamente
-privilegiada — para um fluxo não suportado e não testado em fidelidade.
-Manter a capability `BLOCKED` (fail closed) é a postura correta de
-segurança até que **todas** as condições da §28.3 sejam satisfeitas e
-registradas em capability evidence aprovada.
+1. **O contrato de importação exige FTS.** A operação recebe **FTS em
+   Base64**, não PST (ref. 203).
+2. **O cenário documentado é outro.** A importação prevê itens compatíveis
+   com o formato **produzido por `exportItems`** (round-trip da própria
+   família de APIs), não PST/EV (refs. 201, 203).
+3. **Não há produtor oficial PST/EV → FTS.** Não existe mecanismo Microsoft
+   documentado para **converter PST ou itens do Enterprise Vault em FTS
+   suportado**.
+4. **Sem evidência de fidelidade, escala, idempotência e suporte
+   comercial** para essa conversão — condições que a §28.3 exige antes de
+   qualquer habilitação.
 
-## 5. Recomendação
+Ou seja: a superfície é válida; o que falta é o **produtor PST/EV → FTS
+oficialmente suportado e certificado**. Sem ele, o adapter não pode ser o
+caminho GA de migração de PST/EV.
 
-A documentação oficial **sustenta o bloqueio**: recomenda-se aceitar a
-decisão do ADR-0007 de manter o Graph FTS bloqueado e fora do primeiro
-release, com a capability `GraphFtsArchiveImport` em `BLOCKED`.
+## 5. Risco de segurança da permissão privilegiada
 
-A **aceitação formal** é ato do Decision Owner (Vinicius Miranda) e
-**efetiva-se com o merge** do PR que anexa esta evidência e altera o status
-do ADR-0007 para `aceito`. A reavaliação futura, se as condições da §28.3
-mudarem, ocorre por **novo ADR substituto**, não pela reabertura deste.
+`MailboxItem.ImportExport.All` é consentimento **application-wide**
+altamente privilegiado. Habilitar o adapter sem um produtor FTS suportado
+e certificado exporia esse escopo por um fluxo não homologado — risco
+tratado como controle de segurança (Application Access Policy, escopo
+mínimo, capability evidence aprovada) quando/se o caminho for reavaliado.
+O caráter privilegiado é **risco a mitigar**, não prova de ausência de
+suporte da API.
+
+## 6. Recomendação
+
+> O Microsoft Graph Mailbox Import/Export é uma superfície v1.0 válida e
+> oferece suporte a archive mailboxes. Entretanto, o ArchiveBridge mantém
+> bloqueado o uso dessa API como adapter para migração PST/Enterprise
+> Vault, pois o contrato de importação exige FTS e não existe caminho
+> oficial documentado e certificado para converter PST ou exportação do EV
+> em FTS com fidelidade e suporte adequados.
+
+A capability `GraphFtsArchiveImport` permanece **`BLOCKED`**. A razão
+registrada do bloqueio é a **ausência de um produtor PST/EV → FTS
+oficialmente suportado e certificado** (não a inexistência da API nem
+suporte a archive). A **aceitação formal** é ato do Decision Owner
+(Vinicius Miranda) e efetiva-se com o merge do PR que anexa esta evidência
+e altera o status do ADR-0007 para `aceito`. Reavaliação futura ocorre por
+**novo ADR substituto** (§28.3).
