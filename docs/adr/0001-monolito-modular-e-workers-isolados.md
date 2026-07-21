@@ -1,10 +1,25 @@
 # ADR-0001 — Monólito modular no plano de controle e workers isolados
 
-- **Status:** proposto
-- **Data:** 2026-07-20
-- **Gate de aprovação:** arquiteto + tech lead
-- **Aprovadores:** _(pendente)_
+- **Status:** aceito _(efetivado no merge deste PR pelo Decision Owner)_
+- **Data:** 2026-07-20 (proposto) · 2026-07-21 (aceito)
+- **Gate de aprovação:** Decision Owner + revisão Dev/Tech Lead
 - **Substitui / substituído por:** —
+
+## Registro de aceitação
+
+- **Decision Owner:** Vinicius Miranda — aceitação formal efetivada com o
+  merge do PR que anexa a evidência (data: 2026-07-21).
+- **Revisão necessária (Dev/Tech Lead):** parecer arquitetural em
+  [`evidence/0001-parecer-arquitetural.md`](evidence/0001-parecer-arquitetural.md),
+  produzido pela engenharia; recomendação técnica de aceitar com ressalvas.
+  Não havendo Tech Lead distinto, a competência é exercida/aceita pelo
+  Decision Owner (exceção de bootstrap registrada na
+  [matriz](gate-closure-matrix.md)).
+- **Evidence Owner:** Engenharia ArchiveBridge.
+- **Ressalvas aceitas:** (1) o scaffolding deve incluir o projeto de testes
+  de arquitetura com as regras de dependência da §8.1 desde o início;
+  (2) "workers isolados" pressupõe a topologia de rede da §7.2, sustentada
+  pelo ADR-0008.
 
 ## Contexto
 
