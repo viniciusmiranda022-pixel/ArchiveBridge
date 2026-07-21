@@ -43,7 +43,7 @@ tem o status alterado nesta matriz.**
 | [0004](0004-aspose-email-engine-primaria.md) | — | — | — | — | **substituído** pelo [ADR-0013](0013-exportacao-ev-multiversao.md) em 2026-07-20, antes de aprovação |
 | [0005](0005-libpff-validador-independente.md) | Vinicius Miranda | Jurídico | análise de compatibilidade e licença LGPL | a atribuir | proposto |
 | [0006](0006-purview-adapter-ga-inicial.md) | Vinicius Miranda | responsável técnico pelo tenant | relatório de validação do Purview | a atribuir | proposto |
-| [0007](0007-graph-fts-bloqueado.md) | Vinicius Miranda | Segurança/Arquitetura | evidência Microsoft que sustenta o bloqueio | a atribuir | proposto |
+| [0007](0007-graph-fts-bloqueado.md) | Vinicius Miranda | Segurança/Arquitetura | evidência do bloqueio PST/EV → Graph — [evidência](evidence/0007-evidencia-microsoft-bloqueio.md) (anexada, revalidada 2026-07-21) | Engenharia | proposto (evidência em revisão) |
 | [0008](0008-isolamento-por-tenant-e-projeto.md) | Vinicius Miranda | Segurança/Privacidade | threat model e avaliação de dados | a atribuir | proposto |
 | [0013](0013-exportacao-ev-multiversao.md) | Vinicius Miranda | Dev + Segurança | revisão técnica do capability discovery e dos adapters | a atribuir | proposto |
 
@@ -63,16 +63,17 @@ revisão quando detiver a competência — o que a matriz garante é que a
 competência necessária foi efetivamente exercida e registrada, não que os
 papéis sejam pessoas diferentes.
 
-### ADR-0007: decisão aprovável agora vs. capability bloqueada
+### ADR-0007: adapter condicional vs. rota bloqueada
 
-O que se aprova no ADR-0007 é a **decisão de manter o Graph FTS bloqueado
-e fora do primeiro release** — decisão aprovável hoje por Arquitetura +
-Segurança, com base na documentação Microsoft atual. A **capability**
-`GraphFtsArchiveImport` permanece `BLOCKED` (bloqueada por design). A
-futura disponibilidade do Graph FTS **não é o gate deste ADR**: é o
-gatilho para um **novo ADR substituto** (condições da §28.3). Assim, o
-fechamento dos gates vigentes — e o desbloqueio do scaffolding — não
-depende de mudança futura da Microsoft.
+O que se aprova no ADR-0007 é manter o Graph como **adapter condicional**
+(`GraphFtsTargetAdapter`, `CONDITIONAL`), com a **rota PST/EV → FTS**
+específica em `GraphFtsImportFromPstEv = BLOCKED_PENDING_EVIDENCE` — não um
+bloqueio global do Graph. Decisão aprovável hoje por Arquitetura +
+Segurança. A promoção segue o ciclo `BLOCKED_PENDING_EVIDENCE → CANDIDATE →
+CERTIFIED → ENABLED` (config versionada + capability evidence); **novo ADR**
+só se mudar contrato, segurança ou arquitetura. Assim, o fechamento dos
+gates vigentes — e o desbloqueio do scaffolding — não depende de mudança
+futura da Microsoft. Ver [catálogo de adapters de destino](target-adapter-catalog.md).
 
 ## Delegações formais
 

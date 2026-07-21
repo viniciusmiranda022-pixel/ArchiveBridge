@@ -10,6 +10,14 @@
 
 A [§24 Strategy e capability gates](../runbook/04-parte-iv-destinos-m365.md#24-strategy-e-capability-gates) estabelece que "Microsoft 365" não é uma única capacidade: cada destino é avaliado por `ITargetIngestor` antes de aceitar uma onda. A [§25 Adapter Purview Network Upload - caminho GA](../runbook/04-parte-iv-destinos-m365.md#25-adapter-purview-network-upload---caminho-ga) define o Purview Network Upload (AzCopy + CSV mapping oficial) como o adapter habilitado no primeiro release, que **prepara e transporta**, enquanto a criação/início do job permanece no portal Purview. O bloqueio de >100 GB no mesmo archive (`MICROSOFT_ASSESSMENT_REQUIRED`) é mantido.
 
+> **Catálogo:** registrado no
+> [catálogo de adapters de destino](target-adapter-catalog.md) como
+> `PurviewPstImportAdapter` — papel `PRIMARY_GA_TARGET`, implementação
+> `NOT_IMPLEMENTED`, gate `PENDING_ADR_0006`, **estado-alvo** `ENABLED`. É o
+> adapter GA **inicial planejado** para PST (primeiro destino, não o único),
+> **ainda não habilitado em produção** — o Graph permanece condicional
+> (ADR-0007), preservando destinos evoluíveis.
+
 ## Decisão
 
 **Purview Network Upload** é o **único adapter de destino habilitado no primeiro release**, atrás de `ITargetIngestor`. O produto prepara parts, gera o CSV mapping oficial e transporta via AzCopy homologado; a **criação e o início do import job permanecem como tarefa de workflow humana no portal Purview** (§25.9), conforme orientação da Microsoft. O capacity gate (§25.4) é obrigatório e **bloqueia >100 GB para o mesmo archive** com estado `MICROSOFT_ASSESSMENT_REQUIRED`; auto-expanding archive não é bypass do limite do adapter.

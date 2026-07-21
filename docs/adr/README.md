@@ -28,7 +28,7 @@ Miranda.
 | [ADR-0004](0004-aspose-email-engine-primaria.md) | Aspose como writer/splitter primário | — | **substituído** pelo ADR-0013² |
 | [ADR-0005](0005-libpff-validador-independente.md) | libpff somente como verificador independente | Jurídico | proposto |
 | [ADR-0006](0006-purview-adapter-ga-inicial.md) | Purview como adapter GA inicial | responsável técnico pelo tenant | proposto |
-| [ADR-0007](0007-graph-fts-bloqueado.md) | Graph FTS bloqueado | Segurança/Arquitetura¹ | proposto |
+| [ADR-0007](0007-graph-fts-bloqueado.md) | Graph como adapter condicional; rota PST/EV → FTS não habilitada | Segurança/Arquitetura¹ | proposto (evidência anexada) |
 | [ADR-0008](0008-isolamento-por-tenant-e-projeto.md) | Modelo de isolamento por tenant/projeto | Segurança/Privacidade | proposto |
 | [ADR-0013](0013-exportacao-ev-multiversao.md) | Exportação EV multiversão por capability discovery | Dev + Segurança | proposto |
 
