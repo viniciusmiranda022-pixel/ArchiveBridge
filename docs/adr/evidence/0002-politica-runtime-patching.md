@@ -17,9 +17,14 @@ e política de atualização de dependências).
 
 - **Runtime alvo:** **.NET 10 LTS** para `Control.Api`, `Control.Orchestrator`
   e workers (capa do runbook).
-- **Fixação de versão:** SDK e runtime pinados via `global.json`
-  (`rollForward` controlado); imagem/base pinada por digest. Sem
-  `latest`/floating em produção.
+- **Fixação de versão:** o SDK é selecionado por `global.json`, com versão
+  e `rollForward` controlados. A família do runtime é definida pelo Target
+  Framework (`net10.0`), e o runtime efetivamente implantado é controlado
+  pelo modelo de publicação e pela imagem imutável: imagem de container
+  pinada por digest, imagem de VM identificada por versão/ID, runtime
+  incorporado ao artefato quando *self-contained* ou fornecido pela
+  imagem/plataforma patchada quando *framework-dependent*. Não são
+  permitidas referências `latest` ou floating em produção.
 - **Janela de suporte:** acompanhar o ciclo **LTS** da Microsoft; planejar o
   upgrade para a próxima LTS **antes** do fim de suporte da vigente
   (upgrade é trabalho planejado, não emergencial).
