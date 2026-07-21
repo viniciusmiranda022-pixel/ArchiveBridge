@@ -1,10 +1,21 @@
 # ADR-0004 — Aspose.Email como engine primária de escrita/split de PST
 
-- **Status:** proposto _(gate em aberto — ver abaixo)_
+- **Status:** **substituído** (antes de aprovação, em 2026-07-20)
 - **Data:** 2026-07-20
-- **Gate de aprovação:** PoC de biblioteca, licença e jurídico
-- **Aprovadores:** _(pendente)_
-- **Substitui / substituído por:** —
+- **Gate de aprovação:** PoC de biblioteca, licença e jurídico _(não mais aplicável)_
+- **Aprovadores:** — (nunca aprovado)
+- **Substitui / substituído por:** substituído por
+  [ADR-0013](0013-exportacao-ev-multiversao.md)
+
+> [!IMPORTANT]
+> **Substituído por decisão arquitetural do owner (2026-07-20):** o
+> Enterprise Vault passa a extrair e **segmentar** os PSTs na origem
+> (adapters selecionados por capability discovery — ADR-0013). O Aspose
+> sai do caminho crítico; a PoC (PR #4) foi fechada sem merge (conteúdo
+> recuperável em `refs/pull/4/head`, commit `aac4a61`). A ingestão de
+> PSTs pré-existentes acima do hard limit (§17) fica com decisão adiada
+> para novo ADR quando esse caminho for priorizado. O texto abaixo é
+> mantido como registro histórico.
 
 ## Contexto
 

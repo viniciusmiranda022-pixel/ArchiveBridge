@@ -25,18 +25,19 @@ Só então o `Status` do ADR muda de `proposto` para `aprovado` e a tabela de
 | [0001](0001-monolito-modular-e-workers-isolados.md) | Arquiteto + Tech Lead | A definir | parecer técnico | pendente |
 | [0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | Segurança + Plataforma | A definir | parecer de runtime e patching | pendente |
 | [0003](0003-azure-sql-e-service-bus-premium.md) | Arquitetura + FinOps | A definir | estimativa de custos | pendente |
-| [0004](0004-aspose-email-engine-primaria.md) | PoC + Licença + Jurídico | A definir | relatório de PoC ([plano](0004-poc-plan.md)), contrato e parecer | **bloqueado** |
+| [0004](0004-aspose-email-engine-primaria.md) | — (não mais aplicável) | — | — | **substituído** pelo [ADR-0013](0013-exportacao-ev-multiversao.md) em 2026-07-20, antes de aprovação |
 | [0005](0005-libpff-validador-independente.md) | Compatibilidade + LGPL | A definir | teste de compatibilidade e parecer jurídico | pendente |
 | [0006](0006-purview-adapter-ga-inicial.md) | Evidência Microsoft + tenant controlado | A definir | relatório de validação em tenant | pendente |
 | [0007](0007-graph-fts-bloqueado.md) | Arquitetura + Segurança | A definir | análise da documentação Microsoft confirmando que o cenário PST/FTS não está aprovado | pendente |
 | [0008](0008-isolamento-por-tenant-e-projeto.md) | Segurança + DPO | A definir | threat model e avaliação de dados | pendente |
+| [0013](0013-exportacao-ev-multiversao.md) | Arquitetura + Segurança | A definir | parecer sobre o ADR, o contrato `IEvExportAdapter` e a especificação de capability discovery | pendente |
 
 Legenda de estado:
 
 - **pendente** — aguarda o responsável exercer o gate e anexar evidência;
-- **bloqueado** — depende de artefatos externos ainda inexistentes
-  (ADR-0004: relatório de PoC executado, contrato de licença, parecer
-  jurídico).
+- **substituído** — ADR retirado antes de aprovação por decisão registrada;
+  o gate correspondente deixa de existir e o ADR substituto entra na
+  matriz com gate próprio.
 
 ### ADR-0007: decisão aprovável agora vs. capability bloqueada
 
@@ -58,5 +59,8 @@ de mudança futura da Microsoft.
 ## Efeito sobre o scaffolding
 
 Conforme a seção 9 do runbook, o scaffolding .NET (seção 10) permanece
-**bloqueado** até que os oito gates estejam fechados — incluindo o
-ADR-0004, que depende dos três artefatos externos.
+**bloqueado** até o fechamento de todos os gates vigentes. Com a
+substituição do ADR-0004 pelo ADR-0013, o conjunto obrigatório passa a
+ser: **ADR-0001 a 0003, ADR-0005 a 0008 e ADR-0013** (emenda de
+governança registrada aqui e em `README.md`; o texto da §9 do runbook
+v1.0 permanece original até revisão formal do DOCX).
