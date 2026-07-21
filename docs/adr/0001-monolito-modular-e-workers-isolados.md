@@ -19,7 +19,9 @@
 - **Ressalvas aceitas:** (1) o scaffolding deve incluir o projeto de testes
   de arquitetura com as regras de dependência da §8.1 desde o início;
   (2) "workers isolados" pressupõe a topologia de rede da §7.2, sustentada
-  pelo ADR-0008.
+  pelo ADR-0008; (3) o isolamento de blast radius é propriedade
+  pretendida — a ser comprovada, após o scaffolding, por testes de falha,
+  recuperação e blast radius.
 
 ## Contexto
 
@@ -27,7 +29,7 @@ O runbook define, em [§6 Princípios arquiteturais](../runbook/02-parte-ii-arqu
 
 ## Decisão
 
-O plano de controle (`Control.Api`, `Control.Orchestrator` e os módulos de domínio) é **um único deployable monolítico modular** com fronteiras internas explícitas entre módulos. O processamento pesado é executado por **workers isolados** em unidades de implantação separadas (`pst-worker-windows`, `upload-worker-windows`, `source-connector-windows`, `recon-worker`, `evidence-signer`), cada um com identidade e fronteira de rede próprias. A arquitetura é **hexagonal**: o domínio não conhece SDK de Azure, Aspose, Veritas, Purview ou Graph; interfaces vivem em `Application`, adapters em `Infrastructure`. Regras de dependência (§8.1) são verificadas por testes de arquitetura que falham o build.
+O plano de controle (`Control.Api`, `Control.Orchestrator` e os módulos de domínio) é **um único deployable monolítico modular** com fronteiras internas explícitas entre módulos. O processamento pesado é executado por **workers isolados** em unidades de implantação separadas (`pst-worker-windows`, `upload-worker-windows`, `source-connector-windows`, `recon-worker`, `evidence-signer`), cada um com identidade e fronteira de rede próprias. A arquitetura é **hexagonal**: o domínio não conhece SDK de Azure, Veritas/Enterprise Vault, Purview ou Graph; interfaces vivem em `Application`, adapters em `Infrastructure`. Regras de dependência (§8.1) são verificadas por testes de arquitetura que falham o build.
 
 ## Alternativas consideradas
 

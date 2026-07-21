@@ -32,10 +32,10 @@ A decisão avaliada tem três componentes (runbook
 
 | Requisito do runbook | Como a decisão atende |
 | --- | --- |
-| Isolamento de blast radius (§6 fail closed; §30 DoS/EoP) | PST malformado derruba, no máximo, um worker isolado — não o plano de controle |
+| Isolamento de blast radius (§6 fail closed; §30 DoS/EoP) | a arquitetura **visa** restringir a falha de um PST malformado ao worker isolado, sem atingir o plano de controle (propriedade pretendida — ver ressalva 3) |
 | Segregação de identidade e menor privilégio (§31) | cada worker é unidade de implantação com Managed Identity própria; alinha-se ao ADR-0008 |
 | Custo transacional baixo, sem microsserviços prematuros (§6, princípio 11) | monólito modular evita fan-out de rede/deploy sem perder fronteiras |
-| Domínio agnóstico de fornecedor (§6 hexagonal; §8.1) | interfaces no núcleo; adapters isolam Aspose/EV/Purview/Graph; trocar fornecedor (ex.: ADR-0013) não toca o domínio |
+| Domínio agnóstico de fornecedor (§6 hexagonal; §8.1) | interfaces no núcleo; adapters isolam os fornecedores ativos (EV/Purview/Graph); trocar fornecedor (ex.: substituição do splitter pelo ADR-0013) não toca o domínio |
 | Fronteiras aplicáveis (§8.1) | `NetArchTest`/equivalente falha o build ao violar regra de dependência — a fronteira é executável, não convencional |
 
 ### 2.2 Riscos e mitigação
@@ -70,6 +70,11 @@ exportação isolam o EV). Não há conflito detectado com os demais ADRs.
 - "Workers isolados" pressupõe a topologia de rede da §7.2 (sem IP
   público, private endpoints, NSG negando lateral); o parecer assume que
   ADR-0008 sustentará esses controles.
+- **Isolamento de blast radius é propriedade pretendida, ainda não
+  comprovada.** Não há implementação; a afirmação de que a falha se
+  restringe ao worker isolado **deverá ser validada após o scaffolding**
+  por testes de falha (PST malformado), recuperação e blast radius — a
+  arquitetura viabiliza a propriedade, mas o teste a comprova.
 
 ## 4. Recomendação
 
