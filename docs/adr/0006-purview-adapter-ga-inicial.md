@@ -10,10 +10,13 @@
 
 A [§24 Strategy e capability gates](../runbook/04-parte-iv-destinos-m365.md#24-strategy-e-capability-gates) estabelece que "Microsoft 365" não é uma única capacidade: cada destino é avaliado por `ITargetIngestor` antes de aceitar uma onda. A [§25 Adapter Purview Network Upload - caminho GA](../runbook/04-parte-iv-destinos-m365.md#25-adapter-purview-network-upload---caminho-ga) define o Purview Network Upload (AzCopy + CSV mapping oficial) como o adapter habilitado no primeiro release, que **prepara e transporta**, enquanto a criação/início do job permanece no portal Purview. O bloqueio de >100 GB no mesmo archive (`MICROSOFT_ASSESSMENT_REQUIRED`) é mantido.
 
-> **Catálogo:** registrado como `PurviewPstImportAdapter = ENABLED` no
-> [catálogo de adapters de destino](target-adapter-catalog.md). É o adapter
-> GA **inicial** para PST — primeiro destino, não o único: o Graph
-> permanece condicional (ADR-0007), preservando destinos evoluíveis.
+> **Catálogo:** registrado no
+> [catálogo de adapters de destino](target-adapter-catalog.md) como
+> `PurviewPstImportAdapter` — papel `PRIMARY_GA_TARGET`, implementação
+> `NOT_IMPLEMENTED`, gate `PENDING_ADR_0006`, **estado-alvo** `ENABLED`. É o
+> adapter GA **inicial planejado** para PST (primeiro destino, não o único),
+> **ainda não habilitado em produção** — o Graph permanece condicional
+> (ADR-0007), preservando destinos evoluíveis.
 
 ## Decisão
 

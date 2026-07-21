@@ -22,12 +22,22 @@ primeiro release).
 > [ADR-0007](../0007-graph-fts-bloqueado.md)); um **novo ADR** só é
 > necessário se mudar contrato, segurança ou arquitetura do adapter.
 
-## 1. Pergunta objetiva
+## 1. Perguntas objetivas (dois gates independentes)
 
-Existe caminho **oficialmente documentado e certificado** para usar a API
-Graph Mailbox Import/Export como adapter de **migração de PST legado ou de
-export do Enterprise Vault** para o Microsoft 365, com fidelidade e suporte
-adequados?
+"Documentado/suportado pela Microsoft" e "certificado internamente pelo
+ArchiveBridge" são **gates diferentes**. A evidência responde a **duas
+verificações independentes** sobre a rota PST/EV → FTS → Graph:
+
+- **Q1 (Microsoft):** foi identificado, **nas fontes Microsoft analisadas**,
+  um caminho **suportado** para produzir FTS a partir de PST ou export do
+  Enterprise Vault? → **Não** (seções 3–4).
+- **Q2 (ArchiveBridge):** esse caminho foi **implementado e certificado
+  internamente** quanto a fidelidade, escala, idempotência, segurança e
+  operação? → **Não** (não implementado nem certificado).
+
+Ambas as respostas são **negativas hoje, por razões diferentes** — o que
+sustenta manter a rota em `BLOCKED_PENDING_EVIDENCE` (sem afirmar
+inexistência universal nem bloquear o Graph globalmente).
 
 ## 2. Fontes analisadas (Apêndice F)
 

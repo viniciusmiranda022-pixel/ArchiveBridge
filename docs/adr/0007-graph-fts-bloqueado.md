@@ -62,19 +62,43 @@ A [§28 Adapter Graph Mailbox Import/Export](../runbook/04-parte-iv-destinos-m36
 2. **Design prospectivo do ingestor.** O design **prevê** que o
    `GraphFtsTargetIngestor` seja implementado como adapter compilável,
    porém bloqueado. **Quando implementado**, o capability gate **deverá
-   retornar** `Blocked("GRAPH_FTS_ARCHIVE_NOT_APPROVED")`, impedindo seu uso
-   para migração PST/Enterprise Vault. _(Ainda não existe código de
-   produto; esta é uma prescrição de design, não um estado atual.)_
+   retornar** um bloqueio **associado explicitamente à capability da rota**,
+   impedindo seu uso para migração PST/Enterprise Vault — sem afetar outras
+   capabilities futuras do Graph:
+
+   ```text
+   Blocked(
+       capability: "GraphFtsImportFromPstEv",
+       reasonCode: "GRAPH_FTS_PST_EV_PENDING_EVIDENCE"
+   )
+   ```
+
+   _(Ainda não existe código de produto; esta é uma prescrição de design,
+   não um estado atual. O reason code é específico da rota PST/EV — não um
+   `GRAPH_FTS_ARCHIVE_NOT_APPROVED` global.)_
 
 3. **Capability específica, não global.** A rota é controlada pela
    capability **`GraphFtsImportFromPstEv`**, com estado inicial
    **`BLOCKED_PENDING_EVIDENCE`** — nome específico para não transmitir que
    todo uso de Graph FTS/archive esteja bloqueado.
 
-4. **Purview permanece o adapter GA inicial para PST**
-   (`PurviewPstImportAdapter = ENABLED`, [ADR-0006](0006-purview-adapter-ga-inicial.md)).
-   O condicional do Graph não altera essa decisão; apenas garante que o
-   produto tenha um segundo caminho evoluível.
+4. **Purview permanece o adapter GA inicial planejado para PST**
+   (`PurviewPstImportAdapter`, papel `PRIMARY_GA_TARGET`, estado-alvo
+   `ENABLED`; [ADR-0006](0006-purview-adapter-ga-inicial.md)). Não está
+   habilitado em produção hoje — não há implementação e o ADR-0006 segue
+   `proposto` (ver [catálogo](target-adapter-catalog.md)). O condicional do
+   Graph não altera essa decisão; apenas garante um segundo caminho
+   evoluível.
+
+## Precedência sobre o runbook
+
+Este ADR **substitui, até a consolidação do runbook v1.1, qualquer
+interpretação da seção 28 que trate o Graph Mailbox Import/Export como
+globalmente bloqueado**. O bloqueio vigente é **exclusivamente** da
+capability `GraphFtsImportFromPstEv` (rota PST/EV → FTS → Graph). O DOCX
+fonte **não** é alterado agora; registra-se aqui apenas a precedência da
+decisão aceita, para evitar interpretações divergentes entre
+desenvolvedores.
 
 ### Ciclo de promoção da capability
 

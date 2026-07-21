@@ -7,16 +7,28 @@ e do estado de suas capabilities. O objetivo é que o produto tenha
 Purview é o caminho GA hoje; o Graph é condicional, com ciclo de promoção
 definido.
 
-## Estados
+## Quatro dimensões separadas
 
-**Status arquitetural do adapter** (ele existe e é selecionável?):
+Para **não confundir decisão arquitetural pretendida com estado real de
+implementação**, cada adapter é descrito por quatro dimensões
+independentes:
 
-- `ENABLED` — habilitado e selecionável em produção;
-- `CONDITIONAL` — presente na arquitetura, selecionável **apenas** quando a
-  capability da rota estiver certificada;
-- `RETIRED` — removido/descontinuado.
+1. **Papel arquitetural** — o que o adapter é na arquitetura:
+   - `PRIMARY_GA_TARGET` — destino GA primário planejado;
+   - `CONDITIONAL` — presente na arquitetura, selecionável **apenas** quando
+     a capability da rota estiver certificada;
+   - `RETIRED` — removido/descontinuado.
+2. **Implementação atual** — existe código/runtime? `NOT_IMPLEMENTED` |
+   `IN_PROGRESS` | `IMPLEMENTED`.
+3. **Gate atual** — o que trava a habilitação hoje (ADR pendente, evidência
+   pendente…).
+4. **Estado-alvo** — para onde a decisão aponta quando implementação e gate
+   estiverem satisfeitos.
 
-**Estado da capability de uma rota** (ciclo de promoção):
+**Nenhum adapter está habilitado em produção hoje** — não há implementação.
+`ENABLED` é **estado-alvo**, não estado atual.
+
+### Ciclo de promoção da capability de uma rota
 
 ```text
 BLOCKED_PENDING_EVIDENCE → CANDIDATE → CERTIFIED → ENABLED
@@ -29,20 +41,23 @@ arquitetura** do adapter — não para uma promoção já prevista.
 
 ## Catálogo
 
-| Adapter | Status arquitetural | Rota / capability | Estado da capability | ADR |
-| --- | --- | --- | --- | --- |
-| `PurviewPstImportAdapter` | **ENABLED** | PST → Purview Network Upload (GA) | `ENABLED` | [ADR-0006](0006-purview-adapter-ga-inicial.md) |
-| `GraphFtsTargetAdapter` | **CONDITIONAL** | PST/EV → FTS → Graph (`GraphFtsImportFromPstEv`) | `BLOCKED_PENDING_EVIDENCE` | [ADR-0007](0007-graph-fts-bloqueado.md) |
+| Adapter | Papel arquitetural | Implementação atual | Gate atual | Estado-alvo | ADR |
+| --- | --- | --- | --- | --- | --- |
+| `PurviewPstImportAdapter` | `PRIMARY_GA_TARGET` | `NOT_IMPLEMENTED` | `PENDING_ADR_0006` | `ENABLED` | [ADR-0006](0006-purview-adapter-ga-inicial.md) |
+| `GraphFtsTargetAdapter` | `CONDITIONAL` | `NOT_IMPLEMENTED` | `GraphFtsImportFromPstEv = BLOCKED_PENDING_EVIDENCE` | `ENABLED` após certificação | [ADR-0007](0007-graph-fts-bloqueado.md) |
 
 Notas:
 
-- `PurviewPstImportAdapter = ENABLED` é o adapter GA inicial para PST
-  (mantém o capacity gate e o bloqueio >100 GB / `MICROSOFT_ASSESSMENT_REQUIRED`
-  do ADR-0006). Não é exclusivo: é o primeiro destino, não o único.
-- `GraphFtsTargetAdapter` permanece **CONDITIONAL** — disponível na
-  arquitetura, selecionável só quando `GraphFtsImportFromPstEv` for
-  promovida a `ENABLED`. O bloqueio é **específico à rota PST/EV → FTS**,
-  não ao Graph em geral (ver ADR-0007).
+- **Purview = primeiro adapter GA planejado**, não um adapter atualmente
+  habilitado em produção: não há código nem runtime e o ADR-0006 segue
+  `proposto`. Quando implementado, validado em tenant e com o ADR-0006
+  aceito, o estado-alvo é `ENABLED` (mantendo o capacity gate e o bloqueio
+  >100 GB / `MICROSOFT_ASSESSMENT_REQUIRED`). É o primeiro destino, não o
+  único.
+- **Graph = segundo adapter, condicional**: disponível na arquitetura,
+  selecionável só quando `GraphFtsImportFromPstEv` for promovida a
+  `ENABLED`. O bloqueio é **específico à rota PST/EV → FTS**, não ao Graph
+  em geral (ver ADR-0007).
 - Rotas do Graph **fora** de PST/EV (ex.: round-trip de dados exportados
   pela própria API Graph) não são objeto do bloqueio deste catálogo e, se
   vierem a ser usadas, entram como capability própria.
