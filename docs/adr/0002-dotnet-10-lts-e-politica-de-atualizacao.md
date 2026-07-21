@@ -1,21 +1,33 @@
 # ADR-0002 — .NET 10 LTS e política de atualização de dependências
 
-- **Status:** proposto _(evidência anexada; aguardando revisão do Decision Owner)_
-- **Data:** 2026-07-20
+- **Status:** aceito pelo Decision Owner em 2026-07-21; vigência no
+  repositório a partir do merge deste PR de aceite.
+- **Data:** 2026-07-20 (proposto) · 2026-07-21 (aceito pelo Decision Owner)
 - **Gate de aprovação:** Decision Owner + revisão Dev + Segurança
-- **Aprovadores:** _(pendente)_
 - **Substitui / substituído por:** —
 
-> **Evidência anexada (aguardando aceitação).** Política de runtime,
-> atualização e patching em
-> [`evidence/0002-politica-runtime-patching.md`](evidence/0002-politica-runtime-patching.md)
-> (Evidence Owner: Engenharia). Define runtime .NET 10 LTS pinado, gestão
-> central de pacotes com restore determinístico, atualização por PR com
-> scan de vulnerabilidade + SBOM, e patching de imagem (mensal + CVE
-> crítico); registra R1–R3 como condições de operação contínua. O Decision
-> Owner **ainda revisará** antes da aceitação formal; o status **não** foi
-> alterado para `aceito`. O flip ocorrerá **neste mesmo PR** após
-> autorização.
+## Registro de aceitação
+
+- **Decision Owner:** Vinicius Miranda — **decisão de aceitação em
+  2026-07-21**. Vigência/publicação: a partir do merge deste PR.
+- **Revisão executada (Dev + Segurança):** política de runtime, atualização
+  e patching em
+  [`evidence/0002-politica-runtime-patching.md`](evidence/0002-politica-runtime-patching.md)
+  (Evidence Owner: Engenharia), **publicada pelo PR #12**. Não havendo
+  revisor distinto, a competência é exercida/aceita pelo Decision Owner
+  (exceção de bootstrap na [matriz](gate-closure-matrix.md)).
+- **Condições obrigatórias de operação contínua (não de aceitação):** R1
+  (EOL da LTS vigente sem upgrade planejado), R2 (pacote crítico sem
+  correção upstream), R3 (deriva entre imagem de worker e baseline de
+  hardening) permanecem obrigatórias.
+- **Fixação de versão vigente:** distinção mantida entre **SDK**
+  (`global.json`, versão + `rollForward`), **família do runtime** (Target
+  Framework `net10.0`) e **runtime implantado** (modelo de publicação +
+  imagem imutável — container por digest, VM por versão/ID, *self-contained*
+  vs *framework-dependent*); sem `latest`/floating em produção.
+- **Fluxo de fechamento (dois PRs):** evidência publicada pelo PR #12 (ADR
+  então `proposto`); flip para `aceito` neste PR — modalidade de PR de
+  aceite separado prevista na [matriz](gate-closure-matrix.md).
 
 ## Contexto
 
