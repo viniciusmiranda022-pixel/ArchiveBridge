@@ -80,10 +80,19 @@ A eficácia do mecanismo escolhido é **asserção do teste multi-worker**
   token). O worker **renova por heartbeat** (ex.: a cada `leaseSeconds/3`),
   estendendo `lease_until` enquanto vivo.
 - **Fencing:** heartbeat, checkpoint e conclusão são `UPDATE`s
-  **condicionados a `job_id + owner_worker + lease_epoch + row_ver`**. Se
-  zero linhas forem afetadas, o worker **perdeu o lease e deve interromper
-  imediatamente** a execução — escrita tardia de worker zumbi nunca é
-  aceita.
+  **condicionados a `job_id + owner_worker + lease_epoch`** (o token de
+  fencing). Se zero linhas forem afetadas, o worker **perdeu o lease e deve
+  interromper imediatamente** a execução — escrita tardia de worker zumbi
+  nunca é aceita.
+- **`row_ver` (`rowversion`) NÃO é o token de fencing.** Ele muda a **cada**
+  `UPDATE`; se fosse incluído na condição, um segundo update do **mesmo
+  worker** (ex.: heartbeat seguido de checkpoint) usaria um `row_ver` já
+  obsoleto, afetaria zero linhas e mandaria erroneamente um worker **válido**
+  parar. O `lease_epoch` só muda quando o job é **re-reivindicado** (novo
+  claim), então updates sucessivos do worker legítimo mantêm o mesmo
+  `lease_epoch` e passam, enquanto um zumbi cujo job foi reassumido tem
+  `lease_epoch` antigo e é barrado. `rowversion` permanece para concorrência
+  otimista entre escritores genuinamente distintos, **não** para o lease.
 - **A expiração do lease protege o banco, não o mundo externo:** um worker
   zumbi pode ainda estar concluindo um efeito externo em voo (criar import
   job, reenviar parte, operação no Purview/Exchange Online). Por isso, como
@@ -169,13 +178,29 @@ consulta ledger/resultado antes de decidir repetir.)
 
 ## 7. Failover do SQL Server
 
-- HA por **Always On/cluster** (perfil HA). Transações em voo no momento do
-  failover **fazem rollback** — nenhum efeito parcial confirmado.
-- Leases usam **tempo do banco** (`SYSUTCDATETIME()`), consistente após
-  failover; leases expirados são tratados pelo reaper **pelas duas rotas do
-  item 2** (local → `PENDING`; efeito externo possível →
-  `RECOVERY_REQUIRED`/`RECONCILING`). O ledger do item 3 garante que um
-  retry pós-failover **não** duplica efeito.
+- **Requisito de zero-data-loss (obrigatório para o ledger).** A garantia de
+  não-duplicação depende de o ledger `external_operations` **nunca perder
+  linhas já commitadas**. Um failover **assíncrono ou forçado** do Always On
+  pode perder commits (não apenas dar rollback em transações em voo): se um
+  `INTENT` commitado se perder **depois** de o efeito externo ter tido
+  sucesso, o novo primário não teria a linha única e uma tentativa posterior
+  reemitiria a importação. Portanto, o perfil HA que hospeda a fila+ledger
+  **exige commit síncrono (availability mode = synchronous-commit) com
+  failover automático apenas entre réplicas síncronas**. Réplicas
+  assíncronas servem só a DR/leitura e **não** são alvo de failover
+  automático do primário; failover forçado com possível perda de dados é
+  procedimento manual de desastre, seguido de reconciliação (abaixo).
+- **Reconciliação resiliente a ledger ausente (defesa em profundidade).** O
+  `operation_key` é **determinístico** e o efeito externo carrega um
+  identificador derivável dele visível no provedor. Se, após um failover
+  forçado, a linha do ledger estiver ausente, a recuperação **consulta o
+  provedor por esse chave/idempotência antes de qualquer reemissão** — nunca
+  reemite só porque o ledger local não tem registro.
+- Transações em voo no momento de um failover síncrono **fazem rollback**
+  (nenhum efeito parcial confirmado). Leases usam **tempo do banco**
+  (`SYSUTCDATETIME()`), consistente após failover; leases expirados são
+  tratados pelo reaper **pelas duas rotas do item 2** (local → `PENDING`;
+  efeito externo possível → `RECOVERY_REQUIRED`/`RECONCILING`).
 - Requisito: nenhuma operação com efeito externo é confirmada `COMPLETED`
   sem estado `CONFIRMED` no ledger.
 
@@ -215,11 +240,19 @@ suficiente para HA.
 ## Recomendação
 
 O contrato acima **impede** os modos de falha listados e torna a fila SQL
-Server **suficiente e correta** para a escala inicial on-premises.
-Recomenda-se **aceitar o ADR-0003**, com os itens 1–9 como **contrato de
-implementação** verificável (o item 8 é teste obrigatório antes de
-produção) e a nota de segredos como condição do perfil HA.
+Server **suficiente e correta** para a escala inicial on-premises, com os
+itens 1–9 como **contrato de implementação** verificável (o item 8 é teste
+obrigatório antes de produção), o requisito de **commit síncrono
+zero-data-loss** para o ledger no perfil HA (item 7) e a nota de segredos
+como condição do perfil HA.
 
-A **aceitação formal** é ato do Decision Owner; o ADR-0003 permanece
-`proposto`. O flip para `aceito` ocorrerá **neste mesmo PR** após
-autorização.
+## Estado
+
+**ADR-0003 aceito** pelo Decision Owner (Vinicius Miranda) em **2026-07-22**;
+vigência a partir do merge do **PR #14** (fluxo de PR único: evidência +
+flip no mesmo PR). Esta evidência foi corrigida no mesmo PR após revisão
+automatizada (fencing por `lease_epoch` sem `row_ver`; failover
+zero-data-loss do ledger; esta nota de estado). Os itens 1–9 e as condições
+de HA/segredos permanecem **obrigatórios na implementação e certificação**,
+não de aceitação. Registro completo em
+[`../0003-azure-sql-e-service-bus-premium.md`](../0003-azure-sql-e-service-bus-premium.md#registro-de-aceitação).

@@ -22,11 +22,16 @@
   (exceção de bootstrap na [matriz](gate-closure-matrix.md)).
 - **Condições obrigatórias de implementação (não de aceitação):** itens 1–9
   do parecer da fila como **contrato de implementação verificável** — em
-  particular fencing por `lease_epoch`, rotas `RECOVERY_REQUIRED`/
-  `RECONCILING` para efeito externo, ledger `external_operations`
-  (ambíguo nunca repete automaticamente) e anti-starvation por aging —
-  com o **teste de concorrência multi-worker obrigatório antes de
-  produção**; nota DPAPI: nó único apenas, HA exige segredos multi-nó.
+  particular fencing por `owner_worker + lease_epoch` (não por `row_ver`),
+  rotas `RECOVERY_REQUIRED`/`RECONCILING` para efeito externo, ledger
+  `external_operations` (ambíguo nunca repete automaticamente), **failover
+  HA com commit síncrono zero-data-loss para o ledger** e anti-starvation
+  por aging — com o **teste de concorrência multi-worker obrigatório antes
+  de produção**; nota DPAPI: nó único apenas, HA exige segredos multi-nó.
+- **Correção pós-revisão (no mesmo PR, antes do merge):** a evidência foi
+  ajustada após revisão automatizada (fencing sem `row_ver`; requisito de
+  failover zero-data-loss do ledger; nota de estado alinhada ao aceite) — a
+  decisão de aceitação permanece; a vigência é o merge.
 - **Pendências downstream registradas (fora deste ADR):** revisão do
   ADR-0008 (identidade/rede on-prem), do runbook operacional EV (Azure
   Bastion/JIT) e do runbook DOCX v1.1 (suposições PaaS da Parte V).
@@ -194,18 +199,19 @@ demonstrem que o SQL Server virou gargalo — **não** é requisito inicial.
 > responsabilidade do produto e está especificada em
 > [`evidence/0003-parecer-fila-sql-onprem.md`](evidence/0003-parecer-fila-sql-onprem.md):
 > aquisição atômica (`rowversion` gerado pelo SQL Server, nunca atribuído);
-> lease + heartbeat com **fencing por `lease_epoch`** (updates condicionados
-> a `owner_worker + lease_epoch + row_ver`; perda de lease invalida o
-> worker); jobs com possível **efeito externo** nunca voltam automaticamente
-> a `PENDING` — vão a `RECOVERY_REQUIRED`/`RECONCILING` com consulta ao
-> provedor; **ledger `external_operations`**
+> lease + heartbeat com **fencing por `owner_worker + lease_epoch`** (o
+> `row_ver` **não** é o token de fencing — muda a cada update; perda de
+> lease invalida o worker); jobs com possível **efeito externo** nunca
+> voltam automaticamente a `PENDING` — vão a `RECOVERY_REQUIRED`/
+> `RECONCILING` com consulta ao provedor; **ledger `external_operations`**
 > (`INTENT/SUBMITTED/CONFIRMED/AMBIGUOUS/FAILED`) porque **não há transação
 > distribuída** com Purview/Graph/EXO — ambíguo nunca repete
-> automaticamente; **anti-starvation** por aging/quota/WRR; retry/backoff/
-> DLQ; retenção; failover; teste de concorrência multi-worker (fencing +
-> starvation); critério objetivo para broker opcional. Nota: DPAPI por
-> máquina só serve ao **perfil de nó único**; HA exige mecanismo de
-> segredos multi-nó.
+> automaticamente; **failover HA exige commit síncrono zero-data-loss** para
+> o ledger (mais reconciliação por chave visível no provedor); **anti-
+> starvation** por aging/quota/WRR; retry/backoff/DLQ; retenção; teste de
+> concorrência multi-worker (fencing + starvation); critério objetivo para
+> broker opcional. Nota: DPAPI por máquina só serve ao **perfil de nó
+> único**; HA exige mecanismo de segredos multi-nó.
 
 ## Perfis de implantação
 
