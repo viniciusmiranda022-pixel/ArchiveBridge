@@ -165,15 +165,23 @@ ser adicionado futuramente como adapter opcional**, caso os testes
 demonstrem que o SQL Server virou gargalo — **não** é requisito inicial.
 
 > **Contrato de correção da fila.** Como o broker foi retirado, a garantia
-> contra dupla execução, job preso, dupla importação, lease expirado,
+> contra dupla execução, job preso, dupla importação, worker zumbi,
 > starvation, crescimento de Inbox/Outbox/DLQ e inconsistência em failover é
 > responsabilidade do produto e está especificada em
-> [`evidence/0003-parecer-fila-sql-onprem.md`](evidence/0003-parecer-fila-sql-onprem.md)
-> (aquisição atômica; lease/heartbeat/recuperação; idempotência/dedup;
-> Outbox/Inbox; retry/backoff/DLQ; retenção; failover; teste de
-> concorrência multi-worker; critério objetivo para broker opcional). Nota:
-> DPAPI por máquina só serve ao **perfil de nó único**; HA exige mecanismo
-> de segredos multi-nó.
+> [`evidence/0003-parecer-fila-sql-onprem.md`](evidence/0003-parecer-fila-sql-onprem.md):
+> aquisição atômica (`rowversion` gerado pelo SQL Server, nunca atribuído);
+> lease + heartbeat com **fencing por `lease_epoch`** (updates condicionados
+> a `owner_worker + lease_epoch + row_ver`; perda de lease invalida o
+> worker); jobs com possível **efeito externo** nunca voltam automaticamente
+> a `PENDING` — vão a `RECOVERY_REQUIRED`/`RECONCILING` com consulta ao
+> provedor; **ledger `external_operations`**
+> (`INTENT/SUBMITTED/CONFIRMED/AMBIGUOUS/FAILED`) porque **não há transação
+> distribuída** com Purview/Graph/EXO — ambíguo nunca repete
+> automaticamente; **anti-starvation** por aging/quota/WRR; retry/backoff/
+> DLQ; retenção; failover; teste de concorrência multi-worker (fencing +
+> starvation); critério objetivo para broker opcional. Nota: DPAPI por
+> máquina só serve ao **perfil de nó único**; HA exige mecanismo de
+> segredos multi-nó.
 
 ## Perfis de implantação
 
