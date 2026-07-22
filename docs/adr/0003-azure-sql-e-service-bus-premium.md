@@ -1,11 +1,35 @@
 # ADR-0003 — Persistência e execução durável on-premises
 
-- **Status:** proposto _(reescrito em 2026-07-21; aguardando revisão do Decision Owner)_
-- **Data:** 2026-07-20 (versão original) · 2026-07-21 (reescrito — pivô on-premises)
+- **Status:** aceito pelo Decision Owner em 2026-07-22; vigência no
+  repositório a partir do merge do PR #14.
+- **Data:** 2026-07-20 (versão original) · 2026-07-21 (reescrito — pivô
+  on-premises) · 2026-07-22 (aceito pelo Decision Owner)
 - **Gate de aprovação:** Decision Owner + revisão Dev + Arquitetura/Segurança
-- **Aprovadores:** _(pendente)_
 - **Substitui / substituído por:** reescreve integralmente a versão anterior
   deste ADR ("Azure SQL e Service Bus Premium"), que **não** foi aceita.
+
+## Registro de aceitação
+
+- **Decision Owner:** Vinicius Miranda — **decisão de aceitação em
+  2026-07-22**, após duas rodadas de revisão (conectividade/fila corrigidas).
+  **Vigência/publicação no repositório:** a partir do **merge do PR #14**.
+- **Revisão executada (Dev + Arquitetura/Segurança):** o desenho on-premises
+  deste ADR e o
+  [parecer de correção da fila SQL](evidence/0003-parecer-fila-sql-onprem.md)
+  (Evidence Owner: Engenharia), **anexados e corrigidos neste mesmo PR #14**
+  — fluxo de PR único (evidência + flip, um CI, um merge). Não havendo
+  revisor distinto, a competência é exercida/aceita pelo Decision Owner
+  (exceção de bootstrap na [matriz](gate-closure-matrix.md)).
+- **Condições obrigatórias de implementação (não de aceitação):** itens 1–9
+  do parecer da fila como **contrato de implementação verificável** — em
+  particular fencing por `lease_epoch`, rotas `RECOVERY_REQUIRED`/
+  `RECONCILING` para efeito externo, ledger `external_operations`
+  (ambíguo nunca repete automaticamente) e anti-starvation por aging —
+  com o **teste de concorrência multi-worker obrigatório antes de
+  produção**; nota DPAPI: nó único apenas, HA exige segredos multi-nó.
+- **Pendências downstream registradas (fora deste ADR):** revisão do
+  ADR-0008 (identidade/rede on-prem), do runbook operacional EV (Azure
+  Bastion/JIT) e do runbook DOCX v1.1 (suposições PaaS da Parte V).
 
 > **Reescrita (pivô de baseline).** Por decisão do Decision Owner
 > (2026-07-21), o ArchiveBridge é um **produto on-premises**, instalado na
