@@ -25,16 +25,18 @@ A baseline vigente é **on-premises** ([ADR-0003](0003-azure-sql-e-service-bus-p
 
 ## Decisão
 
-Usar **libpff** (`pffinfo`/`pffexport`) exclusivamente como **segunda engine de verificação**, em **worker isolado e somente leitura**, para conferência cruzada de contagens, hierarquia de pastas e fingerprints amostrados **contra o resultado do handle primário** — seja a part produzida pela **exportação EV multiversão** ([ADR-0013](0013-exportacao-ev-multiversao.md), rota EV) ou por **ingestão de PST já existente** ([§17](../runbook/03-parte-iii-conectores-e-engine-pst.md#17-ingestão-de-pst-já-existente)). A libpff **não** é usada como writer/splitter e **não** repara artefatos. Seus tipos **nunca atravessam** `IPstEngine` (§18.2) — o domínio recebe apenas resultados normalizados. O status de licença (**LGPL**) exige **parecer jurídico antes da adoção**.
+Usar **libpff** (**`pffinfo`** como ferramenta padrão de inspeção; **`pffexport` apenas em laboratório ou validação aprovada**) exclusivamente como **segunda engine de verificação**, em **worker isolado e somente leitura**, para conferência cruzada de contagens, hierarquia de pastas e fingerprints amostrados **contra o resultado do handle primário** — seja a part produzida pela **exportação EV multiversão** ([ADR-0013](0013-exportacao-ev-multiversao.md), rota EV) ou por **ingestão de PST já existente** ([§17](../runbook/03-parte-iii-conectores-e-engine-pst.md#17-ingestão-de-pst-já-existente)). A libpff **não** é usada como writer/splitter e **não** repara artefatos. Seus tipos **nunca atravessam** `IPstEngine` (§18.2) — o domínio recebe apenas resultados normalizados. O status de licença (**LGPL**) exige **parecer jurídico antes da adoção**.
 
 ## Isolamento on-premises (ADR-0003/ADR-0008)
 
-O "container isolado somente-leitura" da §18.1 materializa-se, na baseline on-premises, como:
+O "container isolado somente-leitura" da §18.1 materializa-se, na baseline on-premises (perfil **Windows**), como:
 
 - **processo isolado** em worker Windows sob **identidade de serviço dedicada e de menor privilégio** (gMSA/virtual service account — ADR-0008), distinta da identidade da engine primária;
-- **acesso somente leitura** ao artefato (ACL; a part validada é imutável após validação — §33) e **diretório de trabalho `noexec`/ACL** (§34/§35);
+- **acesso somente leitura** ao artefato (**NTFS ACL**; a part validada é imutável após validação — §33);
+- **impedir execução em diretórios de dados por NTFS ACL e política WDAC/App Control**; **AppLocker** pode ser usado como **controle complementar**; allowlist dos binários autorizados. O termo `noexec` aplica-se **apenas a perfis Linux/container**, não ao worker Windows;
 - **sem rede** (a validação não requer saída); nenhuma execução de macro/script/preview sobre conteúdo não confiável (§35);
-- invocação preferencial como **executável separado** (`pffinfo`/`pffexport`), o que também sustenta a análise LGPL (ver evidência).
+- **ferramenta padrão de inspeção: `pffinfo`** (ou wrapper próprio somente-leitura, se necessário). **`pffexport` apenas em laboratório ou em caso de validação explicitamente aprovado**, em **scratch efêmero, criptografado, com ACL e limpeza**; **conteúdo extraído não entra automaticamente no pacote de evidência** e exige justificativa técnica (um validador raramente precisa exportar conteúdo);
+- invocação como **executável separado**, o que **reduz o acoplamento técnico** (o efeito jurídico é do parecer — ver evidência).
 
 Onde um cliente adotar contêinerização (ex.: Windows containers), ela é uma **realização de perfil** desse mesmo isolamento de processo — não um requisito de plataforma.
 
@@ -56,4 +58,6 @@ Onde um cliente adotar contêinerização (ex.: Windows containers), ela é uma 
 
 Runbook [§18.1](../runbook/03-parte-iii-conectores-e-engine-pst.md#181-decisão-recomendada), [§23](../runbook/03-parte-iii-conectores-e-engine-pst.md#23-validação-independente), [§7](../runbook/02-parte-ii-arquitetura.md#7-componentes-e-responsabilidades). Referência oficial: repositório libpff — Apêndice F.
 
-O gate exige **análise de compatibilidade + parecer jurídico LGPL**. A **análise técnica de compatibilidade LGPL** (modelo de invocação, linkagem, distribuição e substituibilidade) está em [`evidence/0005-analise-lgpl-libpff.md`](evidence/0005-analise-lgpl-libpff.md) (Evidence Owner: Engenharia); o **parecer jurídico é externo e permanece pendente** (revisor Jurídico a atribuir). Este ADR permanece **`proposto`** até o parecer jurídico registrado e a **aceitação formal do Decision Owner** (Vinicius Miranda).
+O gate exige **análise de compatibilidade + parecer jurídico LGPL**. A **análise técnica de compatibilidade LGPL** (licença **LGPL-3.0-or-later** e artefato fixado, modelo de invocação, distribuição, substituibilidade e **contrato do processo libpff**) está em [`evidence/0005-analise-lgpl-libpff.md`](evidence/0005-analise-lgpl-libpff.md) (Evidence Owner: Engenharia) — **não** contém conclusões jurídicas.
+
+Para este gate, a **exceção de bootstrap** (competência exercida pelo Decision Owner) usada em revisões internas de engenharia **não se aplica**: o gate exige **parecer jurídico externo real** sobre a LGPL-3.0-or-later. O ADR permanece **`proposto`** até esse parecer estar registrado e a **aceitação formal do Decision Owner** (Vinicius Miranda) ocorrer.
