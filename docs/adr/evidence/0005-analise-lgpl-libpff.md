@@ -12,9 +12,26 @@ verificador independente).
   parecer jurídico, não é aconselhamento legal e não é a aceitação formal.**
 
 > [!IMPORTANT]
-> A licença exata da libpff (família **LGPL**) e seus termos são **insumo do
-> parecer**: a análise abaixo **não afirma** conformidade — descreve o modelo
-> de uso que a sustenta e delimita o que o Jurídico deve decidir.
+> A licença e os termos exatos são **insumo do parecer**: a análise abaixo
+> **não afirma** conformidade e **não contém conclusões jurídicas** — descreve
+> o modelo de uso e delimita o que o Jurídico deve decidir sobre um
+> **artefato específico**.
+
+## 0. Artefato analisado (fixar antes do parecer)
+
+O parecer jurídico deve analisar **um artefato específico**, não o projeto de
+forma abstrata. O repositório oficial declara **LGPL-3.0-or-later** e status
+**alpha** — o que **exige certificar o build escolhido**. Registrar:
+
+| Campo | Valor |
+| --- | --- |
+| Upstream repository | `libyal/libpff` |
+| License | **LGPL-3.0-or-later** |
+| Pinned commit/tag | _(a fixar)_ |
+| Binary version | _(a fixar)_ |
+| SHA-256 | _(a fixar)_ |
+| Included license files | `COPYING`, `COPYING.LESSER` |
+| Upstream status | **alpha** → build escolhido deve ser certificado antes do uso |
 
 ## 1. Fatos técnicos do uso (o que o produto faz)
 
@@ -35,36 +52,78 @@ verificador independente).
 
 ## 2. Modelos de vínculo e implicação (a decidir pelo Jurídico)
 
-| Modelo | Descrição | Postura LGPL (a confirmar juridicamente) |
-| --- | --- | --- |
-| **A — Executável separado (preferido)** | o produto **executa** `pffinfo`/`pffexport` como processo separado, trocando dados por arquivos/stdout | menor acoplamento; tende a ser o modelo mais seguro (uso do programa, não vínculo de biblioteca) — **preferir e padronizar** |
-| **B — Biblioteca dinâmica** | se algum componente vincular `libpff` dinamicamente | "combined work" da LGPL: exige, tipicamente, **linkagem dinâmica + capacidade de relink/substituição**, aviso de licença e não restringir engenharia reversa para depuração de modificações do usuário |
-| **C — Linkagem estática** | vincular estaticamente a libpff ao binário do produto | **evitar**: aumenta as obrigações da LGPL e é desnecessário dada a arquitetura de processo isolado |
+Descrição técnica dos modelos (o **efeito jurídico de cada um é do parecer**, não da engenharia):
 
-**Decisão de engenharia:** padronizar o **modelo A**. O modelo C é
-explicitamente evitado; o modelo B, se algum dia necessário, entra com
-análise jurídica própria.
+| Modelo | Descrição técnica | Decisão de engenharia |
+| --- | --- | --- |
+| **A — Executável separado** | o produto **executa** `pffinfo` (padrão) como processo separado, trocando dados por arquivos/stdout | **padronizar** — é o modelo de menor acoplamento técnico |
+| **B — Biblioteca dinâmica** | algum componente vincula `libpff` dinamicamente | **não adotar** sem análise jurídica própria |
+| **C — Linkagem estática** | vincular estaticamente a libpff ao binário do produto | **proibir** sem novo ADR/parecer |
+
+As obrigações associadas a cada modelo — **combined work, oferta de fonte,
+relink, engenharia reversa, atribuição** — são **perguntas ao Jurídico**
+(seção 5), **não** conclusões deste documento.
 
 ## 3. Distribuição (pergunta central para o Jurídico)
 
-- **Se o produto redistribui** o binário/ferramentas da libpff junto do
-  instalador on-premises: tipicamente é preciso **incluir o texto da
-  licença**, aviso de uso, e uma **oferta de código-fonte correspondente**
-  (upstream não modificado); se houvesse modificação, disponibilizar a fonte
-  modificada.
-- **Se o cliente instala a libpff separadamente** (o produto apenas a invoca
-  quando presente): a postura de distribuição muda. **Qual dos dois** é
-  adotado é decisão de produto + Jurídico e deve ser registrada.
+Dois cenários possíveis, cuja implicação jurídica é do parecer:
 
-## 4. Substituibilidade (reforço arquitetural)
+- **O produto redistribui** o binário/ferramentas da libpff junto do
+  instalador on-premises; **ou**
+- **o cliente instala a libpff separadamente** e o produto apenas a invoca
+  quando presente.
+
+**Qual cenário adotar**, e quais obrigações dele decorrem (texto de licença,
+aviso, oferta de fonte correspondente, tratamento de eventual modificação),
+são **decisão de produto + Jurídico** e devem ser registradas — este
+documento **não** as pré-decide.
+
+## 4. Substituibilidade (fato arquitetural, sem conclusão jurídica)
 
 Como os tipos da libpff **não atravessam** `IPstEngine`, o validador
 independente é **substituível** por outra engine independente sem alterar o
-domínio. Isso **satisfaz naturalmente** o requisito da LGPL de o usuário
-poder **substituir/relinkar** a versão da biblioteca — a fronteira já é um
-ponto de troca.
+domínio. A separação por processo e a ausência de tipos libpff no domínio
+**reduzem o acoplamento técnico**. **O efeito jurídico desse modelo
+(inclusive quanto a relink/substituição na LGPL) será determinado
+exclusivamente pelo parecer jurídico sobre LGPL-3.0-or-later** — a engenharia
+não conclui que o desenho "satisfaz" qualquer obrigação legal.
 
-## 5. Perguntas objetivas para o parecer jurídico
+## 5. Contrato do processo libpff (verificável)
+
+O ADR exige um **contrato versionado** request/result para o processo de validação, de modo que a saída seja auditável e o input jamais alterado:
+
+```text
+LibpffValidationRequest
+  - artifact_id
+  - canonical_input_path
+  - expected_sha256
+  - validation_profile
+  - timeout
+  - resource_limits
+
+LibpffValidationResult
+  - tool_version
+  - tool_sha256
+  - exit_code
+  - parse_status
+  - folder_count
+  - item_count
+  - normalized_folder_summary
+  - sampled_fingerprints
+  - warnings
+  - error_code
+```
+
+## 6. Plano de compatibilidade
+
+O build escolhido (status upstream **alpha**) deve ser certificado contra:
+
+- encoding; locale; stdout; stderr; exit codes; timeout;
+- arquivos corrompidos; PST **ANSI**; PST **Unicode**; PST grande;
+- memória; CPU; cancellation; **ausência de rede**;
+- **nenhuma alteração do input** — hash **antes e depois** idênticos.
+
+## 7. Perguntas objetivas para o parecer jurídico
 
 1. Qual a **versão exata da LGPL** aplicável à libpff e às ferramentas
    `pffinfo`/`pffexport`, e quais obrigações ela impõe no **modelo A**?
@@ -77,7 +136,7 @@ ponto de troca.
 5. Requisitos de **atribuição/aviso** a incluir na documentação e no
    instalador.
 
-## 6. Riscos residuais
+## 8. Riscos residuais
 
 - Uso inadvertido da libpff fora do papel de validador (ex.: como writer) —
   **mitigação:** `IPstEngine` só recebe resultados normalizados; revisão de
@@ -87,12 +146,16 @@ ponto de troca.
 - Divergência entre a versão da libpff testada e a distribuída —
   **mitigação:** fixar versão + hash, como nos demais binários homologados.
 
-## 7. Conclusão e assinatura (a preencher na revisão)
+## 9. Conclusão e assinatura (a preencher na revisão)
 
-- **Parecer jurídico (LGPL) — assinatura/data:** _(pendente)_
-- **Modelo de distribuição decidido (A/redistribuição × instalação separada):** _(pendente)_
+- **Parecer jurídico (LGPL-3.0-or-later) — assinatura/data:** _(pendente)_
+- **Artefato fixado (commit/tag + versão + SHA-256) analisado no parecer:** _(pendente)_
+- **Modelo de distribuição decidido (redistribuição × instalação separada):** _(pendente)_
 - **Ressalvas/condições:** _(pendente)_
 
-A **aceitação formal** do ADR-0005 é ato do Decision Owner (Vinicius
-Miranda) e ocorre **somente após** o parecer jurídico estar registrado —
-conforme a [matriz de fechamento](../gate-closure-matrix.md).
+Para este gate, a **exceção de bootstrap** (competência de revisão exercida
+pelo Decision Owner) **não se aplica**: exige-se **parecer jurídico externo
+real**; a evidência **não** simula esse parecer. A **aceitação formal** do
+ADR-0005 é ato do Decision Owner (Vinicius Miranda) e ocorre **somente após**
+o parecer jurídico estar registrado — conforme a
+[matriz de fechamento](../gate-closure-matrix.md).
