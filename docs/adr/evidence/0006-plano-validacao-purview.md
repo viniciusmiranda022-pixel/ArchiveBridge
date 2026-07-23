@@ -7,8 +7,8 @@ roteiro de testes e os critérios de aceitação que o **relatório de validaç�
 em tenant controlado** deve preencher.
 
 - **Tipo:** protocolo de validação em tenant Microsoft 365 controlado
-- **Evidence Owner:** _a atribuir_ (Engenharia + responsável técnico pelo tenant)
-- **Revisor necessário:** responsável técnico pelo tenant
+- **Evidence Owner:** _a atribuir_ — **Engenharia** produz e assina o relatório de validação
+- **Revisor necessário:** _a atribuir_ — **responsável técnico pelo tenant** (papel **distinto** do Evidence Owner: quem produz a evidência não é quem a revisa)
 - **Estado da execução:** **pendente** — nenhuma execução em tenant foi
   realizada até esta data. Este documento **não** é o relatório de
   validação nem a aceitação formal.
@@ -52,12 +52,24 @@ segredos on-premises (detalhe em [ADR-0008](../0008-isolamento-por-tenant-e-proj
 | V3 | Capacity gate — dentro do limite | §25.4 | Onda dentro do limite passa; `csvRowCount ≤ 500`; `targetRoot != "/"` |
 | V4 | Capacity gate — **bloqueio >100 GB no mesmo archive** | §25.4, §27 | Estado `MICROSOFT_ASSESSMENT_REQUIRED`; `AutoExpandingArchiveEnabled=True` **não** eleva o limite; job vai a `WAITING_EXTERNAL` com o pacote de suporte (§27) |
 | V5 | Coleta segura do SAS pelo formulário secreto; custódia no mecanismo de segredos on-premises | §25.5, ADR-0006 item 4 | SAS validado (host/HTTPS/container `ingestiondata`/expiry/permissões); **nunca** em log/analytics/telemetria; leitura restrita à identidade do worker; eliminação após upload |
-| V6 | Transporte AzCopy a partir do worker on-premises | §25.6 | Upload concluído; versão AzCopy homologada; SAS redigido em exceções/telemetria; `UPLOAD_VERIFIED` |
+| V6 | Transporte AzCopy a partir do worker on-premises (exceção controlada de SAS no argv) | §25.6, ADR-0006 "Exceção controlada" | Upload concluído; versão AzCopy homologada; controles compensatórios ativos (worker/identidade exclusivos, sem usuário interativo, admin JIT, transcript/history off, sem gravação do comando completo, encerramento após upload, destruição da cópia local); **teste automático de vazamento do SAS** varre logs/stdout/stderr/eventos/telemetria e artefatos de evidência e **falha se o SAS aparecer**; `UPLOAD_VERIFIED` |
 | V7 | Builder do CSV mapping oficial | §25.8 | Dez colunas e cabeçalho idênticos; `Workload=Exchange`; `FilePath` sem `ingestiondata` e case-sensitive; `IsArchive=TRUE` só após precheck; `TargetRootFolder=/ImportedPst_<Project>_<Wave>`; ≤ 500 linhas; SHA-256 do CSV registrado |
 | V8 | Workflow humano no portal Purview (criar/validar/iniciar job) | §25.9 | Passos executados no portal; CSV não editado manualmente; nome/ID do job, operador, horário e relatório registrados |
-| V9 | Ledger `external_operations` para upload + import job | ADR-0006 item 5, ADR-0003 | Transições `INTENT → SUBMITTED → CONFIRMED/AMBIGUOUS/FAILED` registradas com chave visível ao provedor (Purview job ID); retomada idempotente após interrupção não duplica submissão |
+| V9 | Ledger `external_operations` para upload + import job | ADR-0006 item 5, ADR-0003 | `operation_key` determinística gravada em `INTENT` **antes** do efeito externo; nome planejado do job usado no portal; `provider_operation_id` registrado **após** a criação; reconciliação por **nome planejado + `provider_operation_id`**; ambíguo nunca repete automaticamente (ver cenários V9.1–V9.7) |
 | V10 | Reconciliação pós-import | §26 | Resultado classificado (`PASS` / `PASS_WITH_EXPLAINED_EXCEPTIONS` / `INCONCLUSIVE` / `FAIL` / `DUPLICATE_RISK`) com evidência completa; Retention Hold nunca removido automaticamente (§26.4) |
 | V11 | Retenção do staging Microsoft | §25.10 | Registrado que o produto não promete deleção imediata; limitação no data processing record |
+
+### 3.1 Cenários do ledger (expansão do V9)
+
+O V9 deve exercer explicitamente:
+
+- **V9.1** crash **após `INTENT` e antes** de qualquer ação no portal → na retomada, a `operation_key` já existe; nenhuma submissão duplicada é criada.
+- **V9.2** job criado no portal, mas o ArchiveBridge **ainda não atualizado** (`provider_operation_id` ausente) → reconciliação encontra o job pelo **nome planejado** e completa o vínculo.
+- **V9.3** **timeout** ao consultar o Purview → estado permanece consultável; sem marcação otimista de sucesso.
+- **V9.4** operador tenta **criar o mesmo job novamente** → detecção pelo nome planejado; nenhuma segunda importação é iniciada.
+- **V9.5** job **encontrado pelo nome planejado** durante reconciliação → vínculo idempotente ao mesmo `operation_key`.
+- **V9.6** **resultado ambíguo** (não é possível confirmar efeito) → estado `AMBIGUOUS`; **nunca** repete automaticamente; exige disposição.
+- **V9.7** confirmação de que **nenhuma segunda importação** é iniciada em nenhum dos cenários acima.
 
 ## 4. Artefatos de evidência a coletar
 

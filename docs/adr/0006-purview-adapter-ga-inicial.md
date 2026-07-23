@@ -31,9 +31,37 @@ O runbook v1.0 foi redigido antes da fixação da baseline on-premises; esta se�
 
 1. **Purview/M365 = destino externo, não dependência de hospedagem.** Nenhum componente de runtime do produto depende de Azure PaaS e **não há assinatura Azure do cliente**. A conectividade exigida é **somente outbound HTTPS 443** aos endpoints Microsoft necessários (Entra ID, Exchange Online, Purview e o storage temporário do próprio Purview via SAS); **sem portas de entrada**. Isso é consistente com "Microsoft 365 apenas como destino externo" do ADR-0003.
 2. **O container `ingestiondata` é staging temporário provido pela Microsoft**, alcançado pela URL SAS que o operador obtém no portal Purview (§25.5) — **não é storage de uma assinatura Azure do cliente**. Sua retenção é controlada pela Microsoft (§25.10); o produto não promete deleção imediata desse staging.
-3. **O AzCopy executa a partir do upload worker on-premises.** O "worker efêmero dedicado" do runbook v1.0 (§25.5–§25.6) materializa-se, na baseline on-premises, como **host/serviço dedicado e endurecido no ambiente do cliente** (Windows Service, sem usuários interativos, admin JIT, sessão de vida curta) — não uma VM efêmera em nuvem. Como o SAS inevitavelmente aparece na command line do processo AzCopy (§25.6), o isolamento desse worker é requisito, não recomendação.
-4. **Reconciliação do segredo SAS.** O runbook v1.0 §25.5 descreve armazenar o SAS "no Key Vault" e lê-lo pela "managed identity do upload worker" — primitivos de Azure. Na baseline vigente (ADR-0003, sem Azure PaaS obrigatório), o SAS é custodiado pelo **mecanismo de segredos on-premises** (DPAPI em nó único; mecanismo de segredo multi-nó em configuração HA — ADR-0003), preservando **todas** as propriedades funcionais exigidas pelo runbook: campo não ecoado; nunca em log, analytics ou telemetria; validação de host/HTTPS/container/expiry/permissões; expiração e tags de wave; leitura restrita à identidade do upload worker; eliminação/desabilitação após o upload e a janela de investigação. O detalhamento do modelo de identidade e segredos on-premises é objeto do **[ADR-0008](0008-isolamento-por-tenant-e-projeto.md)**; este ADR apenas registra a reconciliação da divergência do runbook v1.0.
-5. **Submissão sem transação distribuída — ledger `external_operations` (ADR-0003).** O upload via AzCopy e a criação/início do import job no portal Purview produzem **efeito externo** fora do alcance de qualquer transação local. Conforme o contrato de execução durável do [ADR-0003](0003-azure-sql-e-service-bus-premium.md), essas etapas são registradas no ledger `external_operations` (`INTENT → SUBMITTED → CONFIRMED | AMBIGUOUS | FAILED`), com **chave visível ao provedor** (nome/ID do Purview job, §25.9) para reconciliação idempotente; a reconciliação pós-import (§26) confirma o efeito. Não se presume atomicidade entre o produto on-premises e o serviço Microsoft.
+3. **O AzCopy executa a partir do upload worker on-premises.** O "worker efêmero dedicado" do runbook v1.0 (§25.5–§25.6) materializa-se, na baseline on-premises, como **host/serviço dedicado e endurecido no ambiente do cliente** (Windows Service, sem usuários interativos, admin JIT, sessão de vida curta) — não uma VM efêmera em nuvem. Como o SAS aparece na command line do processo AzCopy (§25.6, fluxo documentado pela Microsoft), o isolamento desse worker é requisito, não recomendação — sob a **exceção controlada e restrita** registrada adiante.
+4. **Reconciliação do segredo SAS.** O runbook v1.0 §25.5 descreve armazenar o SAS "no Key Vault" e lê-lo pela "managed identity do upload worker" — primitivos de Azure. Na baseline vigente (ADR-0003, sem Azure PaaS obrigatório), o SAS é custodiado pelo **mecanismo de segredos on-premises** (DPAPI em nó único; mecanismo de segredo multi-nó em configuração HA — ADR-0003), preservando **todas** as propriedades funcionais exigidas pelo runbook: campo não ecoado; nunca em log, analytics ou telemetria; validação de host/HTTPS/container/expiry/permissões; expiração e tags de wave; leitura restrita à identidade do upload worker. Após a execução, o produto **destrói todas as cópias locais do SAS e bloqueia sua reutilização interna** (limpeza de memória e temporários, registro de expiração, bloqueio de nova execução). **A validade e a revogação do SAS no serviço Microsoft seguem as capacidades efetivamente disponibilizadas pelo Purview; o produto não promete revogação/desabilitação remota do SAS sem capability evidence oficial.** O detalhamento do modelo de identidade e segredos on-premises é objeto do **[ADR-0008](0008-isolamento-por-tenant-e-projeto.md)**; este ADR apenas registra a reconciliação da divergência do runbook v1.0.
+5. **Submissão sem transação distribuída — ledger `external_operations` (ADR-0003).** O upload via AzCopy e a criação/início do import job no portal Purview produzem **efeito externo** fora do alcance de qualquer transação local. Conforme o contrato de execução durável do [ADR-0003](0003-azure-sql-e-service-bus-premium.md), essas etapas são registradas no ledger `external_operations` (`INTENT → SUBMITTED → CONFIRMED | AMBIGUOUS | FAILED`). A **chave da operação é determinística e gerada pelo ArchiveBridge *antes* do efeito externo** — o `provider_operation_id` (ID do Purview job) **só existe após a criação do job** e, portanto, **não pode ser a chave**. O fluxo correto é:
+   1. o ArchiveBridge gera a `operation_key` determinística (ex.: `PURVIEW_IMPORT:<tenant-hmac>:<project-id>:<wave-id>:<plan-hash>`);
+   2. gera o **nome planejado do job** (ex.: `archivebridge-<project-short-id>-<wave-number>-<plan-hash-prefix>`);
+   3. grava `INTENT` no SQL e **faz commit** — antes de qualquer ação no portal;
+   4. o operador cria o job no portal usando **exatamente o nome planejado**;
+   5. o ArchiveBridge registra o `provider_operation_id` **após** a criação e marca `SUBMITTED`;
+   6. a reconciliação (§26) usa **nome planejado + `provider_operation_id`** e marca `CONFIRMED` ou `AMBIGUOUS`.
+
+   O `provider_operation_id` **não substitui** a `operation_key`; resultado ambíguo **nunca** repete automaticamente. Não se presume atomicidade entre o produto on-premises e o serviço Microsoft.
+
+### Exceção controlada e restrita: SAS no argv do AzCopy
+
+O runbook de engenharia **proíbe segredos em argumentos de linha de comando**. Contudo, o procedimento **oficialmente documentado pela Microsoft** para o Network Upload usa `azcopy.exe copy "<Source>" "<SAS URL>"`, e a própria Microsoft trata essa URL SAS como credencial. Portanto, o ADR **não** trata o problema como resolvido por o SAS "inevitavelmente aparecer"; registra uma **exceção arquitetural explícita e restrita**:
+
+- **Escopo da exceção:** a URL SAS poderá aparecer no `argv` **exclusivamente no adapter Purview Network Upload**, por ser o fluxo suportado pela Microsoft. A exceção **não** se aplica a nenhum outro segredo, adapter ou processo — não é flexibilização geral do SSDLC.
+- **Controles compensatórios obrigatórios:**
+  1. worker exclusivo de upload;
+  2. identidade de serviço exclusiva;
+  3. nenhum usuário interativo no host;
+  4. acesso administrativo JIT;
+  5. restrição de quem pode consultar informações de processos;
+  6. nenhuma gravação do comando completo;
+  7. PowerShell transcription e command history desabilitados na execução;
+  8. sanitização de stdout, stderr, eventos, exceções e telemetria;
+  9. working directory protegido;
+  10. nenhum dump automático contendo command line;
+  11. encerramento imediato do processo após o upload;
+  12. destruição da cópia local da URL SAS (ver item 4);
+  13. teste automático de vazamento do SAS nos artefatos de evidência.
 
 ## Alternativas consideradas
 
