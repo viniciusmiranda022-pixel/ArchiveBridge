@@ -23,19 +23,40 @@ Isolamento **por tenant e por projeto**, realizado com primitivos **on-premises*
 
 ### Dados
 
-- `tenant_id` em todas as tabelas; índices liderados por tenant;
-- **Row-Level Security do SQL Server** — recurso **nativo do SQL Server, válido on-premises** — mais **testes de autorização** que falham o build ao vazar dados entre tenants. O controle obrigatório da §30 (`tenant key, RLS, authorization tests`) permanece **inalterado**, pois o RLS é do próprio SQL Server (sistema de registro do ADR-0003).
+- `tenant_id` em todas as tabelas; índices liderados por tenant; **tenant e projeto explícitos nos contratos**;
+- **Row-Level Security do SQL Server** — recurso **nativo do SQL Server, válido on-premises** — mais **testes de autorização** que falham o build ao vazar dados entre tenants. O controle obrigatório da §30 (`tenant key, RLS, authorization tests`) permanece **inalterado**, pois o RLS é do próprio SQL Server (sistema de registro do ADR-0003);
+- **RLS é defesa em profundidade, não a autorização única.** O RLS vive na Infrastructure; as **regras de autorização permanecem na Application**; **nenhuma consulta depende exclusivamente do *session context* do SQL**; os testes cross-tenant validam **Application + SQL**.
 
-### Identidade
+> **Testes de isolamento e o scaffolding.** O runbook mantém o scaffolding .NET **bloqueado** até a aceitação dos ADRs; portanto **não há código a testar antes do scaffolding**. Os **testes de arquitetura, autorização e isolamento cross-tenant** devem **existir no primeiro PR de scaffolding** e permanecer **obrigatórios desde o primeiro módulo** que persista ou consulte dados escopados por tenant.
 
-- **uma identidade de serviço Windows por workload** (PST / Upload / Recon / Evidence): **gMSA ou virtual service account**, **nunca Domain Admin** (§34); **sem secret compartilhado** entre workloads; RBAC mínimo por função e **segregação de funções** da §31 (quem prepara não aprova; quem aprova não altera artefato);
+Este ADR define **objetivos de identidade e isolamento**; **cada adapter define os papéis concretos** necessários. Princípios:
+
+- **uma identidade de serviço Windows por workload local** (Control / EV / PST / Upload / Recon / Evidence): **gMSA ou virtual service account**, **nunca Domain Admin** (§34); **sem secret compartilhado** entre workloads; RBAC mínimo por função e **segregação de funções** da §31 (quem prepara não aprova; quem aprova não altera artefato);
 - **Source Connector:** certificado por instalação (enrollment mTLS) — já on-premises na §31;
-- **Destino Microsoft 365 (externo):** autenticação **app-only por certificado (CBA)** no Microsoft Entra ID, com **role mínimo** (**Exchange Online RBAC for Applications** — [ADR-0007](0007-graph-fts-bloqueado.md)) e management scope restrito às mailboxes da onda. **Managed Identity aplica-se apenas quando um componente estiver de fato hospedado em Azure** — não é a baseline on-premises (§31 já diz "Managed Identity é preferida **em Azure**").
+- **cada operação externa possui identidade própria e permission set mínimo.** Purview (operador humano), precheck programático, reconciliação e Graph condicional **não compartilham identidade por padrão** — **não** há uma única identidade genérica "M365". Quando programático, o acesso ao destino Microsoft 365 usa **app-only por certificado (CBA)** no Entra ID, com **role mínimo** (**Exchange Online RBAC for Applications** — [ADR-0007](0007-graph-fts-bloqueado.md)) e management scope restrito às mailboxes da onda. **Managed Identity aplica-se apenas quando um componente estiver de fato hospedado em Azure** — não é a baseline on-premises (§31 já diz "Managed Identity é preferida **em Azure**").
+
+Objetivos de identidade por função (os papéis concretos e escopos ficam nos adapters):
+
+| Identidade | Função |
+| --- | --- |
+| `ArchiveBridge-Control` | API e orquestração local |
+| `ArchiveBridge-EvWorker` | acesso ao Enterprise Vault |
+| `ArchiveBridge-PstWorker` | processamento local de PST |
+| `ArchiveBridge-UploadWorker` | upload AzCopy (custódia do SAS) |
+| `ArchiveBridge-ReconWorker` | consultas de reconciliação |
+| Purview Operator (humano) | criação/início do job no portal |
+| Purview Approver (humano) | aprovação quatro-olhos |
+| M365 Precheck App | leituras mínimas de mailbox/archive |
+| Graph FTS App | adapter condicional, atualmente **bloqueado** (ADR-0007) |
+| Evidence Signer | assinatura de evidências |
 
 ### Segredos e material criptográfico
 
-- custódia pelo **mecanismo de segredos on-premises** ([ADR-0003](0003-azure-sql-e-service-bus-premium.md)): **DPAPI (perfil de nó único)** / **mecanismo de segredo multi-nó (perfil HA)**; **Certificate Store** do Windows para certificados; **ACLs exclusivas**;
-- **SAS do Purview** custodiado por esse mecanismo ([ADR-0006](0006-purview-adapter-ga-inicial.md)), com validação de host/HTTPS/container/expiry, tags de wave, leitura restrita à identidade do upload worker e eliminação após o upload;
+- custódia pelo **mecanismo de segredos on-premises** ([ADR-0003](0003-azure-sql-e-service-bus-premium.md)), com baseline explícito para o release inicial:
+  - **perfil de nó único: DPAPI**;
+  - **perfil HA de segredos: `BLOCKED_PENDING_EVIDENCE`** — só habilitado depois de **escolher e certificar** um mecanismo multi-nó concreto (ex.: key ring compartilhado protegido por certificado; store corporativo homologado; HSM; solução de secrets management já existente no cliente). Uma interface vaga "multi-nó" **não** conta como solução pronta;
+  - **Certificate Store** do Windows para certificados; **ACLs exclusivas**;
+- **SAS do Purview** custodiado por esse mecanismo ([ADR-0006](0006-purview-adapter-ga-inicial.md)), com validação de host/HTTPS/container/expiry, tags de wave, leitura restrita à identidade do upload worker e **destruição das cópias locais após o upload** (o produto **não** promete revogação remota do SAS — ADR-0006);
 - **chaves HMAC por tenant, versionadas** (`keyVersion` persistida; rotação **não** invalida fingerprints antigos) — controle de nível de aplicação, inalterado;
 - **assinatura do evidence package com chave não exportável** (TPM/HSM local quando a exigência justificar);
 - **renovação de certificados** automatizada, com alarmes 30/14/7 dias;
@@ -43,18 +64,19 @@ Isolamento **por tenant e por projeto**, realizado com primitivos **on-premises*
 
 ### Rede
 
-- **nenhuma porta de entrada vinda da internet**; **saída somente HTTPS 443** aos endpoints Microsoft exigidos (Entra ID, Exchange Online, Graph, Purview e o Azure Storage temporário do Purview) — [ADR-0003](0003-azure-sql-e-service-bus-premium.md);
-- **comunicação interna restrita por allowlist**, documentada na **matriz de fluxos e portas** (ADR-0003), negando tráfego lateral desnecessário; **segmentação de rede** por firewall/VLAN do cliente;
-- os controles Azure de rede (NSG, private endpoints, ausência de IP público) são a **realização específica do perfil Azure opcional**, não a baseline.
+- **Nenhuma entrada proveniente da internet.**
+- **Egress externo somente HTTPS 443** aos endpoints Microsoft **autorizados** (Entra ID, Exchange Online, Graph, Purview e o Azure Storage temporário do Purview) — [ADR-0003](0003-azure-sql-e-service-bus-premium.md).
+- **Fluxos internos** (Control Plane ↔ SQL Server; workers ↔ SQL Server; workers ↔ NAS/SMB; worker ↔ Enterprise Vault; mTLS entre componentes; navegadores internos ↔ Portal) utilizam **portas explicitamente registradas na matriz de fluxos e portas** (ADR-0003), com **segmentação por firewall/VLAN do cliente** negando tráfego lateral desnecessário. Ou seja: o "somente 443" é a regra de **egress externo**, não dos fluxos internos aprovados.
+- Controles Azure de rede (NSG, private endpoints, ausência de IP público) **não se aplicam** à baseline on-premises (ver "Evolução futura — perfis em Azure").
 
 ### Dados mínimos e fail-closed
 
 - o plano de controle guarda **apenas metadados**; o conteúdo permanece nos artefatos protegidos em storage local/NAS/SMB (ADR-0003), com ciclo de vida por container ([§33](../runbook/05-parte-v-seguranca-infra-operacao.md#33-storage-e-ciclo-de-vida)) e hardening dos workers ([§34](../runbook/05-parte-v-seguranca-infra-operacao.md#34-hardening-dos-workers-windows)); malware/conteúdo hostil tratado por [§35](../runbook/05-parte-v-seguranca-infra-operacao.md#35-malware-e-conteúdo-hostil);
 - **fail closed** na ausência de identidade, consentimento ou autorização.
 
-## Perfil Azure opcional (não requisito)
+## Evolução futura — perfis em Azure (fora do release inicial)
 
-Se um cliente específico optar por um perfil de implantação em Azure (ADR-0003, "adapters opcionais futuros"), os controles nativos — Managed Identity, Key Vault (soft delete / purge protection / private endpoint), Storage com private endpoint, NSG e Azure Policy (§32/§33/§36) — passam a ser a **realização daquele perfil** dos mesmos objetivos de controle deste ADR. Eles **não** são dependência obrigatória do produto e **não** alteram a baseline on-premises vigente.
+Perfis de implantação baseados em Azure **não fazem parte do release inicial**. Caso sejam requeridos futuramente, serão definidos por **ADR específico**, **sem alterar os contratos do domínio** (identidade, segredos e rede permanecem atrás das mesmas abstrações — ADR-0003, "adapters opcionais futuros"). Este ADR **não** projeta agora Managed Identity, Key Vault, NSG ou private endpoints — evitando complexidade acidental e escopo que não será implementado.
 
 ## Alternativas consideradas
 
@@ -63,13 +85,13 @@ Se um cliente específico optar por um perfil de implantação em Azure (ADR-000
 | Deployment single-tenant por cliente | isolamento físico forte | custo e sobrecarga operacional altos por cliente | inviável como padrão multitenant |
 | Filtragem só na aplicação (sem RLS) | simples | uma falha de query vaza dados entre tenants | §30 exige RLS + authorization tests |
 | Identidades/segredos compartilhados entre workloads | menos configuração | quebra segregação de funções e menor privilégio | proibido pela §31 |
-| Exigir Managed Identity/Key Vault Azure como mecanismo **obrigatório** | primitivos gerenciados | exige Azure; contraria a baseline on-premises (ADR-0003) | on-premises: gMSA/CBA + DPAPI/multi-nó; Azure apenas como perfil opcional |
+| Exigir Managed Identity/Key Vault Azure como mecanismo **obrigatório** | primitivos gerenciados | exige Azure; contraria a baseline on-premises (ADR-0003) | on-premises: gMSA/CBA + DPAPI (HA de segredos `BLOCKED_PENDING_EVIDENCE`); Azure só como perfil futuro por ADR específico |
 
 ## Consequências
 
 - Positivas: garantia forte contra acesso cross-tenant; menor privilégio por workload; blast radius reduzido; **modelo realizável na infra do cliente sem Azure obrigatório**; segredos e identidade sob controle do cliente.
-- Negativas / dívidas assumidas: maior complexidade de identidade (gMSA + app-only CBA) e de testes de autorização; RLS exige disciplina de esquema; **HA exige mecanismo de segredos multi-nó** — DPAPI de nó único não basta ([ADR-0003](0003-azure-sql-e-service-bus-premium.md)); rotação de certificados é encargo operacional.
-- Riscos e mitigação: regressão de isolamento → testes de autorização e de arquitetura no CI (§37); exposição de dados pessoais → avaliação de dados/DPO e minimização; comprometimento de segredo → custódia on-premises + redaction + **reimage do worker após manipulação de SAS** (§34).
+- Negativas / dívidas assumidas: maior complexidade de identidade (gMSA + app-only CBA por operação) e de testes de autorização; RLS exige disciplina de esquema; **o perfil HA de segredos fica `BLOCKED_PENDING_EVIDENCE`** até um mecanismo multi-nó concreto ser escolhido e certificado ([ADR-0003](0003-azure-sql-e-service-bus-premium.md)); rotação de certificados é encargo operacional.
+- Riscos e mitigação: regressão de isolamento → testes de autorização e de arquitetura no primeiro PR de scaffolding (§37); exposição de dados pessoais → avaliação de dados/DPO e minimização; comprometimento de segredo → custódia on-premises + redaction. **Higiene padrão do upload worker após cada uso do SAS** (destruir cópia local, encerrar o processo, limpar temporários, verificar logs e dumps, health check); **reimage apenas após incidente, comprometimento ou suspeita de exposição** (§34) — **não** como rotina. Um perfil realmente descartável pode existir no futuro, com desenho operacional próprio.
 
 ## Evidências
 

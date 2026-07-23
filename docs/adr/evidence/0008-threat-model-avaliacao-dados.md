@@ -45,17 +45,27 @@ Exchange/Purview/Graph; pipeline/pacotes/imagens de worker.
 - **Personas** (ProjectAdmin, MigrationEngineer, MigrationApprover,
   M365Operator, Auditor, SecurityAdmin) e o princípio "quem prepara não
   aprova; quem aprova não altera artefato" — inalterados.
-- **Workloads** (PST / Upload / Recon / Evidence): cada um com **gMSA ou
-  virtual service account** própria, **sem secret compartilhado**, RBAC
-  mínimo. O "MI" das linhas §31 é realizado on-premises por gMSA; o acesso
-  ao destino Microsoft é **app-only CBA** com role mínimo.
+- **Workloads locais** (Control / EV / PST / Upload / Recon / Evidence): cada
+  um com **gMSA ou virtual service account** própria, **sem secret
+  compartilhado**, RBAC mínimo. O "MI" das linhas §31 é realizado on-premises
+  por gMSA.
+- **Cada operação externa tem identidade própria e permission set mínimo** —
+  **não** há uma única identidade genérica "M365". Purview (operador humano),
+  Purview Approver (humano), M365 Precheck App (leituras mínimas),
+  reconciliação e Graph FTS App (condicional, bloqueado — ADR-0007) **não
+  compartilham identidade por padrão**. O acesso programático ao destino
+  Microsoft usa **app-only CBA** com role mínimo. Ver a matriz de identidades
+  no [ADR-0008](../0008-isolamento-por-tenant-e-projeto.md).
 - **Source Connector:** certificado por instalação (mTLS) — já on-premises.
+- **RLS = defesa em profundidade:** a autorização permanece na Application com
+  escopo tenant/projeto explícito; nenhuma consulta depende exclusivamente do
+  *session context* do SQL; testes cross-tenant validam Application + SQL.
 
 ## 3. Segredos (§32) — on-premises
 
 | Objetivo do runbook | Realização on-premises |
 | --- | --- |
-| Key Vault com soft delete/purge protection, private endpoint, RBAC | mecanismo de segredos on-premises: **DPAPI (nó único)** / **segredo multi-nó (HA)**; Certificate Store; ACLs — ADR-0003 |
+| Key Vault com soft delete/purge protection, private endpoint, RBAC | mecanismo de segredos on-premises: **DPAPI (nó único)**; **perfil HA de segredos = `BLOCKED_PENDING_EVIDENCE`** até mecanismo multi-nó concreto ser escolhido e certificado; Certificate Store; ACLs — ADR-0003 |
 | SAS com content type/expiry/tags; sem valor em tag | custódia + validação host/HTTPS/container/expiry; tags de wave; nunca em log/analytics/telemetria — ADR-0006 |
 | HMAC por tenant, versionadas; rotação preserva fingerprints | inalterado (app-level); `keyVersion` persistida |
 | assinatura com chave não exportável; HSM se justificar | chave não exportável em **TPM/HSM local** quando justificado |
@@ -63,9 +73,11 @@ Exchange/Purview/Graph; pipeline/pacotes/imagens de worker.
 | redaction central de telemetria | inalterado (§32.1) com canary tests |
 
 > **HA e segredos:** conforme ADR-0003, **DPAPI por máquina serve apenas ao
-> perfil de nó único**; o perfil de Alta Disponibilidade exige um
-> **mecanismo de segredos multi-nó** — condição de implementação, registrada
-> como risco residual (seção 6).
+> perfil de nó único**; o **perfil HA de segredos fica `BLOCKED_PENDING_EVIDENCE`**
+> até um **mecanismo multi-nó concreto** (key ring protegido por certificado,
+> store corporativo homologado, HSM ou solução de secrets management do
+> cliente) ser escolhido e certificado — registrado como risco residual
+> (seção 6). Uma interface vaga "multi-nó" não conta como solução pronta.
 
 ## 4. Storage e hardening (§33/§34)
 
@@ -76,8 +88,10 @@ Exchange/Purview/Graph; pipeline/pacotes/imagens de worker.
 - Hardening dos workers Windows (§34) **já é on-premises**: gMSA/virtual
   service account, WDAC/App Control, JEA, Credential Guard, BitLocker, Secure
   Boot/vTPM, RDP desabilitado (break-glass por JIT/PIM), SMBv1/TLS legado
-  desabilitados, saída apenas para destinos necessários, **reimage do worker
-  após manipulação de SAS ou job de alto risco**.
+  desabilitados, saída apenas para destinos necessários. Após cada uso do SAS,
+  **higiene padrão** (destruir cópia local, encerrar processo, limpar
+  temporários, verificar logs/dumps, health check); **reimage apenas após
+  incidente, comprometimento ou suspeita de exposição** — não como rotina.
 - Malware/conteúdo hostil (§35): sem execução de macros/scripts/preview;
   extração de anexo só em diretório `noexec`/ACL com scan; HTML não
   renderizado sem sanitização.
@@ -105,15 +119,20 @@ Exchange/Purview/Graph; pipeline/pacotes/imagens de worker.
 
 ## 6. Riscos residuais e pendências para Segurança/DPO
 
-1. **Mecanismo de segredos multi-nó (HA)** — definir e homologar (DPAPI de
-   nó único não cobre HA). *Condição de implementação.*
+1. **Mecanismo de segredos multi-nó (HA)** — perfil HA de segredos fica
+   `BLOCKED_PENDING_EVIDENCE` até um mecanismo concreto (key ring por
+   certificado / store corporativo / HSM / secrets management do cliente) ser
+   escolhido e certificado. DPAPI de nó único não cobre HA.
 2. **Base legal, DPA e localização do tenant M365** — avaliação do DPO por
    engajamento (transferência internacional / soberania de dados).
 3. **Threat model por engajamento** — este é o modelo de produto; cada
    implantação valida a matriz de fluxos/portas (ADR-0003) e a segmentação
    de rede do cliente.
-4. **Testes de autorização cross-tenant** — cobertura mínima obrigatória no
-   CI antes do scaffolding (§37), com canaries de RLS.
+4. **Testes de autorização cross-tenant** — não há código antes do
+   scaffolding; portanto os testes de arquitetura, autorização e isolamento
+   cross-tenant devem **existir no primeiro PR de scaffolding** e ser
+   obrigatórios desde o primeiro módulo que persista ou consulte dados
+   escopados por tenant (§37), com canaries de RLS.
 
 ## 7. Conclusão e assinatura (a preencher na revisão)
 
