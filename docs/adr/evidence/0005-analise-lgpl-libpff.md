@@ -17,73 +17,93 @@ verificador independente).
 > o modelo de uso e delimita o que o Jurídico deve decidir sobre um
 > **artefato específico**.
 
-## 0. Artefato candidato fixado
+## 0. Artefato candidato: família definida, procedimento de fixação definido; fixação concreta **parcialmente verificada**
 
-O parecer jurídico e a certificação técnica analisam **um artefato
-específico**, não o projeto de forma abstrata. O upstream declara
-**LGPL-3.0-or-later** e status **alpha** — o build escolhido **deve ser
-certificado**.
+**Família de artefato candidata e procedimento de fixação definidos; a
+fixação concreta completa depende de execução pelo Evidence Owner** (itens
+`BLOCKED` abaixo). O upstream `libyal/libpff` usa o layout libyal padrão
+(`COPYING` = GPLv3, `COPYING.LESSER` = LGPLv3), com **SPDX efetivo
+`LGPL-3.0-or-later`**; status upstream **alpha** → o build escolhido **deve
+ser certificado** (§6). O pin preferencial é por **commit SHA exato**
+verificado (não se presume formato de release asset).
 
-| Campo | Valor |
+### 0.1 Campos verificados nesta sessão (reais)
+
+Verificados por `git ls-remote` + `git clone --branch 20231205` do upstream
+(o **protocolo git smart-HTTP funciona** nesta sessão), tag candidata **`20231205`**:
+
+| Campo | Valor verificado |
 | --- | --- |
-| Upstream repository | `libyal/libpff` (Joachim Metz / libyal) |
-| Artefato candidato | **source distribution experimental** (tarball datado `libpff-experimental-<YYYYMMDD>` / `libpff-alpha-<YYYYMMDD>`), que fornece `pffinfo`/`pffexport` |
-| License (SPDX) | **LGPL-3.0-or-later** |
-| Included license files | `COPYING`, `COPYING.LESSER` |
-| Plataforma de destino | **Windows** (worker do produto — `pffinfo.exe`/`pffexport.exe`) |
-| Plataforma de build-check | Linux/Windows (o smoke pode ser executado em qualquer uma; o binário implantado é Windows) |
-| Pinned commit/tag | _(a preencher na execução — ver §0.1)_ |
-| Binary version (`pffinfo -V`) | _(a preencher na execução)_ |
-| SHA-256 (tarball do artefato) | _(a preencher na execução)_ |
-| Upstream status | **alpha** → build escolhido **certificado** pelo plano de compatibilidade (§6) |
+| Upstream repository | `libyal/libpff` (libyal / Joachim Metz) |
+| Método de aquisição verificado | `git clone --branch 20231205 https://github.com/libyal/libpff` (git protocol) |
+| **Commit SHA (pin preferencial)** | **`d8ab3594683ee9f3ec63ab0e2efd79d545854846`** (tag `20231205`, confirmado por `git ls-remote` e pelo clone) |
+| License (SPDX) | **`LGPL-3.0-or-later`** (`COPYING` = GPLv3; `COPYING.LESSER` = LGPLv3) |
+| SHA-256 `COPYING` | `3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986` |
+| SHA-256 `COPYING.LESSER` | `e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118` |
+| Plataforma-alvo | **Windows** (`pffinfo.exe`/`pffexport.exe`) |
+
+### 0.2 Campos `BLOCKED` nesta sessão (motivo registrado — não fabricados)
+
+| Campo | Estado | Motivo |
+| --- | --- | --- |
+| SHA-256 do **source archive de release** | `BLOCKED` | download de release (`codeload.github.com`) retorna **HTTP 403** pelo proxy da sessão; o pin autoritativo é o **commit SHA** acima |
+| `pffinfo -V` (versão) | `BLOCKED` | build falhou: `./synclibs.sh` sincroniza deps em **tags de 2026** (`libfvalue` 20260531, `libuna` 20260602, `libfwnt` 20260522) **incompatíveis** com a libpff de 2023 → `make` falha em `libfvalue`; a source distribution de release (que empacota deps compatíveis) está inacessível (403) |
+| SHA-256 do **binário Linux** | `BLOCKED` | idem (sem binário construído) |
+| SHA-256 do **binário Windows homologado** | `BLOCKED` | sem toolchain Windows nesta sessão |
+| Smoke test (parse de PST sintético) | `BLOCKED` | depende do build acima e de um PST sintético |
 
 > [!IMPORTANT]
-> **Nesta sessão isolada o egress para o GitHub está bloqueado** (o proxy
-> nega `api.github.com`/`codeload.github.com`), então **não** foi possível
-> baixar o tarball, computar o SHA-256 real, nem executar o smoke test aqui.
-> **Não se inventa hash nem se declara smoke test executado.** Os campos
-> "Pinned commit/tag", "Binary version", "SHA-256" e o resultado do smoke são
-> **preenchidos pelo Evidence Owner** ao rodar o procedimento abaixo (§0.1)
-> num host com acesso ao upstream. O procedimento é determinístico e
-> registrável.
+> **Nada é inventado.** Os campos reais acima foram medidos nesta sessão; os
+> `BLOCKED` **não** foram preenchidos com valores fictícios e **não** se
+> declara smoke test executado. O Evidence Owner completa os `BLOCKED` numa das
+> duas vias: (a) rodar o procedimento §0.3 num host onde o **release tarball**
+> (deps compatíveis) esteja acessível; ou (b) sincronizar deps nas **tags
+> compatíveis** com a libpff `20231205` antes do `make`.
 
-### 0.1 Procedimento de obtenção, build e smoke test (reproduzível)
+### 0.3 Procedimento de fixação, build e smoke test (fail-closed)
 
 ```bash
 #!/usr/bin/env bash
-# Fixa e certifica o artefato candidato da libpff. Rodar em host com acesso ao upstream.
+# Fixa e certifica o artefato candidato da libpff. Fail-closed: qualquer etapa que
+# falhe aborta o script (nada de "|| true"). Rodar em host com acesso ao upstream.
 set -euo pipefail
-TAG="${1:?informe a tag experimental exata, ex.: 20231205}"
-BASE="libpff-experimental-${TAG}"
-URL="https://github.com/libyal/libpff/releases/download/${TAG}/${BASE}.tar.gz"
+TAG="${1:?informe a tag exata verificada, ex.: 20231205}"
+SAMPLE="${2:?informe o caminho de um PST sintético (sem PII)}"
 
-# 1) Obter o tarball e FIXAR o SHA-256 real (registrar na tabela do §0)
-curl -fsSL -o "${BASE}.tar.gz" "${URL}"
-sha256sum "${BASE}.tar.gz" | tee "${BASE}.sha256"
+# 1) Fixar por COMMIT SHA exato (preferencial; não presume formato de asset)
+COMMIT="$(git ls-remote --tags --refs https://github.com/libyal/libpff \
+          | awk -v t="refs/tags/${TAG}" '$2==t{print $1}')"
+test -n "$COMMIT"                       # a tag/commit precisa existir
+git clone https://github.com/libyal/libpff libpff-src
+git -C libpff-src checkout --detach "$COMMIT"
+test "$(git -C libpff-src rev-parse HEAD)" = "$COMMIT"   # pin verificado
 
-# 2) Extrair e registrar os arquivos de licença exigidos
-tar xzf "${BASE}.tar.gz"
-sha256sum "${BASE}/COPYING" "${BASE}/COPYING.LESSER"   # devem existir
+# 2) Registrar SHA-256 dos arquivos de licença exigidos
+sha256sum libpff-src/COPYING libpff-src/COPYING.LESSER
 
-# 3) Build a partir da distribuição (inclui ./configure; sem autogen)
-cd "${BASE}"
-./configure >/dev/null
-make -j"$(nproc)" >/dev/null
+# 3) Build. Sincronizar deps em TAGS COMPATÍVEIS (ou usar o release tarball).
+cd libpff-src
+./synclibs.sh                            # ver nota: fixar tags de deps compatíveis
+./autogen.sh
+./configure
+make -j"$(nproc)"
+PFF="$(find . -name pffinfo -type f -perm -u+x | head -1)"; test -n "$PFF"
 
-# 4) Smoke test: versão + parse read-only de um PST sintético, sem alterar o input
-./pfftools/pffinfo -V | tee ../pffinfo-version.txt
-# gerar/copiar um PST sintético pequeno (sem PII) em ./sample.pst e:
-INHASH=$(sha256sum sample.pst | awk '{print $1}')
-./pfftools/pffinfo sample.pst > ../pffinfo-smoke.txt 2>&1 || true
-OUTHASH=$(sha256sum sample.pst | awk '{print $1}')
-test "$INHASH" = "$OUTHASH"   # o validador NÃO altera o input (hash antes == depois)
+# 4) Smoke test (fail-closed) — versão + parse read-only sem alterar o input
+"$PFF" -V                                # exit != 0 aborta (set -e)
+IN="$(sha256sum "$SAMPLE" | awk '{print $1}')"
+OUT_FILE="$(mktemp)"
+timeout 120 "$PFF" "$SAMPLE" >"$OUT_FILE" 2>&1   # timeout; exit != 0 aborta
+grep -qiE 'Personal Folder File|Number of|File header' "$OUT_FILE"  # saída estrutural esperada
+test "$IN" = "$(sha256sum "$SAMPLE" | awk '{print $1}')"            # input inalterado (hash antes==depois)
+sha256sum "$PFF"                         # SHA-256 do binário construído
 ```
 
-O que o Evidence Owner registra ao executar: o **SHA-256 do tarball**, o
-conteúdo de `COPYING`/`COPYING.LESSER`, a **versão** do `pffinfo`, a saída do
-smoke e a **igualdade de hash antes/depois** do PST sintético (o validador não
-altera o input). Para o **binário Windows** implantado, o mesmo procedimento é
-repetido no toolchain Windows e o hash do executável homologado é registrado.
+O Evidence Owner registra: **commit SHA** (confirmado), SHA-256 de
+`COPYING`/`COPYING.LESSER`, `pffinfo -V`, **exit code** e **stdout/stderr** do
+smoke, a **presença de saída estrutural esperada**, a **ausência de crash**, a
+**igualdade de hash antes/depois** do PST, o **timeout** respeitado e o
+**SHA-256 do binário** (Linux e, no toolchain Windows, do `.exe` homologado).
 
 ## 1. Fatos técnicos do uso (o que o produto faz)
 
