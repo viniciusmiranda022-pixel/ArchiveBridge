@@ -1,11 +1,25 @@
 # ADR-0006 — Purview Network Upload como adapter GA inicial
 
-- **Status:** proposto
-- **Data:** 2026-07-20
-- **Decision Owner:** Vinicius Miranda (aceitação formal pendente)
+- **Status:** **aceito** pelo Decision Owner em 2026-07-28 (aceitação **arquitetural**; validação operacional em tenant pendente antes de produção/certificação)
+- **Data:** 2026-07-20 (proposto) · 2026-07-28 (aceito pelo Decision Owner)
+- **Decision Owner:** Vinicius Miranda
 - **Revisor necessário:** responsável técnico pelo tenant Microsoft 365
-- **Gate de aprovação:** relatório de validação do Purview em tenant controlado + referências oficiais Microsoft
+- **Gate de aprovação:** decisão arquitetural do Decision Owner; validação operacional em tenant controlado (**Gate A**) obrigatória **antes de produção/certificação**, **não** como pré-requisito da aceitação arquitetural
 - **Substitui / substituído por:** —
+
+## Registro de aceitação
+
+- **Decision Owner:** Vinicius Miranda — **decisão de aceitação em 2026-07-28**.
+- **Decisão:** **aceito** — aceitação **arquitetural** da decisão de usar o Purview Network Upload como adapter GA inicial.
+- **Motivo da aceitação:**
+  - o **Purview Network Upload** (AzCopy + CSV mapping oficial) é o **caminho oficial e suportado pela Microsoft**;
+  - o método é **compatível com a baseline on-premises** do ArchiveBridge;
+  - **não exige assinatura Azure do cliente**;
+  - o **Microsoft 365 permanece somente como destino externo**.
+- **Reclassificação do Gate A (validação em tenant):** **deixa de bloquear a aceitação arquitetural**; permanece **obrigatório** como **validação operacional antes de produção** e antes de considerar o adapter Purview **certificado**.
+- **Gate B (contrato de implementação):** permanece **obrigatório antes de produção**.
+- **Validação operacional em tenant controlado:** **pendente. Não impede a aceitação da decisão arquitetural, mas impede a certificação operacional e a promoção a produção.** Nenhum relatório de tenant é presumido ou inventado.
+- **Escopo:** a aceitação do ADR **não** equivale a autorização de produção; o desbloqueio do scaffolding ainda depende dos **demais gates obrigatórios** (0005 e 0008 seguem `proposto`).
 
 ## Contexto
 
