@@ -2,93 +2,112 @@
 
 Evidência requerida pelo gate do
 [ADR-0006](../0006-purview-adapter-ga-inicial.md) (Purview Network Upload
-como adapter GA inicial). Este documento é o **protocolo de validação** — o
-roteiro de testes e os critérios de aceitação que o **relatório de validação
-em tenant controlado** deve preencher.
+como adapter GA inicial). O protocolo é dividido em **dois gates claramente
+separados** para **não exigir código inexistente** como evidência prévia de
+aceitação do ADR.
 
-- **Tipo:** protocolo de validação em tenant Microsoft 365 controlado
-- **Evidence Owner:** _a atribuir_ — **Engenharia** produz e assina o relatório de validação
-- **Revisor necessário:** _a atribuir_ — **responsável técnico pelo tenant** (papel **distinto** do Evidence Owner: quem produz a evidência não é quem a revisa)
+- **Tipo:** protocolo de validação em tenant Microsoft 365 controlado (Gate A)
+  + contrato de implementação (Gate B)
+- **Evidence Owner:** _a atribuir_ — **Engenharia** produz e assina o relatório
+- **Revisor necessário:** _a atribuir_ — **responsável técnico pelo tenant**
+  (papel **distinto** do Evidence Owner)
 - **Estado da execução:** **pendente** — nenhuma execução em tenant foi
-  realizada até esta data. Este documento **não** é o relatório de
-  validação nem a aceitação formal.
+  realizada. Este documento **não** é o relatório nem a aceitação formal.
 
 > [!IMPORTANT]
-> A execução deste protocolo é **externa a esta sessão** e depende de um
-> tenant Microsoft 365 controlado, de contas com os papéis mínimos e da
-> autorização do Decision Owner. Enquanto o relatório de validação não
-> estiver anexado e revisado, o [ADR-0006](../0006-purview-adapter-ga-inicial.md)
-> permanece `proposto`.
+> **Gate A bloqueia a aceitação do ADR; Gate B não.** O Gate A é
+> **evidência pré-código** — executável **manualmente** em tenant controlado,
+> **sem** depender de código do produto. O Gate B é o **contrato de
+> implementação**: obrigatório **antes de produção**, mas **não** é
+> pré-requisito para aceitar o ADR (exigir testes automatizados de código que
+> ainda não existe bloquearia indevidamente a decisão arquitetural).
 
 ## 1. Objetivo
 
-Confirmar, em tenant controlado, que o adapter Purview Network Upload
-prepara, transporta e reconcilia uma onda de PST **pelo único caminho
-suportado pela Microsoft** (portal Purview + AzCopy + CSV mapping oficial),
-respeitando o capacity gate e o bloqueio de >100 GB, e que o fluxo é
-compatível com a **baseline on-premises** ([ADR-0003](../0003-azure-sql-e-service-bus-premium.md)):
-AzCopy a partir de worker on-premises e SAS custodiado pelo mecanismo de
-segredos on-premises (detalhe em [ADR-0008](../0008-isolamento-por-tenant-e-projeto.md)).
+Confirmar que o Purview Network Upload é o **caminho GA suportado pela
+Microsoft** (portal + AzCopy + CSV mapping oficial), compatível com a
+**baseline on-premises** ([ADR-0003](../0003-azure-sql-e-service-bus-premium.md)),
+separando **o que se valida antes do código** (Gate A) do **que o código deve
+garantir antes de produção** (Gate B).
 
-## 2. Pré-requisitos
+---
 
-- Tenant Microsoft 365 controlado (não produção do cliente), com licença
-  que habilite archive quando o caso de teste exigir.
-- Role group dedicado `PST Import Operators` com `Mailbox Import Export` e
-  `Mail Recipients`; **Global Administrator rejeitado como conta operacional**
-  (§25.1). Contas com MFA/Conditional Access/PIM.
-- Aprovador distinto do operador que inicia a onda (§25.1).
-- Upload worker on-premises dedicado e endurecido: Windows Service, sem
-  usuários interativos, admin JIT, AzCopy homologado (binário + SHA-256),
-  transcript desabilitado (§25.6, item 3 do ADR-0006).
-- Mecanismo de segredos on-premises disponível para custódia do SAS (ADR-0003/ADR-0008).
+## Gate A — Evidência pré-código (BLOQUEIA a aceitação do ADR)
 
-## 3. Casos de validação e critérios de aceitação
+Executável manualmente em **tenant controlado**, sem código do produto. Cada
+item produz artefato anexável ao relatório.
 
 | # | Caso | Fonte | Critério de aceitação |
 | --- | --- | --- | --- |
-| V1 | Permissões mínimas: criar job com role group dedicado; recusar Global Administrator como conta operacional | §25.1 | Job criável com o role restrito; conta GA não usada como operacional |
-| V2 | Precheck de tenant/mailbox (archive status, GUIDs, holds, auto-expanding) por leitura restrita | §25.2 | Precheck coleta as propriedades estruturadas; nenhuma mudança implícita (archive/auto-expansion) executada |
-| V3 | Capacity gate — dentro do limite | §25.4 | Onda dentro do limite passa; `csvRowCount ≤ 500`; `targetRoot != "/"` |
-| V4 | Capacity gate — **bloqueio >100 GB no mesmo archive** | §25.4, §27 | Estado `MICROSOFT_ASSESSMENT_REQUIRED`; `AutoExpandingArchiveEnabled=True` **não** eleva o limite; job vai a `WAITING_EXTERNAL` com o pacote de suporte (§27) |
-| V5 | Coleta segura do SAS pelo formulário secreto; custódia no mecanismo de segredos on-premises | §25.5, ADR-0006 item 4 | SAS validado (host/HTTPS/container `ingestiondata`/expiry/permissões); **nunca** em log/analytics/telemetria; leitura restrita à identidade do worker; eliminação após upload |
-| V6 | Transporte AzCopy a partir do worker on-premises (exceção controlada de SAS no argv) | §25.6, ADR-0006 "Exceção controlada" | Upload concluído; versão AzCopy homologada; controles compensatórios ativos (worker/identidade exclusivos, sem usuário interativo, admin JIT, transcript/history off, sem gravação do comando completo, encerramento após upload, destruição da cópia local); **teste automático de vazamento do SAS** varre logs/stdout/stderr/eventos/telemetria e artefatos de evidência e **falha se o SAS aparecer**; `UPLOAD_VERIFIED` |
-| V7 | Builder do CSV mapping oficial | §25.8 | Dez colunas e cabeçalho idênticos; `Workload=Exchange`; `FilePath` sem `ingestiondata` e case-sensitive; `IsArchive=TRUE` só após precheck; `TargetRootFolder=/ImportedPst_<Project>_<Wave>`; ≤ 500 linhas; SHA-256 do CSV registrado |
-| V8 | Workflow humano no portal Purview (criar/validar/iniciar job) | §25.9 | Passos executados no portal; CSV não editado manualmente; nome/ID do job, operador, horário e relatório registrados |
-| V9 | Ledger `external_operations` para upload + import job | ADR-0006 item 5, ADR-0003 | `operation_key` determinística gravada em `INTENT` **antes** do efeito externo; nome planejado do job usado no portal; `provider_operation_id` registrado **após** a criação; reconciliação por **nome planejado + `provider_operation_id`**; ambíguo nunca repete automaticamente (ver cenários V9.1–V9.7) |
-| V10 | Reconciliação pós-import | §26 | Resultado classificado (`PASS` / `PASS_WITH_EXPLAINED_EXCEPTIONS` / `INCONCLUSIVE` / `FAIL` / `DUPLICATE_RISK`) com evidência completa; Retention Hold nunca removido automaticamente (§26.4) |
-| V11 | Retenção do staging Microsoft | §25.10 | Registrado que o produto não promete deleção imediata; limitação no data processing record |
+| A1 | **Tenant controlado** provisionado (não produção do cliente) | §25 | tenant isolado, licença que habilite archive quando o caso exigir |
+| A2 | **Permissões mínimas**: role group dedicado `PST Import Operators` (`Mailbox Import Export` + `Mail Recipients`); GA recusado como conta operacional; aprovador ≠ operador | §25.1 | job criável com role restrito; MFA/CA/PIM; segregação aprovador/operador |
+| A3 | **Obtenção e validação do SAS** pelo formulário secreto | §25.5 | SAS validado (host/HTTPS/container `ingestiondata`/expiry/permissões); nunca ecoado |
+| A4 | **Execução manual do AzCopy** para o staging Microsoft | §25.6 | upload concluído com AzCopy homologado; SAS não impresso |
+| A5 | **CSV mapping oficial** (formato) montado à mão para a onda de teste | §25.8 | dez colunas e cabeçalho idênticos; `Workload=Exchange`; `FilePath` sem `ingestiondata`; `TargetRootFolder=/ImportedPst_<Project>_<Wave>`; ≤ 500 linhas; SHA-256 registrado |
+| A6 | **Criação e início do job no portal Purview** | §25.9 | job criado/validado/iniciado no portal; nome/ID, operador e horário registrados |
+| A7 | **Importação de PST sintético** (pequeno, sem PII) | §25.9 | PST sintético importado; status por arquivo coletado |
+| A8 | **Relatórios do Purview** (validation report, status por PST, import size/count) | §26.1 | relatórios exportados e anexados |
+| A9 | **Dados disponíveis para reconciliação** (EXO statistics antes/depois; granularidade do serviço) | §26.2 | métricas coletadas; granularidade documentada (o serviço pode não expor tudo) |
+| A10 | **Limitações do serviço Microsoft** documentadas | §25.10, §27 | retenção do staging (~30 dias, sem deleção pelo operador); **comportamento do bloqueio >100 GB documentado a partir da documentação oficial — SEM executar carga real >100 GB nesta fase** |
 
-### 3.1 Cenários do ledger (expansão do V9)
+**Regra do Gate A:** valida o **caminho suportado** e as **limitações do
+serviço** — não valida código do produto. Uma **carga real acima de 100 GB
+não é executada** aqui; o cenário >100 GB é confirmado por **documentação
+oficial** e pelo pacote de suporte (§27).
 
-O V9 deve exercer explicitamente:
+---
 
-- **V9.1** crash **após `INTENT` e antes** de qualquer ação no portal → na retomada, a `operation_key` já existe; nenhuma submissão duplicada é criada.
-- **V9.2** job criado no portal, mas o ArchiveBridge **ainda não atualizado** (`provider_operation_id` ausente) → reconciliação encontra o job pelo **nome planejado** e completa o vínculo.
-- **V9.3** **timeout** ao consultar o Purview → estado permanece consultável; sem marcação otimista de sucesso.
-- **V9.4** operador tenta **criar o mesmo job novamente** → detecção pelo nome planejado; nenhuma segunda importação é iniciada.
-- **V9.5** job **encontrado pelo nome planejado** durante reconciliação → vínculo idempotente ao mesmo `operation_key`.
-- **V9.6** **resultado ambíguo** (não é possível confirmar efeito) → estado `AMBIGUOUS`; **nunca** repete automaticamente; exige disposição.
-- **V9.7** confirmação de que **nenhuma segunda importação** é iniciada em nenhum dos cenários acima.
+## Gate B — Contrato de implementação (NÃO bloqueia a aceitação; obrigatório antes de produção)
 
-## 4. Artefatos de evidência a coletar
+Itens **dependentes de código** do produto. Tornam-se verificáveis quando o
+scaffolding existir; **não** são exigidos para aceitar o ADR.
 
-- Saída do precheck (V2) e do capacity gate (V3/V4), incluindo o pacote de
-  suporte do cenário >100 GB (§27).
-- CSV mapping gerado + SHA-256 (V7); validation report do Purview (V8).
-- AzCopy result/plan/log **sanitizados** (sem query string do SAS) (V6).
-- Registro do ledger `external_operations` (V9).
-- Estatísticas EXO antes/depois e resultado de reconciliação (V10, §26).
-- Nome/ID do Purview job, operador, horário e screenshots/relatórios (V8).
+| # | Item | Fonte | O que o código deve garantir |
+| --- | --- | --- | --- |
+| B1 | **Capacity gate** | §25.4, §27 | bloqueia >100 GB no mesmo archive (`MICROSOFT_ASSESSMENT_REQUIRED`); auto-expanding não eleva o limite; `csvRowCount ≤ 500`; `targetRoot != "/"` |
+| B2 | **CSV builder** | §25.8 | gera o CSV oficial com todas as validações; nunca edição manual; nova versão + hash a cada mudança |
+| B3 | **Ledger `external_operations`** | ADR-0006 item 5, ADR-0003 | transições `INTENT → SUBMITTED → CONFIRMED/AMBIGUOUS/FAILED` persistidas |
+| B4 | **`operation_key` determinística** | ADR-0006 item 5 | gravada em `INTENT` **antes** do efeito externo; **nome planejado do job** usado no portal; `provider_operation_id` registrado **após** a criação; reconciliação por **nome planejado + provider id** |
+| B5 | **Crash recovery** | ADR-0003 | crash após `INTENT` e antes do portal não duplica submissão; retomada usa a `operation_key` existente |
+| B6 | **Idempotência** | ADR-0003 | retomada não recria job nem reimporta parts já validadas |
+| B7 | **Duplicate prevention** | ADR-0006 | tentativa de criar o mesmo job (nome planejado) não inicia segunda importação |
+| B8 | **Leak test automático do SAS** | ADR-0006 "Exceção controlada" | varre logs/stdout/stderr/eventos/telemetria/evidência e **falha** se o SAS aparecer |
+| B9 | **Reconciliação automática** | §26 | classifica `PASS`/`PASS_WITH_EXPLAINED_EXCEPTIONS`/`INCONCLUSIVE`/`FAIL`/`DUPLICATE_RISK`; Retention Hold nunca removido automaticamente (§26.4) |
+| B10 | **Chaos tests** | ADR-0003 | timeout de consulta ao Purview, worker morto com lease ativo, resultado ambíguo (`AMBIGUOUS` nunca repete automaticamente) |
 
-## 5. Conclusão e assinatura (a preencher na execução)
+**Regra do Gate B:** é o **contrato de implementação verificável** antes de
+produção. Sua ausência **não** bloqueia a aceitação do ADR — bloqueia a
+**promoção a produção**.
 
-- **Resultado geral:** _(pendente)_
-- **Ressalvas/limitações:** _(pendente)_
-- **Evidence Owner (assinatura/data):** _(pendente)_
+---
+
+## 2. Fronteira entre os gates (para não confundir)
+
+- **Aceitar o ADR-0006** exige **apenas o Gate A** (evidência pré-código em
+  tenant + limitações do serviço), mais a revisão do responsável técnico pelo
+  tenant.
+- **Ir a produção** exige adicionalmente o **Gate B** (contrato de
+  implementação) satisfeito e certificado — quando o código existir.
+- **Nunca** exigir código inexistente (Gate B) como evidência prévia para
+  aceitar a decisão arquitetural.
+
+## 3. Artefatos de evidência (Gate A) a coletar
+
+- A2: definição do role group e prova de segregação aprovador/operador.
+- A3–A4: registro do upload (AzCopy result/plan/log **sanitizados**, sem SAS).
+- A5: CSV de teste + SHA-256.
+- A6–A8: nome/ID do job, screenshots/relatórios do portal, validation report.
+- A9: EXO statistics antes/depois; nota de granularidade do serviço.
+- A10: documentação oficial das limitações (staging, >100 GB).
+
+## 4. Conclusão e assinatura (Gate A — a preencher na execução)
+
+- **Resultado do Gate A:** _(pendente)_
+- **Limitações observadas do serviço:** _(pendente)_
+- **Evidence Owner (Engenharia) — assinatura/data:** _(pendente)_
 - **Revisor — responsável técnico pelo tenant (parecer/data):** _(pendente)_
 
 A **aceitação formal** do ADR-0006 é ato do Decision Owner (Vinicius
-Miranda) e ocorre **somente após** este protocolo ser executado, o relatório
-de validação ser anexado e a revisão do responsável técnico pelo tenant ser
-registrada — conforme a [matriz de fechamento](../gate-closure-matrix.md).
+Miranda) e ocorre **somente após** o **Gate A** executado e revisado —
+conforme a [matriz de fechamento](../gate-closure-matrix.md). O **Gate B**
+segue como contrato de implementação obrigatório antes de produção.
