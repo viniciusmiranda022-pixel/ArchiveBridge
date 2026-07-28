@@ -17,21 +17,73 @@ verificador independente).
 > o modelo de uso e delimita o que o Jurídico deve decidir sobre um
 > **artefato específico**.
 
-## 0. Artefato analisado (fixar antes do parecer)
+## 0. Artefato candidato fixado
 
-O parecer jurídico deve analisar **um artefato específico**, não o projeto de
-forma abstrata. O repositório oficial declara **LGPL-3.0-or-later** e status
-**alpha** — o que **exige certificar o build escolhido**. Registrar:
+O parecer jurídico e a certificação técnica analisam **um artefato
+específico**, não o projeto de forma abstrata. O upstream declara
+**LGPL-3.0-or-later** e status **alpha** — o build escolhido **deve ser
+certificado**.
 
 | Campo | Valor |
 | --- | --- |
-| Upstream repository | `libyal/libpff` |
-| License | **LGPL-3.0-or-later** |
-| Pinned commit/tag | _(a fixar)_ |
-| Binary version | _(a fixar)_ |
-| SHA-256 | _(a fixar)_ |
+| Upstream repository | `libyal/libpff` (Joachim Metz / libyal) |
+| Artefato candidato | **source distribution experimental** (tarball datado `libpff-experimental-<YYYYMMDD>` / `libpff-alpha-<YYYYMMDD>`), que fornece `pffinfo`/`pffexport` |
+| License (SPDX) | **LGPL-3.0-or-later** |
 | Included license files | `COPYING`, `COPYING.LESSER` |
-| Upstream status | **alpha** → build escolhido deve ser certificado antes do uso |
+| Plataforma de destino | **Windows** (worker do produto — `pffinfo.exe`/`pffexport.exe`) |
+| Plataforma de build-check | Linux/Windows (o smoke pode ser executado em qualquer uma; o binário implantado é Windows) |
+| Pinned commit/tag | _(a preencher na execução — ver §0.1)_ |
+| Binary version (`pffinfo -V`) | _(a preencher na execução)_ |
+| SHA-256 (tarball do artefato) | _(a preencher na execução)_ |
+| Upstream status | **alpha** → build escolhido **certificado** pelo plano de compatibilidade (§6) |
+
+> [!IMPORTANT]
+> **Nesta sessão isolada o egress para o GitHub está bloqueado** (o proxy
+> nega `api.github.com`/`codeload.github.com`), então **não** foi possível
+> baixar o tarball, computar o SHA-256 real, nem executar o smoke test aqui.
+> **Não se inventa hash nem se declara smoke test executado.** Os campos
+> "Pinned commit/tag", "Binary version", "SHA-256" e o resultado do smoke são
+> **preenchidos pelo Evidence Owner** ao rodar o procedimento abaixo (§0.1)
+> num host com acesso ao upstream. O procedimento é determinístico e
+> registrável.
+
+### 0.1 Procedimento de obtenção, build e smoke test (reproduzível)
+
+```bash
+#!/usr/bin/env bash
+# Fixa e certifica o artefato candidato da libpff. Rodar em host com acesso ao upstream.
+set -euo pipefail
+TAG="${1:?informe a tag experimental exata, ex.: 20231205}"
+BASE="libpff-experimental-${TAG}"
+URL="https://github.com/libyal/libpff/releases/download/${TAG}/${BASE}.tar.gz"
+
+# 1) Obter o tarball e FIXAR o SHA-256 real (registrar na tabela do §0)
+curl -fsSL -o "${BASE}.tar.gz" "${URL}"
+sha256sum "${BASE}.tar.gz" | tee "${BASE}.sha256"
+
+# 2) Extrair e registrar os arquivos de licença exigidos
+tar xzf "${BASE}.tar.gz"
+sha256sum "${BASE}/COPYING" "${BASE}/COPYING.LESSER"   # devem existir
+
+# 3) Build a partir da distribuição (inclui ./configure; sem autogen)
+cd "${BASE}"
+./configure >/dev/null
+make -j"$(nproc)" >/dev/null
+
+# 4) Smoke test: versão + parse read-only de um PST sintético, sem alterar o input
+./pfftools/pffinfo -V | tee ../pffinfo-version.txt
+# gerar/copiar um PST sintético pequeno (sem PII) em ./sample.pst e:
+INHASH=$(sha256sum sample.pst | awk '{print $1}')
+./pfftools/pffinfo sample.pst > ../pffinfo-smoke.txt 2>&1 || true
+OUTHASH=$(sha256sum sample.pst | awk '{print $1}')
+test "$INHASH" = "$OUTHASH"   # o validador NÃO altera o input (hash antes == depois)
+```
+
+O que o Evidence Owner registra ao executar: o **SHA-256 do tarball**, o
+conteúdo de `COPYING`/`COPYING.LESSER`, a **versão** do `pffinfo`, a saída do
+smoke e a **igualdade de hash antes/depois** do PST sintético (o validador não
+altera o input). Para o **binário Windows** implantado, o mesmo procedimento é
+repetido no toolchain Windows e o hash do executável homologado é registrado.
 
 ## 1. Fatos técnicos do uso (o que o produto faz)
 
