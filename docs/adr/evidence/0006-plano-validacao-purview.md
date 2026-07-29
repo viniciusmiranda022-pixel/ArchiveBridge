@@ -15,12 +15,14 @@ aceitação do ADR.
   realizada. Este documento **não** é o relatório nem a aceitação formal.
 
 > [!IMPORTANT]
-> **Gate A bloqueia a aceitação do ADR; Gate B não.** O Gate A é
-> **evidência pré-código** — executável **manualmente** em tenant controlado,
-> **sem** depender de código do produto. O Gate B é o **contrato de
-> implementação**: obrigatório **antes de produção**, mas **não** é
-> pré-requisito para aceitar o ADR (exigir testes automatizados de código que
-> ainda não existe bloquearia indevidamente a decisão arquitetural).
+> **Reclassificação (Decision Owner, 2026-07-28 — aceitação arquitetural do ADR-0006).**
+> A decisão arquitetural foi **aceita**; nem o Gate A nem o Gate B bloqueiam
+> essa aceitação. **Gate A** (validação operacional em tenant, executável
+> **manualmente**, sem código) permanece **obrigatório antes de produção e da
+> certificação** do adapter Purview — **está pendente**. **Gate B** (contrato
+> de implementação, dependente de código) permanece **obrigatório antes de
+> produção**. Exigir código inexistente como evidência prévia bloquearia
+> indevidamente a decisão arquitetural.
 
 ## 1. Objetivo
 
@@ -32,10 +34,11 @@ garantir antes de produção** (Gate B).
 
 ---
 
-## Gate A — Evidência pré-código (BLOQUEIA a aceitação do ADR)
+## Gate A — Validação operacional em tenant (obrigatória antes de produção/certificação; **não** bloqueia a aceitação arquitetural)
 
 Executável manualmente em **tenant controlado**, sem código do produto. Cada
-item produz artefato anexável ao relatório.
+item produz artefato anexável ao relatório. **Estado: pendente** — nenhuma
+execução em tenant foi realizada; nenhum relatório é presumido.
 
 | # | Caso | Fonte | Critério de aceitação |
 | --- | --- | --- | --- |
@@ -83,13 +86,14 @@ produção. Sua ausência **não** bloqueia a aceitação do ADR — bloqueia a
 
 ## 2. Fronteira entre os gates (para não confundir)
 
-- **Aceitar o ADR-0006** exige **apenas o Gate A** (evidência pré-código em
-  tenant + limitações do serviço), mais a revisão do responsável técnico pelo
-  tenant.
-- **Ir a produção** exige adicionalmente o **Gate B** (contrato de
-  implementação) satisfeito e certificado — quando o código existir.
-- **Nunca** exigir código inexistente (Gate B) como evidência prévia para
-  aceitar a decisão arquitetural.
+- **Aceitação arquitetural do ADR-0006:** **já concedida** pelo Decision Owner
+  em 2026-07-28 — **não** dependeu de Gate A nem de Gate B.
+- **Certificar o adapter Purview e ir a produção** exige o **Gate A**
+  (validação operacional em tenant + limitações do serviço, com revisão do
+  responsável técnico pelo tenant) **e** o **Gate B** (contrato de
+  implementação satisfeito e certificado, quando o código existir).
+- **Nunca** exigir código inexistente (Gate B) como evidência prévia da
+  decisão arquitetural.
 
 ## 3. Artefatos de evidência (Gate A) a coletar
 
@@ -107,7 +111,10 @@ produção. Sua ausência **não** bloqueia a aceitação do ADR — bloqueia a
 - **Evidence Owner (Engenharia) — assinatura/data:** _(pendente)_
 - **Revisor — responsável técnico pelo tenant (parecer/data):** _(pendente)_
 
-A **aceitação formal** do ADR-0006 é ato do Decision Owner (Vinicius
-Miranda) e ocorre **somente após** o **Gate A** executado e revisado —
-conforme a [matriz de fechamento](../gate-closure-matrix.md). O **Gate B**
-segue como contrato de implementação obrigatório antes de produção.
+A **aceitação arquitetural** do ADR-0006 foi registrada pelo Decision Owner
+(Vinicius Miranda) em **2026-07-28** (ver "Registro de aceitação" no ADR e a
+[matriz de fechamento](../gate-closure-matrix.md)). A **validação operacional
+em tenant (Gate A) permanece pendente** e é **obrigatória antes de produção e
+da certificação** do adapter; o **Gate B** segue como contrato de
+implementação obrigatório antes de produção. **A aceitação do ADR não autoriza
+produção.**
