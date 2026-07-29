@@ -1,0 +1,20 @@
+# Configuração do gitleaks para o ArchiveBridge.
+# Estende as regras padrão e mantém uma allowlist mínima e justificada.
+title = "ArchiveBridge gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+Credencial efêmera do container SQL Server usado APENAS nos testes de integração de CI.
+O container é criado e destruído dentro do job, não é acessível externamente e não protege
+nenhum dado real. Não é um segredo de produção. A conexão de teste real vem sempre da variável
+de ambiente ARCHIVEBRIDGE_TEST_SQL (nunca versionada).
+"""
+regexes = [
+  '''Slice1_CI_Ephemeral!9''',
+]
+paths = [
+  '''\.gitleaks\.toml''',
+]

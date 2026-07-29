@@ -21,6 +21,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\ArchiveBridge.Domain\ArchiveBridge.Domain.csproj" />
     <ProjectReference Include="..\..\src\ArchiveBridge.Contracts\ArchiveBridge.Contracts.csproj" />
+    <ProjectReference Include="..\..\src\ArchiveBridge.Application\ArchiveBridge.Application.csproj" />
     <ProjectReference Include="..\..\src\ArchiveBridge.Infrastructure\ArchiveBridge.Infrastructure.csproj" />
   </ItemGroup>
 

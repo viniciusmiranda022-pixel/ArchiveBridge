@@ -38,6 +38,26 @@ jobs:
   dotnet:
     name: Scaffolding .NET (build, testes, qualidade)
     runs-on: ubuntu-latest
+    services:
+      # SQL Server efêmero apenas para os testes de integração (destruído ao fim do job; não
+      # acessível externamente). A senha abaixo NÃO é um segredo real — é uma credencial
+      # descartável deste container de CI (allowlist em .gitleaks.toml).
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Slice1_CI_Ephemeral!9"
+          MSSQL_PID: Developer
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Slice1_CI_Ephemeral!9 -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 30s
+    env:
+      ARCHIVEBRIDGE_TEST_SQL: "Server=localhost,1433;User ID=sa;Password=Slice1_CI_Ephemeral!9;TrustServerCertificate=True;Encrypt=False"
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
