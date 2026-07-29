@@ -1,11 +1,28 @@
 # ADR-0008 — Modelo de isolamento por tenant/projeto (identidade, segredos e rede on-premises)
 
-- **Status:** proposto
-- **Data:** 2026-07-20 (versão original) · 2026-07-23 (reescrito — alinhamento on-premises)
-- **Decision Owner:** Vinicius Miranda (aceitação formal pendente)
+- **Status:** **aceito arquiteturalmente com condições** pelo Decision Owner em 2026-07-28 (assinatura institucional de Segurança/DPO pendente antes de produção; **não bloqueia o início do desenvolvimento**)
+- **Data:** 2026-07-20 (versão original) · 2026-07-23 (reescrito — on-premises) · 2026-07-28 (aceito arquiteturalmente pelo Decision Owner)
+- **Decision Owner:** Vinicius Miranda
 - **Revisor necessário:** Segurança/Privacidade (DPO)
-- **Gate de aprovação:** threat model on-premises + avaliação de dados/privacidade, revisados por Segurança/DPO
+- **Gate de aprovação:** aceitação arquitetural do Decision Owner sobre o parecer técnico (**APROVAÇÃO TÉCNICA CONDICIONAL**); assinatura institucional de Segurança/DPO obrigatória **antes de produção**
 - **Substitui / substituído por:** reescreve a versão anterior deste ADR (isolamento expresso em primitivos Azure — Managed Identity, private endpoints, NSG), que **não** foi aceita. Nome do arquivo mantido por estabilidade de referências.
+
+## Registro de aceitação
+
+- **Decision Owner:** Vinicius Miranda — **decisão de aceitação em 2026-07-28**.
+- **Decisão:** **aceito arquiteturalmente com condições.**
+- **Fundamento:** parecer técnico de Segurança e Privacidade concluído (resultado **APROVAÇÃO TÉCNICA CONDICIONAL**, [`evidence/0008-parecer-tecnico-seguranca-privacidade.md`](evidence/0008-parecer-tecnico-seguranca-privacidade.md)); desenho on-premises tecnicamente adequado; condições **SEC-01..04, IAM-01..03, NET-01, PRIV-01..04, IR-01** já incorporadas (seção 7 da [evidência](evidence/0008-threat-model-avaliacao-dados.md)).
+
+> O ADR-0008 está **aceito arquiteturalmente pelo Decision Owner, condicionado aos controles documentados no parecer técnico**. A **assinatura institucional de Segurança/DPO permanece pendente como requisito anterior à produção, mas não bloqueia o início do desenvolvimento**. **A aceitação deste ADR não equivale à autorização de produção.**
+
+- **Perfil inicial autorizado:** nó único; **DPAPI sob identidade dedicada**; **workers separados**; **identidade por workload**; **RLS como defesa em profundidade**; **autorização também na Application**.
+- **Perfil HA de segredos:** **`BLOCKED_PENDING_EVIDENCE`** — o HA **não** pode ser habilitado até existir **solução concreta e certificada** para segredos multi-nó.
+- **Pendências mantidas:**
+  - **assinatura institucional de Segurança/DPO** — pendente **antes de produção**;
+  - **controles de implementação** (SEC-01, IAM-01..03, …) — obrigatórios **no primeiro scaffolding**;
+  - **controles operacionais** — obrigatórios **antes de produção**;
+  - **HA de segredos** — **bloqueado**.
+- **Assinaturas institucionais e parecer jurídico:** **não preenchidos** — nenhuma assinatura de Segurança/DPO e nenhum parecer jurídico foram declarados ou falsificados.
 
 ## Contexto
 
@@ -101,4 +118,4 @@ O gate exige **threat model on-premises + avaliação de dados/privacidade**. Es
 
 Uma **revisão técnica preliminar de Segurança e Privacidade** foi produzida em [`evidence/0008-parecer-tecnico-seguranca-privacidade.md`](evidence/0008-parecer-tecnico-seguranca-privacidade.md), com resultado **APROVAÇÃO TÉCNICA CONDICIONAL**: o desenho on-premises é tecnicamente adequado, **sujeito às condições** SEC-01..04, IAM-01..03, NET-01, PRIV-01..04 e IR-01 (incorporadas à seção 7 da evidência) — que valem como correções e como gates verificáveis de scaffolding/produção. O perfil **HA de segredos permanece `BLOCKED_PENDING_EVIDENCE`**. Essa revisão **não** é assinatura institucional de Segurança/DPO (pendente) nem parecer jurídico, e **não** autoriza produção.
 
-Este ADR permanece **`proposto`** até a **assinatura institucional de Segurança/DPO** e a **aceitação formal do Decision Owner** (Vinicius Miranda). A aceitação do ADR não equivale a autorização de produção.
+Este ADR está **aceito arquiteturalmente com condições** pelo Decision Owner (Vinicius Miranda) em **2026-07-28** — ver "Registro de aceitação". A **assinatura institucional de Segurança/DPO permanece pendente como requisito anterior à produção** (não bloqueia o início do desenvolvimento), e a **aceitação do ADR não equivale a autorização de produção**.
