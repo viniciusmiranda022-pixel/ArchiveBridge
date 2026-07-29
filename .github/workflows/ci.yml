@@ -34,3 +34,62 @@ jobs:
             git --no-pager diff --stat -- docs/runbook
             exit 1
           fi
+
+  dotnet:
+    name: Scaffolding .NET (build, testes, qualidade)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar .NET (SDK do global.json)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore ArchiveBridge.sln
+
+      - name: Build Release (warnings as errors via Directory.Build.props)
+        run: dotnet build ArchiveBridge.sln --configuration Release --no-restore
+
+      - name: Testes (unitários, arquitetura e integração) em Release
+        run: dotnet test ArchiveBridge.sln --configuration Release --no-build --verbosity normal
+
+      - name: Verificar formatação
+        run: dotnet format ArchiveBridge.sln --verify-no-changes --no-restore
+
+      - name: SCA — pacotes vulneráveis (fail-closed)
+        run: |
+          report=$(dotnet list ArchiveBridge.sln package --vulnerable --include-transitive 2>&1)
+          echo "$report"
+          if echo "$report" | grep -q 'has the following vulnerable'; then
+            echo "::error::Dependências vulneráveis detectadas (SCA)."
+            exit 1
+          fi
+
+      - name: Gerar SBOM inicial (CycloneDX)
+        run: |
+          dotnet tool install --global CycloneDX
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          dotnet CycloneDX ArchiveBridge.sln --output sbom --json --exclude-dev
+
+      - name: Publicar SBOM como artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom/
+
+  secret-scanning:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (histórico completo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

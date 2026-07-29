@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ArchiveBridge.Domain\ArchiveBridge.Domain.csproj" />
+    <ProjectReference Include="..\ArchiveBridge.Contracts\ArchiveBridge.Contracts.csproj" />
+    <ProjectReference Include="..\ArchiveBridge.Application\ArchiveBridge.Application.csproj" />
+    <ProjectReference Include="..\ArchiveBridge.Infrastructure\ArchiveBridge.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>
