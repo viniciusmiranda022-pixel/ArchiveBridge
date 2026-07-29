@@ -32,9 +32,9 @@ A **autoridade** é sempre o ADR citado.
 | [ADR-0003](../adr/0003-azure-sql-e-service-bus-premium.md) | Persistência e execução durável **on-premises** | **aceito** |
 | [ADR-0007](../adr/0007-graph-fts-bloqueado.md) | Graph condicional; rota PST/EV → FTS bloqueada | **aceito** |
 | [ADR-0013](../adr/0013-exportacao-ev-multiversao.md) | Exportação EV multiversão por capability discovery | **aceito** |
-| [ADR-0006](../adr/0006-purview-adapter-ga-inicial.md) | Purview Network Upload como adapter GA inicial | proposto |
-| [ADR-0008](../adr/0008-isolamento-por-tenant-e-projeto.md) | Isolamento por tenant/projeto (identidade, segredos, rede) | proposto |
-| [ADR-0005](../adr/0005-libpff-validador-independente.md) | libpff como verificador independente | proposto |
+| [ADR-0006](../adr/0006-purview-adapter-ga-inicial.md) | Purview Network Upload como adapter GA inicial | **aceito** (arquitetural; Gate A em tenant obrigatório antes de produção) |
+| [ADR-0008](../adr/0008-isolamento-por-tenant-e-projeto.md) | Isolamento por tenant/projeto (identidade, segredos, rede) | **aceito** (arquitetural, com condições; assinatura Seg./DPO antes de produção; HA de segredos `BLOCKED_PENDING_EVIDENCE`) |
+| [ADR-0005](../adr/0005-libpff-validador-independente.md) | libpff como verificador independente | **aceito** (não inclusão no MVP; capacidade opcional `BLOCKED_PENDING_EVIDENCE`) |
 
 ## 1. Baseline arquitetural on-premises (ADR-0003, aceito)
 
