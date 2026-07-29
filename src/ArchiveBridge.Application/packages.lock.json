@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0": {
+      "archivebridge.contracts": {
+        "type": "Project",
+        "dependencies": {
+          "ArchiveBridge.Domain": "[1.0.0, )"
+        }
+      },
+      "archivebridge.domain": {
+        "type": "Project"
+      }
+    }
+  }
+}

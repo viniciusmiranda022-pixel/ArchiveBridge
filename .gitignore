@@ -37,3 +37,7 @@ obj/
 TestResults/
 *.user
 *.suo
+
+# Artefatos gerados por CI (SBOM e relatório de SCA) — não versionar
+/sbom/
+sca.json
