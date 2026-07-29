@@ -17,6 +17,17 @@ verificador independente).
 > o modelo de uso e delimita o que o Jurídico deve decidir sobre um
 > **artefato específico**.
 
+> [!NOTE]
+> **Decisão do Decision Owner (2026-07-28): libpff FORA do MVP.** A capacidade
+> `LibpffIndependentValidation` está **`BLOCKED_PENDING_EVIDENCE`** — **opcional,
+> não pertencente ao MVP e não bloqueadora** do desenvolvimento. **O MVP não
+> distribui** libpff / `pffinfo.exe` / `pffexport.exe` / bibliotecas LGPL
+> relacionadas. Portanto, **todos os campos `BLOCKED` deste documento**
+> (build, `pffinfo -V`, binário Windows, smoke) são **requisitos de habilitação
+> futura**, e **não bloqueadores do MVP**. A pesquisa técnica já obtida é
+> **preservada** para a certificação futura. A habilitação exige **certificação
+> técnica + parecer jurídico + nova autorização do Decision Owner**.
+
 ## 0. Artefato candidato: família definida, procedimento de fixação definido; fixação concreta **parcialmente verificada**
 
 **Família de artefato candidata e procedimento de fixação definidos; a

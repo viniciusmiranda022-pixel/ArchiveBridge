@@ -26,7 +26,7 @@ Miranda.
 | [ADR-0002](0002-dotnet-10-lts-e-politica-de-atualizacao.md) | .NET 10 LTS e política de atualização | Dev + Segurança | **aceito** |
 | [ADR-0003](0003-azure-sql-e-service-bus-premium.md) | Persistência e execução durável **on-premises** (SQL Server local + fila durável em SQL) | Dev + Arquitetura/Segurança | **aceito** |
 | [ADR-0004](0004-aspose-email-engine-primaria.md) | Aspose como writer/splitter primário | — | **substituído** pelo ADR-0013² |
-| [ADR-0005](0005-libpff-validador-independente.md) | libpff somente como verificador independente | Jurídico | proposto |
+| [ADR-0005](0005-libpff-validador-independente.md) | libpff somente como verificador independente | Jurídico (habilitação futura) | **aceito** (decisão de não inclusão no MVP; capacidade opcional `BLOCKED_PENDING_EVIDENCE`) |
 | [ADR-0006](0006-purview-adapter-ga-inicial.md) | Purview como adapter GA inicial | responsável técnico pelo tenant | proposto |
 | [ADR-0007](0007-graph-fts-bloqueado.md) | Graph como adapter condicional; rota PST/EV → FTS não habilitada | Segurança/Arquitetura¹ | **aceito** |
 | [ADR-0008](0008-isolamento-por-tenant-e-projeto.md) | Modelo de isolamento por tenant/projeto | Segurança/Privacidade | proposto |

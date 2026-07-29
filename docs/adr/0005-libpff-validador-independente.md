@@ -1,11 +1,23 @@
 # ADR-0005 — libpff somente como verificador independente
 
-- **Status:** proposto
-- **Data:** 2026-07-20 (versão original) · 2026-07-23 (revisão — dependência ADR-0004 e alinhamento on-premises)
-- **Decision Owner:** Vinicius Miranda (aceitação formal pendente)
-- **Revisor necessário:** Jurídico (licença LGPL)
-- **Gate de aprovação:** análise de compatibilidade + parecer jurídico LGPL
+- **Status:** **aceito** pelo Decision Owner em 2026-07-28 — **decisão de NÃO inclusão no MVP** (libpff = capacidade opcional futura, desabilitada, `BLOCKED_PENDING_EVIDENCE`)
+- **Data:** 2026-07-20 (versão original) · 2026-07-23 (revisão — dependência ADR-0004 e alinhamento on-premises) · 2026-07-28 (aceito pelo Decision Owner)
+- **Decision Owner:** Vinicius Miranda
+- **Revisor necessário:** Jurídico (licença LGPL) — para **habilitação futura**
+- **Gate de aprovação:** decisão do Decision Owner de manter a validação libpff **fora do MVP** como capacidade opcional; **habilitação futura** exige certificação técnica + parecer jurídico + nova autorização
 - **Substitui / substituído por:** —
+
+## Registro de aceitação
+
+- **Decision Owner:** Vinicius Miranda — **decisão de aceitação em 2026-07-28**.
+- **Decisão:** **ACEITO COMO DECISÃO DE NÃO INCLUSÃO NO MVP.** O libpff **não fará parte do MVP**; permanece **planejado como capacidade opcional futura, desabilitada e pendente de certificação**. A decisão **não** é excluir definitivamente o libpff.
+- **Capacidade registrada:** `LibpffIndependentValidation = BLOCKED_PENDING_EVIDENCE` — **capacidade opcional, não pertencente ao MVP e não bloqueadora do desenvolvimento principal** (não bloqueia o scaffolding).
+- **O MVP NÃO distribuirá:** `libpff`, `pffinfo.exe`, `pffexport.exe`, nem bibliotecas **LGPL** relacionadas.
+- **Evidência técnica preservada (obtida nesta campanha, será usada na certificação futura):** upstream `libyal/libpff`; tag `20231205`; commit `d8ab3594683ee9f3ec63ab0e2efd79d545854846`; licença `LGPL-3.0-or-later`; SHA-256 de `COPYING` = `3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986` e de `COPYING.LESSER` = `e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118`. **Essa pesquisa não é apagada.**
+- **Requisitos de habilitação futura (NÃO são bloqueadores do MVP):** build Windows reproduzível; `pffinfo -V`; SHA-256 do binário homologado; dependências fixadas; smoke test com PST sintético; confirmação de leitura sem alteração do PST; matriz de compatibilidade; parecer jurídico da LGPL; pacote de distribuição e obrigações de source/relink.
+- **Validação de custódia do MVP SEM libpff:** SHA-256 dos PSTs; tamanho dos arquivos; manifestos; contagens do Enterprise Vault; **validação pela engine principal**; **reabertura do PST**; reconciliação; cadeia de custódia; relatórios de erro; **bloqueio fail-closed em inconsistências**.
+
+> A **habilitação futura da capacidade libpff exige evidência técnica, parecer jurídico e nova autorização do Decision Owner. Nenhum binário libpff pode ser incluído no produto enquanto a capacidade estiver `BLOCKED_PENDING_EVIDENCE`.** Nenhum parecer jurídico foi produzido ou presumido aqui.
 
 ## Contexto
 
@@ -25,7 +37,7 @@ A baseline vigente é **on-premises** ([ADR-0003](0003-azure-sql-e-service-bus-p
 
 ## Decisão
 
-Usar **libpff** (**`pffinfo`** como ferramenta padrão de inspeção; **`pffexport` apenas em laboratório ou validação aprovada**) exclusivamente como **segunda engine de verificação**, em **worker isolado e somente leitura**, para conferência cruzada de contagens, hierarquia de pastas e fingerprints amostrados **contra o resultado do handle primário** — seja a part produzida pela **exportação EV multiversão** ([ADR-0013](0013-exportacao-ev-multiversao.md), rota EV) ou por **ingestão de PST já existente** ([§17](../runbook/03-parte-iii-conectores-e-engine-pst.md#17-ingestão-de-pst-já-existente)). A libpff **não** é usada como writer/splitter e **não** repara artefatos. Seus tipos **nunca atravessam** `IPstEngine` (§18.2) — o domínio recebe apenas resultados normalizados. O status de licença (**LGPL**) exige **parecer jurídico antes da adoção**.
+**Fora do MVP — capacidade opcional futura (`LibpffIndependentValidation = BLOCKED_PENDING_EVIDENCE`).** O desenho abaixo é a **realização planejada** para quando/se a capacidade for **habilitada por nova autorização** (após certificação técnica e parecer jurídico); **nenhum binário libpff é distribuído no MVP**. Nesse enquadramento: usar **libpff** (**`pffinfo`** como ferramenta padrão de inspeção; **`pffexport` apenas em laboratório ou validação aprovada**) exclusivamente como **segunda engine de verificação**, em **worker isolado e somente leitura**, para conferência cruzada de contagens, hierarquia de pastas e fingerprints amostrados **contra o resultado do handle primário** — seja a part produzida pela **exportação EV multiversão** ([ADR-0013](0013-exportacao-ev-multiversao.md), rota EV) ou por **ingestão de PST já existente** ([§17](../runbook/03-parte-iii-conectores-e-engine-pst.md#17-ingestão-de-pst-já-existente)). A libpff **não** é usada como writer/splitter e **não** repara artefatos. Seus tipos **nunca atravessam** `IPstEngine` (§18.2) — o domínio recebe apenas resultados normalizados. O status de licença (**LGPL**) exige **parecer jurídico antes da adoção**.
 
 ## Isolamento on-premises (ADR-0003/ADR-0008)
 
@@ -60,4 +72,4 @@ Runbook [§18.1](../runbook/03-parte-iii-conectores-e-engine-pst.md#181-decisão
 
 O gate exige **análise de compatibilidade + parecer jurídico LGPL**. A **análise técnica de compatibilidade LGPL** está em [`evidence/0005-analise-lgpl-libpff.md`](evidence/0005-analise-lgpl-libpff.md) (Evidence Owner: Engenharia) — licença **`LGPL-3.0-or-later`**, com **família de artefato candidata e procedimento de fixação definidos** e **pin preferencial por commit SHA verificado** (`libyal/libpff`, tag `20231205`); a **fixação concreta completa (build, `pffinfo -V`, binário Windows, smoke) permanece parcialmente `BLOCKED` nesta sessão isolada** (motivos registrados na evidência) e será concluída pelo Evidence Owner. A análise **não** contém conclusões jurídicas.
 
-Para este gate, a **exceção de bootstrap** (competência exercida pelo Decision Owner) usada em revisões internas de engenharia **não se aplica**: o gate exige **parecer jurídico externo real** sobre a LGPL-3.0-or-later. O ADR permanece **`proposto`** até esse parecer estar registrado e a **aceitação formal do Decision Owner** (Vinicius Miranda) ocorrer.
+Para a **habilitação futura** desta capacidade, a **exceção de bootstrap** (competência exercida pelo Decision Owner) **não se aplica**: exige-se **parecer jurídico externo real** sobre a LGPL-3.0-or-later — que **não** foi produzido nem presumido. Este ADR está **aceito como decisão de não inclusão no MVP** pelo Decision Owner (Vinicius Miranda) em **2026-07-28** (ver "Registro de aceitação"); a validação libpff permanece **capacidade opcional `BLOCKED_PENDING_EVIDENCE`**, e sua habilitação futura depende de certificação técnica, parecer jurídico e nova autorização.
