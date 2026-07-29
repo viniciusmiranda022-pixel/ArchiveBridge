@@ -1,4 +1,5 @@
 using System.Data;
+using System.Globalization;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
@@ -9,10 +10,11 @@ using Microsoft.Data.SqlClient;
 namespace ArchiveBridge.Infrastructure.Jobs;
 
 /// <summary>
-/// Gestão de leases sobre SQL Server: renovação (heartbeat) cercada por (owner_worker + lease_epoch)
-/// e recuperação de leases expirados (reaper). O reaper usa uma conexão em modo de manutenção
-/// (percorre todos os tenants de forma controlada) e devolve cada Job a RetryScheduled ou Failed,
-/// conforme a política de retry — uma queda de worker nunca perde o Job.
+/// Gestão de leases sobre SQL Server. A renovação (heartbeat) é cercada por (projeto + owner +
+/// época) e REJEITA um lease já expirado (não ressuscita lease vencido). A recuperação (reaper) usa
+/// a identidade de manutenção e REVALIDA a expiração no próprio UPDATE (fecha a corrida com um
+/// heartbeat concorrente): se o worker renovou entre a seleção e o UPDATE, o Job não é recuperado.
+/// Uma queda de worker nunca perde o Job.
 /// </summary>
 public sealed class SqlJobLeaseManager(
     TenantConnectionFactory connectionFactory,
@@ -25,9 +27,10 @@ public sealed class SqlJobLeaseManager(
         SET NOCOUNT ON;
         UPDATE dbo.jobs
         SET lease_expires_at_utc = @leaseExpires, updated_at_utc = @now
-        WHERE job_id = @jobId AND owner_worker = @worker AND lease_epoch = @epoch AND state = 1;
+        WHERE job_id = @jobId AND project_id = @project AND owner_worker = @worker
+              AND lease_epoch = @epoch AND state = 1 AND lease_expires_at_utc > @now;
         IF @@ROWCOUNT > 0 SELECT 0 AS outcome;
-        ELSE IF EXISTS (SELECT 1 FROM dbo.jobs WHERE job_id = @jobId) SELECT 2 AS outcome;
+        ELSE IF EXISTS (SELECT 1 FROM dbo.jobs WHERE job_id = @jobId AND project_id = @project) SELECT 2 AS outcome;
         ELSE SELECT 3 AS outcome;
         """;
 
@@ -51,7 +54,7 @@ public sealed class SqlJobLeaseManager(
             last_error_code = @lastError,
             updated_at_utc = @now
         OUTPUT inserted.project_id INTO @applied
-        WHERE job_id = @jobId AND lease_epoch = @epoch AND state = 1;
+        WHERE job_id = @jobId AND lease_epoch = @epoch AND state = 1 AND lease_expires_at_utc < @now;
 
         IF EXISTS (SELECT 1 FROM @applied)
         BEGIN
@@ -80,11 +83,12 @@ public sealed class SqlJobLeaseManager(
         sqlCommand.Parameters.Add(new SqlParameter("@leaseExpires", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(now + _leaseDuration) });
         sqlCommand.Parameters.Add(new SqlParameter("@now", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(now) });
         sqlCommand.Parameters.Add(new SqlParameter("@jobId", SqlDbType.UniqueIdentifier) { Value = command.JobId.Value });
+        sqlCommand.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = command.Scope.Project.Value });
         sqlCommand.Parameters.Add(new SqlParameter("@worker", SqlDbType.NVarChar, 200) { Value = command.Worker.Value });
         sqlCommand.Parameters.Add(new SqlParameter("@epoch", SqlDbType.BigInt) { Value = command.Epoch.Value });
 
         var scalar = await sqlCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return (JobCommandOutcome)Convert.ToInt32(scalar, System.Globalization.CultureInfo.InvariantCulture);
+        return (JobCommandOutcome)Convert.ToInt32(scalar, CultureInfo.InvariantCulture);
     }
 
     /// <inheritdoc />
@@ -155,7 +159,7 @@ public sealed class SqlJobLeaseManager(
                 command.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = CorrelationId.New().Value });
                 command.Parameters.Add(new SqlParameter("@now", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(now) });
                 var scalar = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-                result = Convert.ToInt32(scalar, System.Globalization.CultureInfo.InvariantCulture);
+                result = Convert.ToInt32(scalar, CultureInfo.InvariantCulture);
             }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);

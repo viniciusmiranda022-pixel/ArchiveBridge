@@ -1,4 +1,5 @@
 using System.Data;
+using System.Globalization;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
@@ -9,12 +10,15 @@ using Microsoft.Data.SqlClient;
 namespace ArchiveBridge.Infrastructure.Jobs;
 
 /// <summary>
-/// Fila durável de Jobs sobre SQL Server. O claim é atômico (padrão READPAST + UPDLOCK: um único
-/// vencedor), e complete/fail/retry são cercados por (owner_worker + lease_epoch). Toda mudança de
-/// estado grava a auditoria na MESMA transação (nunca perdida). A RLS por SESSION_CONTEXT (definida
-/// por <see cref="TenantConnectionFactory"/>) garante isolamento entre tenants.
+/// Fila durável de Jobs sobre SQL Server. O claim é atômico (READPAST + UPDLOCK: um único vencedor)
+/// com ordenação por prioridade EFETIVA (aging, para evitar starvation). Complete/fail/retry são
+/// cercados por (tenant + projeto + job + owner_worker + lease_epoch) e limpam o owner ao sair de
+/// Processing; a idempotência é decidida pela trilha de auditoria (época + worker + estado alvo),
+/// então um worker diferente com a mesma época NÃO recebe replay. A RLS por SESSION_CONTEXT garante
+/// isolamento entre tenants; o filtro explícito por project_id garante isolamento entre projetos.
 /// </summary>
-public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, IClock clock) : IJobStore
+public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, IClock clock, TimeSpan agingInterval)
+    : IJobStore
 {
     private const string ClaimSql =
         """
@@ -24,10 +28,12 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
         ;WITH candidate AS (
             SELECT TOP (1) job_id
             FROM dbo.jobs WITH (READPAST, UPDLOCK, ROWLOCK)
-            WHERE workload = @workload
+            WHERE project_id = @project
+              AND workload = @workload
               AND state IN (0, 2)
               AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= @now)
-            ORDER BY priority DESC, next_attempt_at_utc ASC, created_at_utc ASC
+            ORDER BY (priority + DATEDIFF(SECOND, created_at_utc, @now) / @agingSeconds) DESC,
+                     created_at_utc ASC
         )
         UPDATE j
         SET state = 1,
@@ -73,37 +79,41 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
     private const string TransitionSql =
         """
         SET NOCOUNT ON;
-        DECLARE @applied TABLE (project_id UNIQUEIDENTIFIER, prior_state TINYINT);
+        DECLARE @applied TABLE (prior_state TINYINT);
         UPDATE dbo.jobs
         SET state = @toState,
             last_error_code = @lastError,
             next_attempt_at_utc = @nextAttempt,
-            owner_worker = CASE WHEN @clearOwner = 1 THEN NULL ELSE owner_worker END,
+            owner_worker = NULL,
             lease_expires_at_utc = NULL,
             updated_at_utc = @now
-        OUTPUT inserted.project_id, deleted.state INTO @applied
-        WHERE job_id = @jobId AND owner_worker = @worker AND lease_epoch = @epoch AND state = 1;
+        OUTPUT deleted.state INTO @applied
+        WHERE job_id = @jobId AND project_id = @project AND owner_worker = @worker
+              AND lease_epoch = @epoch AND state = 1;
 
         IF EXISTS (SELECT 1 FROM @applied)
         BEGIN
             INSERT INTO dbo.job_state_transitions
                 (job_id, tenant_id, project_id, from_state, to_state, reason_code, lease_epoch, worker_id, correlation_id, occurred_at_utc)
-            SELECT @jobId, @tenant, a.project_id, a.prior_state, @toState, @reason, @epoch, @worker, @correlation, @now
+            SELECT @jobId, @tenant, @project, a.prior_state, @toState, @reason, @epoch, @worker, @correlation, @now
             FROM @applied a;
             SELECT 0 AS outcome;
         END
         ELSE
         BEGIN
-            DECLARE @curState TINYINT, @curEpoch BIGINT;
-            SELECT @curState = state, @curEpoch = lease_epoch FROM dbo.jobs WHERE job_id = @jobId;
-            IF @curState IS NULL SELECT 3 AS outcome;
-            ELSE IF @curEpoch = @epoch AND @curState = @toState SELECT 1 AS outcome;
-            ELSE SELECT 2 AS outcome;
+            IF NOT EXISTS (SELECT 1 FROM dbo.jobs WHERE job_id = @jobId AND project_id = @project)
+                SELECT 3 AS outcome;
+            ELSE IF EXISTS (SELECT 1 FROM dbo.job_state_transitions
+                            WHERE job_id = @jobId AND lease_epoch = @epoch AND to_state = @toState AND worker_id = @worker)
+                SELECT 1 AS outcome;
+            ELSE
+                SELECT 2 AS outcome;
         END
         """;
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
     private readonly IClock _clock = clock;
+    private readonly long _agingSeconds = Math.Max(1L, (long)agingInterval.TotalSeconds);
 
     /// <inheritdoc />
     public async Task<JobId> CreateAsync(CreateJobCommand command, CancellationToken cancellationToken)
@@ -156,12 +166,14 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
             ClaimedJob? claimed = null;
             await using (var sqlCommand = new SqlCommand(ClaimSql, tenantConnection.Connection, transaction))
             {
+                sqlCommand.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = request.Scope.Project.Value });
                 sqlCommand.Parameters.Add(new SqlParameter("@workload", SqlDbType.TinyInt) { Value = (byte)request.Workload });
                 sqlCommand.Parameters.Add(new SqlParameter("@worker", SqlDbType.NVarChar, 200) { Value = request.Worker.Value });
                 sqlCommand.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = request.Scope.Tenant.Value });
                 sqlCommand.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = request.Correlation.Value });
                 sqlCommand.Parameters.Add(new SqlParameter("@leaseExpires", SqlDbType.DateTime2) { Value = leaseExpires });
                 sqlCommand.Parameters.Add(new SqlParameter("@now", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(now) });
+                sqlCommand.Parameters.Add(new SqlParameter("@agingSeconds", SqlDbType.BigInt) { Value = _agingSeconds });
 
                 await using var reader = await sqlCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
                 if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -190,9 +202,10 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
         await using var tenantConnection = await _connectionFactory
             .OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var sqlCommand = new SqlCommand(
-            $"SELECT {SqlJobMapping.JobColumns} FROM dbo.jobs WHERE job_id = @jobId;",
+            $"SELECT {SqlJobMapping.JobColumns} FROM dbo.jobs WHERE job_id = @jobId AND project_id = @project;",
             tenantConnection.Connection);
         sqlCommand.Parameters.Add(new SqlParameter("@jobId", SqlDbType.UniqueIdentifier) { Value = jobId.Value });
+        sqlCommand.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
 
         await using var reader = await sqlCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -207,14 +220,14 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
     public Task<JobCommandOutcome> CompleteAsync(LeaseCommand command, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(command);
-        return ApplyTransitionAsync(command, toState: 3, reason: 2, lastError: null, nextAttempt: null, clearOwner: false, cancellationToken);
+        return ApplyTransitionAsync(command, toState: 3, reason: 2, lastError: null, nextAttempt: null, cancellationToken);
     }
 
     /// <inheritdoc />
     public Task<JobCommandOutcome> FailAsync(LeaseCommand command, ErrorCode errorCode, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(command);
-        return ApplyTransitionAsync(command, toState: 4, reason: 4, lastError: (byte)errorCode, nextAttempt: null, clearOwner: false, cancellationToken);
+        return ApplyTransitionAsync(command, toState: 4, reason: 4, lastError: (byte)errorCode, nextAttempt: null, cancellationToken);
     }
 
     /// <inheritdoc />
@@ -231,7 +244,6 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
             reason: 3,
             lastError: (byte)errorCode,
             nextAttempt: SqlJobMapping.ToDbUtc(nextAttemptAtUtc),
-            clearOwner: true,
             cancellationToken);
     }
 
@@ -241,7 +253,6 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
         byte reason,
         byte? lastError,
         DateTime? nextAttempt,
-        bool clearOwner,
         CancellationToken cancellationToken)
     {
         var now = SqlJobMapping.ToDbUtc(_clock.UtcNow);
@@ -259,8 +270,8 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
                 sqlCommand.Parameters.Add(new SqlParameter("@reason", SqlDbType.TinyInt) { Value = reason });
                 sqlCommand.Parameters.Add(new SqlParameter("@lastError", SqlDbType.TinyInt) { Value = (object?)lastError ?? DBNull.Value });
                 sqlCommand.Parameters.Add(new SqlParameter("@nextAttempt", SqlDbType.DateTime2) { Value = (object?)nextAttempt ?? DBNull.Value });
-                sqlCommand.Parameters.Add(new SqlParameter("@clearOwner", SqlDbType.Bit) { Value = clearOwner });
                 sqlCommand.Parameters.Add(new SqlParameter("@jobId", SqlDbType.UniqueIdentifier) { Value = command.JobId.Value });
+                sqlCommand.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = command.Scope.Project.Value });
                 sqlCommand.Parameters.Add(new SqlParameter("@worker", SqlDbType.NVarChar, 200) { Value = command.Worker.Value });
                 sqlCommand.Parameters.Add(new SqlParameter("@epoch", SqlDbType.BigInt) { Value = command.Epoch.Value });
                 sqlCommand.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = command.Scope.Tenant.Value });
@@ -268,7 +279,7 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
                 sqlCommand.Parameters.Add(new SqlParameter("@now", SqlDbType.DateTime2) { Value = now });
 
                 var scalar = await sqlCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-                outcome = Convert.ToInt32(scalar, System.Globalization.CultureInfo.InvariantCulture);
+                outcome = Convert.ToInt32(scalar, CultureInfo.InvariantCulture);
             }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);

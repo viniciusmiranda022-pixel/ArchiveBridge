@@ -17,7 +17,7 @@ public sealed class SqlJobAuditReader(TenantConnectionFactory connectionFactory)
         """
         SELECT job_id, from_state, to_state, reason_code, lease_epoch, worker_id, correlation_id, occurred_at_utc
         FROM dbo.job_state_transitions
-        WHERE job_id = @jobId
+        WHERE job_id = @jobId AND project_id = @project
         ORDER BY transition_id ASC;
         """;
 
@@ -35,6 +35,7 @@ public sealed class SqlJobAuditReader(TenantConnectionFactory connectionFactory)
             .OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var command = new SqlCommand(SelectSql, tenantConnection.Connection);
         command.Parameters.Add(new SqlParameter("@jobId", SqlDbType.UniqueIdentifier) { Value = jobId.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))

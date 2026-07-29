@@ -43,7 +43,8 @@ jobs:
       # acessível externamente). A senha abaixo NÃO é um segredo real — é uma credencial
       # descartável deste container de CI (allowlist em .gitleaks.toml).
       sqlserver:
-        image: mcr.microsoft.com/mssql/server:2022-latest
+        # Imagem fixada por digest imutável (reprodutível; a tag :2022-latest é mutável).
+        image: mcr.microsoft.com/mssql/server@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: "Slice1_CI_Ephemeral!9"

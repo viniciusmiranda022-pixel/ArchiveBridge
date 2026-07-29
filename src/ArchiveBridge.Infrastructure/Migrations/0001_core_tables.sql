@@ -6,6 +6,7 @@
 --               LeaseExpiredRecovered=6, AttemptsExhausted=7
 -- IMPORTANTE: lease_epoch é o token de fencing; row_version (ROWVERSION) é concorrência otimista,
 -- NÃO fencing. Auditoria não registra conteúdo sensível (apenas ids/códigos).
+-- Coerência tenant/projeto é garantida no BANCO por chaves compostas (não apenas no código).
 
 CREATE TABLE dbo.projects
 (
@@ -13,7 +14,8 @@ CREATE TABLE dbo.projects
     tenant_id      UNIQUEIDENTIFIER NOT NULL,
     created_at_utc DATETIME2(3)     NOT NULL CONSTRAINT DF_projects_created DEFAULT SYSUTCDATETIME(),
     CONSTRAINT PK_projects PRIMARY KEY (project_id),
-    CONSTRAINT UQ_projects_tenant UNIQUE (tenant_id, project_id)
+    -- Alvo da FK composta de jobs: garante que o par (tenant, projeto) é único e coerente.
+    CONSTRAINT UQ_projects_tenant_project UNIQUE (tenant_id, project_id)
 );
 
 CREATE TABLE dbo.jobs
@@ -34,16 +36,21 @@ CREATE TABLE dbo.jobs
     updated_at_utc       DATETIME2(3)     NOT NULL CONSTRAINT DF_jobs_updated DEFAULT SYSUTCDATETIME(),
     row_version          ROWVERSION       NOT NULL,
     CONSTRAINT PK_jobs PRIMARY KEY (job_id),
-    CONSTRAINT FK_jobs_project FOREIGN KEY (project_id) REFERENCES dbo.projects (project_id),
+    -- FK composta: um Job só existe para um par (tenant, projeto) coerente. Impede associar um Job
+    -- a um projeto de OUTRO tenant (não haveria projeto (esteTenant, projeto)).
+    CONSTRAINT FK_jobs_project FOREIGN KEY (tenant_id, project_id)
+        REFERENCES dbo.projects (tenant_id, project_id),
+    -- Alvo das FKs compostas de job_attempts e job_state_transitions.
+    CONSTRAINT UQ_jobs_identity UNIQUE (job_id, tenant_id, project_id),
     CONSTRAINT CK_jobs_state CHECK (state BETWEEN 0 AND 5),
     CONSTRAINT CK_jobs_workload CHECK (workload BETWEEN 0 AND 5)
 );
 
--- Índice de claim (anti-starvation): filtra por tenant/workload/estado e ordena por
--- prioridade desc., próxima tentativa e criação. tenant_id encabeça a chave (isolamento).
+-- Índice de claim: filtra por tenant/projeto/workload/estado e ordena por próxima tentativa e
+-- criação. tenant_id e project_id encabeçam a chave (isolamento por tenant E por projeto).
 CREATE INDEX IX_jobs_claim
-    ON dbo.jobs (tenant_id, workload, state, next_attempt_at_utc, created_at_utc)
-    INCLUDE (project_id, priority, owner_worker, lease_epoch);
+    ON dbo.jobs (tenant_id, project_id, workload, state, next_attempt_at_utc, created_at_utc)
+    INCLUDE (priority, owner_worker, lease_epoch);
 
 -- Índice do reaper: Jobs em Processing (state=1) ordenados por expiração do lease.
 CREATE INDEX IX_jobs_lease_expiry
@@ -62,11 +69,12 @@ CREATE TABLE dbo.job_attempts
     lease_epoch    BIGINT                NOT NULL,
     started_at_utc DATETIME2(3)          NOT NULL CONSTRAINT DF_job_attempts_started DEFAULT SYSUTCDATETIME(),
     CONSTRAINT PK_job_attempts PRIMARY KEY (attempt_id),
-    CONSTRAINT FK_job_attempts_job FOREIGN KEY (job_id) REFERENCES dbo.jobs (job_id)
+    CONSTRAINT FK_job_attempts_job FOREIGN KEY (job_id, tenant_id, project_id)
+        REFERENCES dbo.jobs (job_id, tenant_id, project_id)
 );
 
 CREATE INDEX IX_job_attempts_job
-    ON dbo.job_attempts (tenant_id, job_id, attempt_number);
+    ON dbo.job_attempts (tenant_id, project_id, job_id, attempt_number);
 
 CREATE TABLE dbo.job_state_transitions
 (
@@ -82,8 +90,13 @@ CREATE TABLE dbo.job_state_transitions
     correlation_id  UNIQUEIDENTIFIER      NOT NULL,
     occurred_at_utc DATETIME2(3)          NOT NULL CONSTRAINT DF_jst_occurred DEFAULT SYSUTCDATETIME(),
     CONSTRAINT PK_job_state_transitions PRIMARY KEY (transition_id),
-    CONSTRAINT FK_jst_job FOREIGN KEY (job_id) REFERENCES dbo.jobs (job_id)
+    CONSTRAINT FK_jst_job FOREIGN KEY (job_id, tenant_id, project_id)
+        REFERENCES dbo.jobs (job_id, tenant_id, project_id)
 );
 
 CREATE INDEX IX_jst_job
-    ON dbo.job_state_transitions (tenant_id, job_id, transition_id);
+    ON dbo.job_state_transitions (tenant_id, project_id, job_id, transition_id);
+
+-- Índice para a checagem de idempotência (transição já registrada por época + worker + estado).
+CREATE INDEX IX_jst_idempotency
+    ON dbo.job_state_transitions (job_id, lease_epoch, to_state, worker_id);

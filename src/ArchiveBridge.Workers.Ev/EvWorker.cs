@@ -6,35 +6,51 @@ using ArchiveBridge.Infrastructure.Jobs;
 using ArchiveBridge.Infrastructure.Persistence;
 using ArchiveBridge.Infrastructure.Time;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 
 namespace ArchiveBridge.Workers.Ev;
 
 /// <summary>
-/// Primeiro consumidor técnico do ciclo durável de Jobs (Vertical Slice 1). Quando há uma conexão
-/// <c>ConnectionStrings:JobStore</c> configurada, executa UM ciclo sintético e controlado:
-/// cria um Job → reivindica com lease → renova o lease → simula a execução → conclui. Sem conexão,
-/// permanece ocioso. NÃO chama o Enterprise Vault, NÃO gera PST e NÃO declara capacidade de
-/// exportação — apenas exercita a fila durável, os leases e o fencing.
+/// Primeiro consumidor técnico do ciclo durável de Jobs (Vertical Slice 1). O ciclo sintético
+/// (cria → reivindica → renova → simula → conclui um Job de demonstração) só roda quando
+/// <c>SyntheticJobMode:Enabled=true</c> — o padrão é <b>false</b>, de modo que a operação normal
+/// NÃO cria dados sintéticos. É explicitamente bloqueado no ambiente Production. Requer as
+/// identidades <c>ConnectionStrings:JobStoreApp</c> e <c>ConnectionStrings:JobStoreMaintenance</c>.
+/// Nunca chama o Enterprise Vault, nunca gera PST e não declara capacidade de exportação.
 /// </summary>
-public sealed partial class EvWorker(ILogger<EvWorker> logger, IConfiguration configuration) : BackgroundService
+public sealed partial class EvWorker(
+    ILogger<EvWorker> logger,
+    IConfiguration configuration,
+    IHostEnvironment environment) : BackgroundService
 {
     private static readonly TimeSpan LeaseDuration = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan AgingInterval = TimeSpan.FromMinutes(5);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var connectionString = configuration.GetConnectionString("JobStore");
-        if (string.IsNullOrWhiteSpace(connectionString))
+        if (!configuration.GetValue("SyntheticJobMode:Enabled", defaultValue: false))
         {
-            LogNoConnection(logger);
+            LogSyntheticDisabled(logger);
             return;
         }
 
-        await new MigrationRunner(connectionString).ApplyAsync(stoppingToken);
+        if (environment.IsProduction())
+        {
+            LogSyntheticBlockedInProduction(logger);
+            return;
+        }
+
+        var appConnectionString = configuration.GetConnectionString("JobStoreApp");
+        var maintenanceConnectionString = configuration.GetConnectionString("JobStoreMaintenance");
+        if (string.IsNullOrWhiteSpace(appConnectionString) || string.IsNullOrWhiteSpace(maintenanceConnectionString))
+        {
+            LogMissingConnections(logger);
+            return;
+        }
 
         var clock = new SystemClock();
-        var factory = new TenantConnectionFactory(connectionString);
-        var store = new SqlJobStore(factory, clock);
-        var leases = new SqlJobLeaseManager(factory, clock, RetryPolicy.Default, LeaseDuration);
+        var factory = new TenantConnectionFactory(appConnectionString, maintenanceConnectionString);
+        var store = new SqlJobStore(factory, clock, AgingInterval);
 
         var scope = new TenantScope(new TenantId(Guid.NewGuid()), new ProjectId(Guid.NewGuid()));
         var worker = new WorkerId($"ev-worker-{Environment.MachineName}");
@@ -54,9 +70,6 @@ public sealed partial class EvWorker(ILogger<EvWorker> logger, IConfiguration co
 
         LogClaimed(logger, claimed.JobId.Value, claimed.Epoch.Value);
 
-        await leases.RenewAsync(
-            new LeaseCommand(scope, claimed.JobId, worker, claimed.Epoch, correlation), stoppingToken);
-
         // Execução simulada e controlada — SEM Enterprise Vault, SEM gerar/ler PST.
         LogSimulating(logger, claimed.JobId.Value);
 
@@ -66,8 +79,16 @@ public sealed partial class EvWorker(ILogger<EvWorker> logger, IConfiguration co
     }
 
     [LoggerMessage(Level = LogLevel.Information,
-        Message = "Worker EV ocioso: ConnectionStrings:JobStore não configurada (nenhum ciclo executado).")]
-    private static partial void LogNoConnection(ILogger logger);
+        Message = "Worker EV ocioso: SyntheticJobMode desabilitado (nenhum dado sintético criado).")]
+    private static partial void LogSyntheticDisabled(ILogger logger);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Worker EV: SyntheticJobMode habilitado, mas o ambiente é Production — ciclo BLOQUEADO.")]
+    private static partial void LogSyntheticBlockedInProduction(ILogger logger);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Worker EV: SyntheticJobMode habilitado, mas faltam ConnectionStrings:JobStoreApp/JobStoreMaintenance.")]
+    private static partial void LogMissingConnections(ILogger logger);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "Worker EV: Job sintético criado {JobId}.")]
     private static partial void LogCreated(ILogger logger, Guid jobId);
