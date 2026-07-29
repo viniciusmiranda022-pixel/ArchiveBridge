@@ -43,7 +43,9 @@ CREATE TABLE dbo.jobs
     -- Alvo das FKs compostas de job_attempts e job_state_transitions.
     CONSTRAINT UQ_jobs_identity UNIQUE (job_id, tenant_id, project_id),
     CONSTRAINT CK_jobs_state CHECK (state BETWEEN 0 AND 5),
-    CONSTRAINT CK_jobs_workload CHECK (workload BETWEEN 0 AND 5)
+    CONSTRAINT CK_jobs_workload CHECK (workload BETWEEN 0 AND 5),
+    -- Intervalo permitido de JobPriority (equivalente à validação de domínio [0, 100]).
+    CONSTRAINT CK_jobs_priority CHECK (priority BETWEEN 0 AND 100)
 );
 
 -- Índice de claim: filtra por tenant/projeto/workload/estado e ordena por próxima tentativa e

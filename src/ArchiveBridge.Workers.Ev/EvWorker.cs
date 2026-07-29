@@ -12,7 +12,7 @@ namespace ArchiveBridge.Workers.Ev;
 
 /// <summary>
 /// Primeiro consumidor técnico do ciclo durável de Jobs (Vertical Slice 1). O ciclo sintético
-/// (cria → reivindica → renova → simula → conclui um Job de demonstração) só roda quando
+/// (cria → reivindica → simula → conclui um Job de demonstração) só roda quando
 /// <c>SyntheticJobMode:Enabled=true</c> — o padrão é <b>false</b>, de modo que a operação normal
 /// NÃO cria dados sintéticos. É explicitamente bloqueado no ambiente Production. Requer as
 /// identidades <c>ConnectionStrings:JobStoreApp</c> e <c>ConnectionStrings:JobStoreMaintenance</c>.
@@ -24,7 +24,10 @@ public sealed partial class EvWorker(
     IHostEnvironment environment) : BackgroundService
 {
     private static readonly TimeSpan LeaseDuration = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan AgingInterval = TimeSpan.FromMinutes(5);
+
+    // agingInterval adotado: 30s. Limite máximo de espera derivado =
+    // (JobPriority.MaxValue - JobPriority.MinValue) * agingInterval = 100 * 30s = 3000s = 50 min.
+    private static readonly TimeSpan AgingInterval = TimeSpan.FromSeconds(30);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {

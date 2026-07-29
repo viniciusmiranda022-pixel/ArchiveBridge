@@ -60,14 +60,9 @@ public sealed class TenantConnectionFactory(string applicationConnectionString, 
     private readonly string _applicationConnectionString = applicationConnectionString;
     private readonly string _maintenanceConnectionString = maintenanceConnectionString;
 
-    /// <summary>
-    /// Constrói uma fábrica com uma única string (identidade única). Use apenas em cenários sem
-    /// separação de manutenção; o reaper compartilharia a mesma identidade.
-    /// </summary>
-    public TenantConnectionFactory(string connectionString)
-        : this(connectionString, connectionString)
-    {
-    }
+    // Não há construtor de conveniência com uma única string: a separação entre a identidade da
+    // aplicação e a de manutenção é OBRIGATÓRIA. Configurar as duas com a mesma credencial é
+    // possível apenas de forma explícita (passando a mesma string duas vezes), nunca silenciosa.
 
     /// <summary>Abre uma conexão da APLICAÇÃO com <c>SESSION_CONTEXT('tenant_id')</c> = tenant do escopo.</summary>
     public async Task<TenantConnection> OpenForTenantAsync(TenantScope scope, CancellationToken cancellationToken)

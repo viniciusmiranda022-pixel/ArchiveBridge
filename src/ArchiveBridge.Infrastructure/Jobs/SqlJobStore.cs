@@ -32,7 +32,7 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
               AND workload = @workload
               AND state IN (0, 2)
               AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= @now)
-            ORDER BY (priority + DATEDIFF(SECOND, created_at_utc, @now) / @agingSeconds) DESC,
+            ORDER BY (CAST(priority AS BIGINT) + DATEDIFF_BIG(SECOND, created_at_utc, @now) / @agingSeconds) DESC,
                      created_at_utc ASC
         )
         UPDATE j
@@ -113,7 +113,20 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
     private readonly IClock _clock = clock;
-    private readonly long _agingSeconds = Math.Max(1L, (long)agingInterval.TotalSeconds);
+    private readonly long _agingSeconds = ComputeAgingSeconds(agingInterval);
+
+    // agingInterval deve ser estritamente positivo; a granularidade de aging é de 1 segundo
+    // (Ceiling garante divisor >= 1 sem coerção silenciosa de valores não positivos).
+    private static long ComputeAgingSeconds(TimeSpan agingInterval)
+    {
+        if (agingInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(agingInterval), agingInterval, "agingInterval deve ser maior que zero.");
+        }
+
+        return (long)Math.Ceiling(agingInterval.TotalSeconds);
+    }
 
     /// <inheritdoc />
     public async Task<JobId> CreateAsync(CreateJobCommand command, CancellationToken cancellationToken)

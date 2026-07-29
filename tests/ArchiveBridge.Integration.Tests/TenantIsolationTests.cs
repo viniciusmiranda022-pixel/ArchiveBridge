@@ -101,7 +101,9 @@ public sealed class TenantIsolationTests(SqlServerFixture fixture)
         var scope = SqlServerFixture.NewScope();
         // Pool com uma única conexão física: a segunda abertura reusa a mesma conexão.
         var singlePool = new SqlConnectionStringBuilder(fixture.ConnectionString) { MaxPoolSize = 1 }.ConnectionString;
-        var factory = new ArchiveBridge.Infrastructure.Persistence.TenantConnectionFactory(singlePool);
+        // Este teste isola o comportamento de pool: a mesma string é passada explicitamente para
+        // app e manutenção (a fábrica exige as duas; não há mais construtor de conveniência).
+        var factory = new ArchiveBridge.Infrastructure.Persistence.TenantConnectionFactory(singlePool, singlePool);
 
         await using (var tenantConnection = await factory.OpenForTenantAsync(scope, CancellationToken.None))
         {
