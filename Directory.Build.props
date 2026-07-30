@@ -14,7 +14,8 @@
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
     <IsPackable>false</IsPackable>
-    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- InvariantGlobalization NÃO é habilitado: Microsoft.Data.SqlClient (ADR-0003, SQL Server)
+         não suporta o modo invariante. A plataforma depende de globalização real (ICU). -->
     <!-- Restauração reprodutível: exige packages.lock.json versionado (CI restaura em locked mode). -->
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>

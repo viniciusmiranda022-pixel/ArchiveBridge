@@ -1,19 +1,19 @@
 using ArchiveBridge.Contracts.Jobs;
-using ArchiveBridge.Domain.IdentityAndAccess;
 
 namespace ArchiveBridge.Application.Jobs;
 
 /// <summary>
-/// Caso de uso mínimo (scaffolding): reivindica o próximo job de um workload pela porta da fila.
-/// Existe para provar a regra de dependência — a Application depende apenas de Domain e Contracts,
-/// e orquestra através de <see cref="IJobLeaseSource"/> sem conhecer nenhuma implementação concreta.
-/// Não executa migração real.
+/// Reivindica atomicamente o próximo Job elegível de um workload para um worker. A garantia de
+/// vencedor único e o incremento da época do lease são responsabilidade da porta durável.
 /// </summary>
-public sealed class ClaimNextJobUseCase(IJobLeaseSource source)
+public sealed class ClaimNextJobUseCase(IJobStore store)
 {
-    private readonly IJobLeaseSource _source = source;
+    private readonly IJobStore _store = store;
 
-    /// <summary>Reivindica o próximo job elegível do workload; <see langword="null"/> quando não há trabalho.</summary>
-    public Task<JobLease?> ExecuteAsync(Workload workload, CancellationToken cancellationToken) =>
-        _source.TryClaimNextAsync(workload, cancellationToken);
+    /// <summary>Reivindica o próximo Job; <see langword="null"/> quando não há trabalho elegível.</summary>
+    public Task<ClaimedJob?> ExecuteAsync(ClaimRequest request, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return _store.TryClaimNextAsync(request, cancellationToken);
+    }
 }

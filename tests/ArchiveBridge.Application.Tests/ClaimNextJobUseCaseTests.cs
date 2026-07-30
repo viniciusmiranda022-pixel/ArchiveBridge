@@ -1,46 +1,60 @@
 using ArchiveBridge.Application.Jobs;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.IdentityAndAccess;
 using ArchiveBridge.Domain.Jobs;
+using ArchiveBridge.Domain.Projects;
 
 namespace ArchiveBridge.Application.Tests;
 
-/// <summary>
-/// Prova que a Application é testável apenas com Domain + Contracts, através de um duplo de teste
-/// da porta <see cref="IJobLeaseSource"/> — sem referenciar nenhuma implementação de Infrastructure.
-/// </summary>
 public sealed class ClaimNextJobUseCaseTests
 {
-    private sealed class StubLeaseSource(JobLease? result) : IJobLeaseSource
+    private sealed class ClaimStore(ClaimedJob? result) : IJobStore
     {
-        public Workload? LastWorkload { get; private set; }
+        public Task<JobId> CreateAsync(CreateJobCommand command, CancellationToken cancellationToken) =>
+            Task.FromResult(JobId.New());
 
-        public Task<JobLease?> TryClaimNextAsync(Workload workload, CancellationToken cancellationToken)
-        {
-            LastWorkload = workload;
-            return Task.FromResult(result);
-        }
+        public Task<ClaimedJob?> TryClaimNextAsync(ClaimRequest request, CancellationToken cancellationToken) =>
+            Task.FromResult(result);
+
+        public Task<JobSnapshot?> GetAsync(TenantScope scope, JobId jobId, CancellationToken cancellationToken) =>
+            Task.FromResult<JobSnapshot?>(null);
+
+        public Task<JobCommandOutcome> CompleteAsync(LeaseCommand command, CancellationToken cancellationToken) =>
+            Task.FromResult(JobCommandOutcome.Applied);
+
+        public Task<JobCommandOutcome> FailAsync(LeaseCommand command, ErrorCode errorCode, CancellationToken cancellationToken) =>
+            Task.FromResult(JobCommandOutcome.Applied);
+
+        public Task<JobCommandOutcome> ScheduleRetryAsync(LeaseCommand command, ErrorCode errorCode, DateTimeOffset nextAttemptAtUtc, CancellationToken cancellationToken) =>
+            Task.FromResult(JobCommandOutcome.Applied);
     }
 
-    [Fact]
-    public async Task ExecuteForwardsWorkloadAndReturnsLease()
-    {
-        var expected = new JobLease(new JobId(Guid.NewGuid()), JobState.Pending, LeaseEpoch: 1);
-        var stub = new StubLeaseSource(expected);
-        var useCase = new ClaimNextJobUseCase(stub);
+    private static ClaimRequest Request() =>
+        new(
+            new TenantScope(new TenantId(Guid.NewGuid()), new ProjectId(Guid.NewGuid())),
+            Workload.EnterpriseVault,
+            new WorkerId("w"),
+            TimeSpan.FromSeconds(30),
+            CorrelationId.New());
 
-        var actual = await useCase.ExecuteAsync(Workload.EnterpriseVault, CancellationToken.None);
+    [Fact]
+    public async Task ExecuteReturnsTheClaimedJob()
+    {
+        var expected = new ClaimedJob(JobId.New(), new LeaseEpoch(1), DateTimeOffset.UnixEpoch, 1);
+        var useCase = new ClaimNextJobUseCase(new ClaimStore(expected));
+
+        var actual = await useCase.ExecuteAsync(Request(), CancellationToken.None);
 
         Assert.Equal(expected, actual);
-        Assert.Equal(Workload.EnterpriseVault, stub.LastWorkload);
     }
 
     [Fact]
     public async Task ExecuteReturnsNullWhenThereIsNoWork()
     {
-        var useCase = new ClaimNextJobUseCase(new StubLeaseSource(null));
+        var useCase = new ClaimNextJobUseCase(new ClaimStore(null));
 
-        var actual = await useCase.ExecuteAsync(Workload.Pst, CancellationToken.None);
+        var actual = await useCase.ExecuteAsync(Request(), CancellationToken.None);
 
         Assert.Null(actual);
     }
