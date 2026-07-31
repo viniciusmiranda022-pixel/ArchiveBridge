@@ -116,6 +116,7 @@ public sealed record WaveSelection
         {
             parts.Add(entry.FilePath);
             parts.Add(entry.PstName);
+            parts.Add(entry.Archive.Identity.Value);
             parts.Add(entry.Archive.Mailbox);
             parts.Add(entry.SizeBytes.ToString(CultureInfo.InvariantCulture));
             parts.Add(entry.ItemCount.ToString(CultureInfo.InvariantCulture));
@@ -124,14 +125,18 @@ public sealed record WaveSelection
         return DeterministicHash.Compute(parts);
     }
 
-    /// <summary>Volume total (bytes) por archive de destino — a soma que a regra de 100 GB avalia.</summary>
-    public IReadOnlyDictionary<string, long> BytesByArchive()
+    /// <summary>
+    /// Volume total (bytes) por archive de destino — a soma que a regra de 100 GB avalia. Agrupa pela
+    /// <see cref="TargetArchiveId"/> canônica (não pela string de exibição) e soma com <c>checked</c>
+    /// para falhar em overflow em vez de silenciar.
+    /// </summary>
+    public IReadOnlyDictionary<TargetArchiveId, long> BytesByArchive()
     {
-        var totals = new Dictionary<string, long>(StringComparer.Ordinal);
+        var totals = new Dictionary<TargetArchiveId, long>();
         foreach (var entry in Entries)
         {
-            totals.TryGetValue(entry.Archive.Mailbox, out var current);
-            totals[entry.Archive.Mailbox] = current + entry.SizeBytes;
+            totals.TryGetValue(entry.Archive.Identity, out var current);
+            totals[entry.Archive.Identity] = checked(current + entry.SizeBytes);
         }
 
         return totals;

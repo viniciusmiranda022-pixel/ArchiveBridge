@@ -68,8 +68,8 @@ public sealed class Slice2ValueObjectTests
         var selection = new WaveSelection(entries);
         var byArchive = selection.BytesByArchive();
 
-        Assert.Equal(100, byArchive["shared@contoso.com"]);
-        Assert.Equal(5, byArchive["other@contoso.com"]);
+        Assert.Equal(100, byArchive[new TargetArchiveId("shared@contoso.com")]);
+        Assert.Equal(5, byArchive[new TargetArchiveId("other@contoso.com")]);
         Assert.Equal(105, selection.TotalBytes);
     }
 

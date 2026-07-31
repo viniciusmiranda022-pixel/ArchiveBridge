@@ -2,25 +2,23 @@ using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Projects;
 using ArchiveBridge.Domain.Common;
-using ArchiveBridge.Domain.IdentityAndAccess;
-using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Domain.Projects;
 
 namespace ArchiveBridge.Application.Planning;
 
-/// <summary>Resultado de <see cref="ValidateProjectUseCase"/>: o Job durável emitido e o estado resultante.</summary>
-public sealed record ProjectValidationResult(JobId Job, ProjectStatus Status);
+/// <summary>Resultado de <see cref="ValidateProjectUseCase"/>: o estado resultante do projeto.</summary>
+public sealed record ProjectValidationResult(ProjectStatus Status);
 
 /// <summary>
-/// Comando ValidateProject: valida a integridade da configuração do projeto (o hash persistido tem
-/// de reproduzir-se a partir da configuração — detecta manipulação de hash) e, se ainda em Draft,
-/// submete-o para avaliação. Emite um Job de controle durável (reutiliza a fila do Slice 1) como
-/// registro auditável e retriável da operação, correlacionado à mesma <see cref="CorrelationId"/>.
+/// Corpo de execução do comando durável <c>ValidateProject</c> (invocado pelo
+/// <c>PlanningCommandProcessor</c> após reivindicar o Job). Valida a integridade da configuração (o
+/// hash persistido tem de reproduzir-se a partir da configuração — detecta manipulação de hash) e,
+/// se ainda em Draft, submete o projeto para avaliação. É idempotente em retry: só transita a partir
+/// de Draft (reexecutar após já ter submetido não duplica efeito).
 /// </summary>
-public sealed class ValidateProjectUseCase(IProjectStore projects, IJobStore jobs, IClock clock)
+public sealed class ValidateProjectUseCase(IProjectStore projects, IClock clock)
 {
     private readonly IProjectStore _projects = projects;
-    private readonly IJobStore _jobs = jobs;
     private readonly IClock _clock = clock;
 
     /// <summary>Executa a validação do projeto do escopo.</summary>
@@ -38,16 +36,12 @@ public sealed class ValidateProjectUseCase(IProjectStore projects, IJobStore job
             throw new PlanningValidationException("Hash de configuração do projeto inconsistente; validação recusada.");
         }
 
-        var jobId = await _jobs.CreateAsync(
-            new CreateJobCommand(scope, Workload.Control, JobPriority.Normal, correlation), cancellationToken)
-            .ConfigureAwait(false);
-
         if (project.Status == ProjectStatus.Draft)
         {
             project.SubmitForAssessment(_clock.UtcNow);
             await _projects.SaveStatusAsync(project, correlation, cancellationToken).ConfigureAwait(false);
         }
 
-        return new ProjectValidationResult(jobId, project.Status);
+        return new ProjectValidationResult(project.Status);
     }
 }

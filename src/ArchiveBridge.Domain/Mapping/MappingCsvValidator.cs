@@ -60,7 +60,17 @@ public static class MappingCsvValidator
             errors.Add("CSV contém BOM; esperado UTF-8 sem BOM.");
         }
 
-        var records = MappingCsvParser.Parse(csvText);
+        IReadOnlyList<IReadOnlyList<string>> records;
+        try
+        {
+            records = MappingCsvParser.Parse(csvText);
+        }
+        catch (MappingCsvFormatException)
+        {
+            errors.Add("CSV estruturalmente malformado; rejeitado (fail-closed).");
+            return MappingValidationResult.Failure(errors);
+        }
+
         if (records.Count == 0)
         {
             errors.Add("CSV sem registros.");

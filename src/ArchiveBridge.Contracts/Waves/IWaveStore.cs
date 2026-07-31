@@ -1,3 +1,4 @@
+using ArchiveBridge.Contracts.Approvals;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.Waves;
@@ -26,4 +27,11 @@ public interface IWaveStore
     /// onda a Draft. Bloqueado pelo domínio e por gatilho quando a seleção está congelada (aprovada).
     /// </summary>
     Task SaveSelectionAsync(MigrationWave wave, CorrelationId correlation, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Persiste atomicamente a transição de estado (com concorrência otimista) E a linha de decisão
+    /// na tabela <c>approvals</c>, em uma única transação. Falha com concorrência se o
+    /// <c>row_version</c> divergiu.
+    /// </summary>
+    Task SaveStatusWithApprovalAsync(MigrationWave wave, ApprovalRecord approval, CancellationToken cancellationToken);
 }

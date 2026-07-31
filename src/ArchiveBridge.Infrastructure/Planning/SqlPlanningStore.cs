@@ -17,10 +17,10 @@ public sealed class SqlPlanningStore(TenantConnectionFactory connectionFactory) 
     private const string InsertSql =
         """
         INSERT INTO dbo.planning_assessments
-            (tenant_id, project_id, wave_id, wave_version, mailbox, total_bytes, rule_code,
+            (tenant_id, project_id, wave_id, wave_version, target_archive_id, total_bytes, rule_code,
              result, reason, correlation_id, assessed_at_utc, released_by)
         VALUES
-            (@tenant, @project, @waveId, @version, @mailbox, @totalBytes, @ruleCode,
+            (@tenant, @project, @waveId, @version, @archiveId, @totalBytes, @ruleCode,
              @result, @reason, @correlation, @assessedAt, @releasedBy);
         """;
 
@@ -53,7 +53,7 @@ public sealed class SqlPlanningStore(TenantConnectionFactory connectionFactory) 
                 command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
                 command.Parameters.Add(new SqlParameter("@waveId", SqlDbType.UniqueIdentifier) { Value = waveId.Value });
                 command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = waveVersion.Value });
-                command.Parameters.Add(new SqlParameter("@mailbox", SqlDbType.NVarChar, 320) { Value = assessment.Mailbox });
+                command.Parameters.Add(new SqlParameter("@archiveId", SqlDbType.NVarChar, 320) { Value = assessment.Archive.Value });
                 command.Parameters.Add(new SqlParameter("@totalBytes", SqlDbType.BigInt) { Value = assessment.TotalBytes });
                 command.Parameters.Add(new SqlParameter("@ruleCode", SqlDbType.NVarChar, 64) { Value = assessment.RuleCode });
                 command.Parameters.Add(new SqlParameter("@result", SqlDbType.TinyInt) { Value = (byte)assessment.Result });

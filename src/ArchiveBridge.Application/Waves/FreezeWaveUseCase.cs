@@ -2,25 +2,21 @@ using ArchiveBridge.Application.Planning;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Waves;
 using ArchiveBridge.Domain.Common;
-using ArchiveBridge.Domain.IdentityAndAccess;
-using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Domain.Waves;
 
 namespace ArchiveBridge.Application.Waves;
 
 /// <summary>Resultado de <see cref="FreezeWaveUseCase"/>.</summary>
-public sealed record WaveFreezeResult(JobId Job, WaveStatus Status);
+public sealed record WaveFreezeResult(WaveStatus Status);
 
 /// <summary>
-/// Comando FreezeWave: congela uma onda aprovada para execução (Approved → Frozen). A seleção e o
-/// destino já são imutáveis desde a aprovação (reforçado por gatilho); o congelamento sela a onda
-/// para a fase de execução. Emite um Job de controle durável correlacionado. Transições inválidas
-/// falham de forma fechada.
+/// Corpo de execução do comando durável <c>FreezeWave</c>. Congela uma onda aprovada para execução
+/// (Approved → Frozen). A seleção e o destino já são imutáveis desde a aprovação (reforçado por
+/// gatilho); o congelamento sela a onda. É idempotente em retry: se já está Frozen, não re-transita.
 /// </summary>
-public sealed class FreezeWaveUseCase(IWaveStore waves, IJobStore jobs)
+public sealed class FreezeWaveUseCase(IWaveStore waves)
 {
     private readonly IWaveStore _waves = waves;
-    private readonly IJobStore _jobs = jobs;
 
     /// <summary>Congela a onda do escopo.</summary>
     public async Task<WaveFreezeResult> ExecuteAsync(
@@ -29,13 +25,14 @@ public sealed class FreezeWaveUseCase(IWaveStore waves, IJobStore jobs)
         var wave = await _waves.GetAsync(scope, waveId, cancellationToken).ConfigureAwait(false)
             ?? throw new PlanningNotFoundException("Onda não encontrada no escopo.");
 
-        wave.Freeze();
+        if (wave.Status == WaveStatus.Frozen)
+        {
+            return new WaveFreezeResult(wave.Status);
+        }
 
-        var jobId = await _jobs.CreateAsync(
-            new CreateJobCommand(scope, Workload.Control, JobPriority.Normal, correlation), cancellationToken)
-            .ConfigureAwait(false);
+        wave.Freeze();
         await _waves.SaveStatusAsync(wave, correlation, cancellationToken).ConfigureAwait(false);
 
-        return new WaveFreezeResult(jobId, wave.Status);
+        return new WaveFreezeResult(wave.Status);
     }
 }

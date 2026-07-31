@@ -25,16 +25,38 @@ public readonly record struct WaveName
 }
 
 /// <summary>
-/// Referência a um archive de destino (o archive de uma mailbox). Usada para agrupar volume no
-/// planejamento de capacidade — dividir artificialmente a mesma onda não contorna a regra, pois a
-/// soma é por archive.
+/// Referência a um archive de destino. Carrega DUAS coisas distintas: a <see cref="Identity"/>
+/// canônica (chave de agrupamento do planejamento de capacidade — a soma é por identidade, não pela
+/// string de exibição, então variação de caixa/alias não divide artificialmente o volume) e a
+/// <see cref="Mailbox"/> de exibição (metadado usado na coluna <c>Mailbox</c> do CSV, com a caixa
+/// preservada). Dividir artificialmente a mesma onda não contorna a regra, pois a soma é por
+/// <see cref="Identity"/>.
 /// </summary>
 public readonly record struct ArchiveRef
 {
     private const int MaxLength = 320;
 
-    /// <summary>Cria uma referência de archive válida (mailbox obrigatória).</summary>
+    /// <summary>Cria uma referência derivando a identidade canônica da própria mailbox (só caixa).</summary>
     public ArchiveRef(string mailbox)
+    {
+        Mailbox = Normalize(mailbox);
+        Identity = TargetArchiveId.FromMailbox(Mailbox);
+    }
+
+    /// <summary>Cria uma referência com a identidade canônica resolvida explicitamente (unifica aliases).</summary>
+    public ArchiveRef(string mailbox, TargetArchiveId identity)
+    {
+        Mailbox = Normalize(mailbox);
+        Identity = identity;
+    }
+
+    /// <summary>Mailbox de exibição (preserva a caixa; usada na coluna Mailbox do CSV).</summary>
+    public string Mailbox { get; }
+
+    /// <summary>Identidade canônica do archive (chave de agrupamento de capacidade).</summary>
+    public TargetArchiveId Identity { get; }
+
+    private static string Normalize(string mailbox)
     {
         var normalized = TextValue.Require(mailbox, nameof(mailbox), MaxLength);
         if (normalized.Contains(' ', StringComparison.Ordinal))
@@ -42,9 +64,6 @@ public readonly record struct ArchiveRef
             throw new ArgumentException("Mailbox de archive não pode conter espaços.", nameof(mailbox));
         }
 
-        Mailbox = normalized;
+        return normalized;
     }
-
-    /// <summary>Mailbox cujo archive é o destino.</summary>
-    public string Mailbox { get; }
 }

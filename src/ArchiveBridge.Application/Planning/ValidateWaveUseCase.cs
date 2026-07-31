@@ -3,34 +3,32 @@ using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Planning;
 using ArchiveBridge.Contracts.Waves;
 using ArchiveBridge.Domain.Common;
-using ArchiveBridge.Domain.IdentityAndAccess;
-using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Domain.Planning;
 using ArchiveBridge.Domain.Waves;
 
 namespace ArchiveBridge.Application.Planning;
 
 /// <summary>Resultado de <see cref="ValidateWaveUseCase"/>.</summary>
-public sealed record WaveValidationResult(JobId Job, WaveStatus Status, bool AssessmentRequired, int ArchiveCount);
+public sealed record WaveValidationResult(WaveStatus Status, bool AssessmentRequired, int ArchiveCount);
 
 /// <summary>
-/// Comando ValidateWave: aplica a regra de capacidade por archive (100 GiB) sobre a seleção da onda.
-/// Se QUALQUER archive exigir avaliação, a onda fica <c>Blocked</c> (com <c>MICROSOFT_ASSESSMENT_REQUIRED</c>)
-/// até evidência/decisão; caso contrário, avança para <c>ReadyForApproval</c>. Cada avaliação é
-/// registrada como evidência (append-only). Emite um Job de controle durável correlacionado. As
-/// razões registradas são livres de PII (não citam mailbox, caminho ou nome de PST).
+/// Corpo de execução do comando durável <c>ValidateWave</c>. Aplica a regra de capacidade por archive
+/// (100 GB decimais) sobre a seleção da onda. Se QUALQUER archive exigir avaliação, a onda fica
+/// <c>Blocked</c> (com <c>MICROSOFT_ASSESSMENT_REQUIRED</c>) até evidência/decisão; caso contrário,
+/// avança para <c>ReadyForApproval</c>. Cada avaliação é registrada como evidência (append-only). É
+/// idempotente em retry: se a onda já está Blocked/ReadyForApproval (validada para esta versão), não
+/// re-registra. As razões são livres de PII (não citam mailbox, caminho ou nome de PST).
 /// </summary>
-public sealed class ValidateWaveUseCase(IWaveStore waves, IPlanningStore planning, IJobStore jobs, IClock clock)
+public sealed class ValidateWaveUseCase(IWaveStore waves, IPlanningStore planning, IClock clock)
 {
     private const string AssessmentRequiredReason =
-        "Volume planejado por archive excede 100 GiB; avaliação Microsoft exigida antes de prosseguir.";
+        "Volume planejado por archive excede 100 GB; avaliação Microsoft exigida antes de prosseguir.";
 
     private const string WithinLimitReason =
-        "Volume planejado por archive dentro do limite de 100 GiB.";
+        "Volume planejado por archive dentro do limite de 100 GB.";
 
     private readonly IWaveStore _waves = waves;
     private readonly IPlanningStore _planning = planning;
-    private readonly IJobStore _jobs = jobs;
     private readonly IClock _clock = clock;
 
     /// <summary>Executa a validação de capacidade da onda.</summary>
@@ -41,6 +39,13 @@ public sealed class ValidateWaveUseCase(IWaveStore waves, IPlanningStore plannin
             ?? throw new PlanningNotFoundException("Onda não encontrada no escopo.");
 
         var report = CapacityPlanner.Assess(wave.Selection);
+
+        // Idempotência em retry: já validada para esta versão — não re-registra nem re-transita.
+        if (wave.Status is WaveStatus.Blocked or WaveStatus.ReadyForApproval)
+        {
+            return new WaveValidationResult(wave.Status, report.AssessmentRequired, report.PerArchive.Count);
+        }
+
         var now = _clock.UtcNow;
         var assessments = BuildAssessments(report, correlation, now);
 
@@ -54,13 +59,10 @@ public sealed class ValidateWaveUseCase(IWaveStore waves, IPlanningStore plannin
             wave.MarkReadyForApproval();
         }
 
-        var jobId = await _jobs.CreateAsync(
-            new CreateJobCommand(scope, Workload.Control, JobPriority.Normal, correlation), cancellationToken)
-            .ConfigureAwait(false);
         await _planning.RecordAsync(scope, waveId, wave.Version, assessments, cancellationToken).ConfigureAwait(false);
         await _waves.SaveStatusAsync(wave, correlation, cancellationToken).ConfigureAwait(false);
 
-        return new WaveValidationResult(jobId, wave.Status, report.AssessmentRequired, report.PerArchive.Count);
+        return new WaveValidationResult(wave.Status, report.AssessmentRequired, report.PerArchive.Count);
     }
 
     private static void MoveToValidating(MigrationWave wave)
@@ -69,9 +71,6 @@ public sealed class ValidateWaveUseCase(IWaveStore waves, IPlanningStore plannin
         {
             case WaveStatus.Draft:
                 wave.StartValidation();
-                break;
-            case WaveStatus.Blocked:
-                wave.Unblock();
                 break;
             case WaveStatus.Validating:
                 break;
@@ -91,7 +90,7 @@ public sealed class ValidateWaveUseCase(IWaveStore waves, IPlanningStore plannin
                 ? AssessmentRequiredReason
                 : WithinLimitReason;
             assessments.Add(new PlanningAssessment(
-                archive.Mailbox,
+                archive.Archive,
                 archive.TotalBytes,
                 archive.RuleCode,
                 archive.Result,

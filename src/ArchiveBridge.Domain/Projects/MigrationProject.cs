@@ -30,6 +30,7 @@ public sealed class MigrationProject
         Status = ProjectStatus.Draft;
         CreatedAtUtc = createdAtUtc;
         UpdatedAtUtc = createdAtUtc;
+        RowVersion = RowVersion.None;
     }
 
     public ProjectId Id { get; }
@@ -51,6 +52,12 @@ public sealed class MigrationProject
     public DateTimeOffset CreatedAtUtc { get; }
 
     public DateTimeOffset UpdatedAtUtc { get; private set; }
+
+    /// <summary>Token de concorrência otimista carregado na leitura (conferido em cada UPDATE).</summary>
+    public RowVersion RowVersion { get; private set; }
+
+    /// <summary>Registra o token de concorrência atribuído pela persistência (uso do store).</summary>
+    public void ApplyPersistedRowVersion(RowVersion rowVersion) => RowVersion = rowVersion;
 
     /// <summary>Cria um projeto novo em Draft, na configuração inicial (versão 1).</summary>
     public static MigrationProject Create(
@@ -76,7 +83,8 @@ public sealed class MigrationProject
         Sha256Hash configurationHash,
         ProjectStatus status,
         DateTimeOffset createdAtUtc,
-        DateTimeOffset updatedAtUtc)
+        DateTimeOffset updatedAtUtc,
+        RowVersion rowVersion)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         return new MigrationProject(id, tenant, name, owner, configuration, createdAtUtc)
@@ -85,6 +93,7 @@ public sealed class MigrationProject
             ConfigurationHash = configurationHash,
             Status = status,
             UpdatedAtUtc = updatedAtUtc,
+            RowVersion = rowVersion,
         };
     }
 

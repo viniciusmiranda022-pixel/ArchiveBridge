@@ -1,5 +1,10 @@
+using ArchiveBridge.Application.Mapping;
+using ArchiveBridge.Application.Planning;
+using ArchiveBridge.Application.Waves;
+using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
+using ArchiveBridge.Domain.Mapping;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Domain.Waves;
 using ArchiveBridge.Infrastructure.Mapping;
@@ -21,6 +26,20 @@ internal static class Slice2Support
     public static SqlPlanningStore PlanningStore(SqlServerFixture fixture) => new(fixture.Factory);
 
     public static SqlMappingStore MappingStore(SqlServerFixture fixture) => new(fixture.Factory);
+
+    public static SqlPlanningCommandInbox Inbox(SqlServerFixture fixture, IClock clock) =>
+        new(fixture.Factory, fixture.Store(clock), clock);
+
+    public static PlanningCommandProcessor Processor(SqlServerFixture fixture, IClock clock) =>
+        new(
+            Inbox(fixture, clock),
+            fixture.Store(clock),
+            new ValidateProjectUseCase(ProjectStore(fixture), clock),
+            new ValidateWaveUseCase(WaveStore(fixture), PlanningStore(fixture), clock),
+            new GenerateMappingCsvUseCase(WaveStore(fixture), MappingStore(fixture), clock),
+            new FreezeWaveUseCase(WaveStore(fixture)),
+            MappingPolicy.Default,
+            clock);
 
     public static Sha256Hash ConfigHash() =>
         new ProjectConfiguration(new TargetTenant("contoso.onmicrosoft.com"), TargetArchivePolicy.OnlineArchive)

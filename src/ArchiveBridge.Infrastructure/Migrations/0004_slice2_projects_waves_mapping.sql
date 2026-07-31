@@ -106,6 +106,8 @@ CREATE TABLE dbo.wave_versions
     CONSTRAINT PK_wave_versions PRIMARY KEY (wave_id, wave_version),
     CONSTRAINT FK_wave_versions_wave FOREIGN KEY (wave_id, tenant_id, project_id)
         REFERENCES dbo.migration_waves (wave_id, tenant_id, project_id),
+    -- Alvo da FK composta de wave_entries: garante coerência de tenant/projeto entre pai e filho.
+    CONSTRAINT UQ_wave_versions_scope UNIQUE (wave_id, wave_version, tenant_id, project_id),
     CONSTRAINT CK_wave_versions_version CHECK (wave_version >= 1),
     CONSTRAINT CK_wave_versions_planned CHECK (planned_bytes >= 0 AND planned_items >= 0)
 );
@@ -119,14 +121,19 @@ CREATE TABLE dbo.wave_entries
     tenant_id    UNIQUEIDENTIFIER       NOT NULL,
     project_id   UNIQUEIDENTIFIER       NOT NULL,
     wave_version INT                    NOT NULL,
-    file_path    NVARCHAR(400)          NOT NULL,
-    pst_name     NVARCHAR(260)          NOT NULL,
-    mailbox      NVARCHAR(320)          NOT NULL,
-    size_bytes   BIGINT                 NOT NULL,
-    item_count   BIGINT                 NOT NULL,
+    file_path         NVARCHAR(400)     NOT NULL,
+    pst_name          NVARCHAR(260)     NOT NULL,
+    mailbox           NVARCHAR(320)     NOT NULL,
+    -- Identidade canônica (resolvida) do archive: a chave de agrupamento de capacidade (a mailbox é
+    -- apenas metadado de exibição). Persistida para preservar a resolução de aliases entre recargas.
+    target_archive_id NVARCHAR(320)     NOT NULL,
+    size_bytes        BIGINT            NOT NULL,
+    item_count        BIGINT            NOT NULL,
     CONSTRAINT PK_wave_entries PRIMARY KEY (entry_id),
-    CONSTRAINT FK_wave_entries_version FOREIGN KEY (wave_id, wave_version)
-        REFERENCES dbo.wave_versions (wave_id, wave_version),
+    -- FK composta com tenant_id/project_id: uma entrada NÃO pode referenciar uma versão de outro
+    -- tenant/projeto mesmo conhecendo o (wave_id, wave_version). Coerência garantida no banco.
+    CONSTRAINT FK_wave_entries_version FOREIGN KEY (wave_id, wave_version, tenant_id, project_id)
+        REFERENCES dbo.wave_versions (wave_id, wave_version, tenant_id, project_id),
     CONSTRAINT UQ_wave_entries_pst UNIQUE (wave_id, wave_version, pst_name),
     CONSTRAINT CK_wave_entries_size CHECK (size_bytes >= 0 AND item_count >= 0)
 );
@@ -152,6 +159,8 @@ CREATE TABLE dbo.mapping_csv_versions
     CONSTRAINT PK_mapping_csv_versions PRIMARY KEY (wave_id, mapping_version),
     CONSTRAINT FK_mcv_wave FOREIGN KEY (wave_id, tenant_id, project_id)
         REFERENCES dbo.migration_waves (wave_id, tenant_id, project_id),
+    -- Alvo da FK composta de mapping_csv_rows (coerência de tenant/projeto entre pai e filho).
+    CONSTRAINT UQ_mcv_scope UNIQUE (wave_id, mapping_version, tenant_id, project_id),
     CONSTRAINT CK_mcv_status CHECK (status BETWEEN 0 AND 1),
     CONSTRAINT CK_mcv_validation CHECK (validation_result BETWEEN 0 AND 1),
     CONSTRAINT CK_mcv_rowcount CHECK (row_count >= 0 AND row_count <= 500),
@@ -182,8 +191,10 @@ CREATE TABLE dbo.mapping_csv_rows
     sp_manifest_container NVARCHAR(400)          NOT NULL CONSTRAINT DF_mcr_spmanifest DEFAULT N'',
     sp_site_url           NVARCHAR(400)          NOT NULL CONSTRAINT DF_mcr_spsite DEFAULT N'',
     CONSTRAINT PK_mapping_csv_rows PRIMARY KEY (row_id),
-    CONSTRAINT FK_mcr_version FOREIGN KEY (wave_id, mapping_version)
-        REFERENCES dbo.mapping_csv_versions (wave_id, mapping_version),
+    -- FK composta com tenant_id/project_id: uma linha NÃO pode referenciar uma versão de mapping de
+    -- outro tenant/projeto mesmo conhecendo o (wave_id, mapping_version).
+    CONSTRAINT FK_mcr_version FOREIGN KEY (wave_id, mapping_version, tenant_id, project_id)
+        REFERENCES dbo.mapping_csv_versions (wave_id, mapping_version, tenant_id, project_id),
     CONSTRAINT UQ_mcr_name UNIQUE (wave_id, mapping_version, name),
     CONSTRAINT CK_mcr_sp_empty CHECK (sp_file_container = N'' AND sp_manifest_container = N'' AND sp_site_url = N''),
     CONSTRAINT CK_mcr_workload CHECK (workload = N'Exchange'),
@@ -200,11 +211,13 @@ CREATE TABLE dbo.planning_assessments
     assessment_id   BIGINT IDENTITY (1, 1) NOT NULL,
     tenant_id       UNIQUEIDENTIFIER       NOT NULL,
     project_id      UNIQUEIDENTIFIER       NOT NULL,
-    wave_id         UNIQUEIDENTIFIER       NOT NULL,
-    wave_version    INT                    NOT NULL,
-    mailbox         NVARCHAR(320)          NOT NULL,
-    total_bytes     BIGINT                 NOT NULL,
-    rule_code       NVARCHAR(64)           NOT NULL,
+    wave_id           UNIQUEIDENTIFIER     NOT NULL,
+    wave_version      INT                  NOT NULL,
+    -- Identidade canônica do archive avaliado (a soma de capacidade é por esta chave, não pela
+    -- string de exibição da mailbox).
+    target_archive_id NVARCHAR(320)        NOT NULL,
+    total_bytes       BIGINT               NOT NULL,
+    rule_code         NVARCHAR(64)         NOT NULL,
     result          TINYINT                NOT NULL,
     reason          NVARCHAR(400)          NOT NULL,
     correlation_id  UNIQUEIDENTIFIER       NOT NULL,

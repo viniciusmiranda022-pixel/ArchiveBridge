@@ -1,3 +1,4 @@
+using ArchiveBridge.Contracts.Approvals;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.Projects;
@@ -26,4 +27,11 @@ public interface IProjectStore
     /// histórico. Bloqueado pelo domínio e por gatilho quando a configuração está congelada.
     /// </summary>
     Task SaveConfigurationAsync(MigrationProject project, CorrelationId correlation, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Persiste atomicamente a transição de estado (com concorrência otimista) E a linha de decisão
+    /// na tabela <c>approvals</c>, em uma única transação. Falha com concorrência se o
+    /// <c>row_version</c> divergiu.
+    /// </summary>
+    Task SaveStatusWithApprovalAsync(MigrationProject project, ApprovalRecord approval, CancellationToken cancellationToken);
 }

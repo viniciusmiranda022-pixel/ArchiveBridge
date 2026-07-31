@@ -272,4 +272,32 @@ public sealed class Slice2MappingTests
         var content = ValidContent(wave);
         Assert.False(MappingCsvValidator.Validate(content, wave, new ContentCodePage(1250), MappingPolicy.Default).IsValid);
     }
+
+    // ---- B7: parser fail-closed para CSV estruturalmente malformado ----
+
+    [Theory]
+    [InlineData("u\"ser\"@contoso.com")]                 // aspas no meio de campo não citado
+    [InlineData("\"campo\"texto")]                       // texto após fechamento de campo citado
+    [InlineData("\"campo sem fechamento")]               // aspas não fechadas
+    [InlineData("\"\"\"escape inválido")]                // escape inválido → aspas não fechadas
+    public void ValidatorRejectsStructurallyMalformedCsv(string dataLine)
+    {
+        var wave = ApprovedWave(E("/src/a.pst", "a.pst", "u@contoso.com"));
+        var malformed = MappingSchema.HeaderLine + "\r\n" + dataLine + "\r\n";
+        var result = MappingCsvValidator.Validate(malformed, wave, CodePage, MappingPolicy.Default);
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Contains("malformado", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void MalformedFieldIsRejectedEvenIfInterpretedValueWouldMatchSource()
+    {
+        // O parser deve rejeitar u"ser"@... como estrutura, sem "reparar" para user@... e aceitar.
+        var wave = ApprovedWave(E("/src/a.pst", "a.pst", "user@contoso.com"));
+        var lines = Lines(ValidContent(wave)).ToList();
+        var fields = lines[1].Split(',');
+        fields[3] = "us\"er\"@contoso.com"; // Mailbox malformada que "interpretada" daria user@contoso.com
+        lines[1] = string.Join(',', fields);
+        Assert.False(MappingCsvValidator.Validate(Rejoin(lines), wave, CodePage, MappingPolicy.Default).IsValid);
+    }
 }

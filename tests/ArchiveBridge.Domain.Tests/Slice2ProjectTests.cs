@@ -111,10 +111,11 @@ public sealed class Slice2ProjectTests
         var config = new ProjectConfiguration(new TargetTenant("contoso.onmicrosoft.com"), TargetArchivePolicy.PrimaryMailbox);
         var project = MigrationProject.Rehydrate(
             id, tenant, new ProjectName("P"), new ProjectOwner("O"), config,
-            new ConfigurationVersion(3), config.ComputeHash(), ProjectStatus.Approved, Now, Later);
+            new ConfigurationVersion(3), config.ComputeHash(), ProjectStatus.Approved, Now, Later, new RowVersion(42));
 
         Assert.Equal(3, project.ConfigurationVersion.Value);
         Assert.Equal(ProjectStatus.Approved, project.Status);
         Assert.Equal(config.ComputeHash(), project.ConfigurationHash);
+        Assert.Equal(42UL, project.RowVersion.Value);
     }
 }

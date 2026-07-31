@@ -40,6 +40,7 @@ public sealed class MigrationWave
         Version = WaveVersion.Initial;
         Status = WaveStatus.Draft;
         CreatedAtUtc = createdAtUtc;
+        RowVersion = RowVersion.None;
     }
 
     public WaveId Id { get; }
@@ -76,6 +77,12 @@ public sealed class MigrationWave
 
     public DateTimeOffset CreatedAtUtc { get; }
 
+    /// <summary>Token de concorrência otimista carregado na leitura (conferido em cada UPDATE).</summary>
+    public RowVersion RowVersion { get; private set; }
+
+    /// <summary>Registra o token de concorrência atribuído pela persistência (uso do store).</summary>
+    public void ApplyPersistedRowVersion(RowVersion rowVersion) => RowVersion = rowVersion;
+
     /// <summary>Cria uma onda nova em Draft (versão 1).</summary>
     public static MigrationWave Create(
         WaveId id,
@@ -104,7 +111,8 @@ public sealed class MigrationWave
         WaveStatus status,
         DateTimeOffset? approvedAtUtc,
         string? approvedBy,
-        DateTimeOffset createdAtUtc)
+        DateTimeOffset createdAtUtc,
+        RowVersion rowVersion)
     {
         ArgumentNullException.ThrowIfNull(selection);
         return new MigrationWave(id, tenant, project, name, targetRootFolder, configurationHash, selection, createdAtUtc)
@@ -113,6 +121,7 @@ public sealed class MigrationWave
             Status = status,
             ApprovedAtUtc = approvedAtUtc,
             ApprovedBy = approvedBy,
+            RowVersion = rowVersion,
         };
     }
 
@@ -163,6 +172,9 @@ public sealed class MigrationWave
         ApprovedBy = approver;
         ApprovedAtUtc = now;
     }
+
+    /// <summary>Rejeita a onda na aprovação (ReadyForApproval → Draft), devolvendo-a para retrabalho.</summary>
+    public void Reject() => Transition(WaveStatus.Draft);
 
     /// <summary>Congela a onda para execução (Approved → Frozen).</summary>
     public void Freeze() => Transition(WaveStatus.Frozen);
