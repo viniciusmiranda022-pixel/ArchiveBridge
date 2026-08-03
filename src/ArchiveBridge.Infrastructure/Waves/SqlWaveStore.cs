@@ -1,4 +1,5 @@
 using System.Data;
+using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Approvals;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Waves;
@@ -20,7 +21,7 @@ namespace ArchiveBridge.Infrastructure.Waves;
 /// seleção grava uma nova versão + entradas e devolve a onda a Draft. Congelamento pós-aprovação é
 /// reforçado por gatilho. RLS por SESSION_CONTEXT + filtro por project_id.
 /// </summary>
-public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IWaveStore
+public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory, IClock clock) : IWaveStore
 {
     private const int ConcurrencyError = 50021;
 
@@ -114,6 +115,7 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
         """;
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
+    private readonly IClock _clock = clock;
 
     /// <inheritdoc />
     public async Task AddAsync(MigrationWave wave, CorrelationId correlation, CancellationToken cancellationToken)
@@ -213,9 +215,25 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
         var scope = new TenantScope(wave.Tenant, wave.Project);
         await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken)
             .ConfigureAwait(false);
-        await using var command = new SqlCommand(SaveStatusSql, connection.Connection);
-        BindStatus(command, wave, fence);
-        await SqlJobFence.ExecuteGuardedAsync(command, ConcurrencyError, "Onda", cancellationToken).ConfigureAwait(false);
+        await using var transaction = (SqlTransaction)await connection.Connection
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using (var command = new SqlCommand(SaveStatusSql, connection.Connection, transaction))
+            {
+                BindStatus(command, wave, fence);
+                await SqlJobFence.ExecuteGuardedAsync(command, ConcurrencyError, "Onda", cancellationToken).ConfigureAwait(false);
+            }
+
+            await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow), cancellationToken)
+                .ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            throw;
+        }
     }
 
     /// <inheritdoc />
@@ -262,6 +280,8 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow), cancellationToken)
+                .ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch
@@ -271,7 +291,7 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
         }
     }
 
-    private static void BindStatus(SqlCommand command, MigrationWave wave, JobFence? fence)
+    private void BindStatus(SqlCommand command, MigrationWave wave, JobFence? fence)
     {
         command.Parameters.Add(new SqlParameter("@status", SqlDbType.TinyInt) { Value = (byte)wave.Status });
         command.Parameters.Add(new SqlParameter("@approvedAt", SqlDbType.DateTime2)
@@ -281,7 +301,7 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
         command.Parameters.Add(new SqlParameter("@waveId", SqlDbType.UniqueIdentifier) { Value = wave.Id.Value });
         command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = wave.Project.Value });
         command.Parameters.Add(new SqlParameter("@rowVersion", SqlDbType.Binary, 8) { Value = wave.RowVersion.ToBytes() });
-        SqlJobFence.Bind(command, fence);
+        SqlJobFence.Bind(command, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow));
     }
 
     /// <inheritdoc />

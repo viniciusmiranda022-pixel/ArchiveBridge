@@ -112,6 +112,9 @@ public sealed class SqlPlanningCommandInbox(TenantConnectionFactory connectionFa
     public async Task<JobId> EnqueueAsync(PlanningCommand command, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(command);
+        // Fail-closed: o contexto obrigatório por tipo é exigido ANTES de enfileirar (espelha
+        // CK_pc_required_by_type no banco). Um comando incompleto nunca chega à fila.
+        PlanningCommandValidation.EnsureValid(command);
         var jobId = JobId.New();
         var now = SqlJobMapping.ToDbUtc(_clock.UtcNow);
         var scope = command.Scope;

@@ -1,4 +1,5 @@
 using System.Data;
+using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Mapping;
 using ArchiveBridge.Domain.Common;
@@ -18,7 +19,7 @@ namespace ArchiveBridge.Infrastructure.Mapping;
 /// o índice único filtrado impõe no máximo uma utilizável por onda. A role da aplicação só pode
 /// atualizar a coluna <c>status</c> (hashes/fingerprint/artefato imutáveis). RLS por SESSION_CONTEXT.
 /// </summary>
-public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) : IMappingStore
+public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory, IClock clock) : IMappingStore
 {
     private const string MaxVersionSql =
         "SELECT ISNULL(MAX(mapping_version), 0) FROM dbo.mapping_csv_versions WHERE wave_id = @waveId AND project_id = @project;";
@@ -64,6 +65,7 @@ public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) :
     private static readonly string FenceGuardSql = $"SET NOCOUNT ON;\n{SqlJobFence.GuardSql}";
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
+    private readonly IClock _clock = clock;
 
     /// <inheritdoc />
     public async Task<int> GetMaxVersionAsync(TenantScope scope, WaveId waveId, CancellationToken cancellationToken)
@@ -125,11 +127,11 @@ public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) :
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            // Cercamento do Job (inerte quando não durável): valida na MESMA transação que o efeito é
-            // do dono corrente antes de qualquer gravação.
+            // Cercamento do Job (inerte quando não durável): valida na MESMA transação, com lock retido
+            // (UPDLOCK/HOLDLOCK) até o commit e lease válido, que o efeito é do dono corrente.
             await using (var guard = new SqlCommand(FenceGuardSql, connection.Connection, transaction))
             {
-                SqlJobFence.Bind(guard, fence);
+                SqlJobFence.Bind(guard, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow));
                 await SqlJobFence.ExecuteGuardedAsync(guard, concurrencyError: -1, "Mapping", cancellationToken).ConfigureAwait(false);
             }
 
@@ -197,6 +199,10 @@ public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) :
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            // Revalida o cercamento (instante fresco) imediatamente antes do commit: um lease que
+            // expirou durante a geração/publicação não confirma a versão.
+            await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow), cancellationToken)
+                .ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return persisted;
         }

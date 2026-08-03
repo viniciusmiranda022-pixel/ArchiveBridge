@@ -1,4 +1,5 @@
 using System.Data;
+using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Planning;
 using ArchiveBridge.Domain.Planning;
@@ -15,7 +16,7 @@ namespace ArchiveBridge.Infrastructure.Planning;
 /// cercamento do Job). Uma rejeição apenas registra a decisão. A role da aplicação só tem SELECT/INSERT
 /// nesta tabela (imutável). RLS por SESSION_CONTEXT.
 /// </summary>
-public sealed class SqlCapacityAssessmentDecisionStore(TenantConnectionFactory connectionFactory)
+public sealed class SqlCapacityAssessmentDecisionStore(TenantConnectionFactory connectionFactory, IClock clock)
     : ICapacityAssessmentDecisionStore
 {
     private const int ConcurrencyError = 50021;
@@ -50,6 +51,7 @@ public sealed class SqlCapacityAssessmentDecisionStore(TenantConnectionFactory c
         """;
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
+    private readonly IClock _clock = clock;
 
     /// <inheritdoc />
     public async Task RecordAsync(
@@ -70,14 +72,19 @@ public sealed class SqlCapacityAssessmentDecisionStore(TenantConnectionFactory c
         {
             if (unblock)
             {
-                await using var command = new SqlCommand(UnblockAndInsertSql, connection.Connection, transaction);
-                command.Parameters.Add(new SqlParameter("@status", SqlDbType.TinyInt) { Value = (byte)wave.Status });
-                command.Parameters.Add(new SqlParameter("@waveId", SqlDbType.UniqueIdentifier) { Value = wave.Id.Value });
-                command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = wave.Project.Value });
-                command.Parameters.Add(new SqlParameter("@rowVersion", SqlDbType.Binary, 8) { Value = wave.RowVersion.ToBytes() });
-                SqlJobFence.Bind(command, fence);
-                BindDecision(command, wave, decision);
-                await SqlJobFence.ExecuteGuardedAsync(command, ConcurrencyError, "Onda", cancellationToken).ConfigureAwait(false);
+                await using (var command = new SqlCommand(UnblockAndInsertSql, connection.Connection, transaction))
+                {
+                    command.Parameters.Add(new SqlParameter("@status", SqlDbType.TinyInt) { Value = (byte)wave.Status });
+                    command.Parameters.Add(new SqlParameter("@waveId", SqlDbType.UniqueIdentifier) { Value = wave.Id.Value });
+                    command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = wave.Project.Value });
+                    command.Parameters.Add(new SqlParameter("@rowVersion", SqlDbType.Binary, 8) { Value = wave.RowVersion.ToBytes() });
+                    SqlJobFence.Bind(command, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow));
+                    BindDecision(command, wave, decision);
+                    await SqlJobFence.ExecuteGuardedAsync(command, ConcurrencyError, "Onda", cancellationToken).ConfigureAwait(false);
+                }
+
+                await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow), cancellationToken)
+                    .ConfigureAwait(false);
             }
             else
             {

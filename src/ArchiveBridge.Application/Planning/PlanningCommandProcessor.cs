@@ -50,6 +50,7 @@ public sealed record PlanningCommandExecution(
 public sealed class PlanningCommandProcessor(
     IPlanningCommandInbox queue,
     IJobStore jobs,
+    IJobLeaseManager leases,
     IProjectStore projects,
     IWaveStore waves,
     ValidateProjectUseCase validateProject,
@@ -63,6 +64,7 @@ public sealed class PlanningCommandProcessor(
 
     private readonly IPlanningCommandInbox _queue = queue;
     private readonly IJobStore _jobs = jobs;
+    private readonly IJobLeaseManager _leases = leases;
     private readonly IProjectStore _projects = projects;
     private readonly IWaveStore _waves = waves;
     private readonly ValidateProjectUseCase _validateProject = validateProject;
@@ -90,6 +92,16 @@ public sealed class PlanningCommandProcessor(
         try
         {
             await GuardContextAsync(command, cancellationToken).ConfigureAwait(false);
+
+            // Heartbeat: renova o lease antes de executar (mantém a operação válida ao longo do tempo).
+            // Um heartbeat perdido (época/dono defasado ou lease já vencido) cancela a execução — nenhum
+            // efeito é gravado. Operações mais longas repetiriam este batimento durante o trabalho.
+            var beat = await _leases.RenewAsync(lease, cancellationToken).ConfigureAwait(false);
+            if (beat is not (JobCommandOutcome.Applied or JobCommandOutcome.IdempotentReplay))
+            {
+                return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, PlanningCommandOutcome.Fenced, beat);
+            }
+
             await DispatchAsync(command, fence, cancellationToken).ConfigureAwait(false);
         }
         catch (FencedOutException)
@@ -102,25 +114,30 @@ public sealed class PlanningCommandProcessor(
         catch (Exception exception) when (IsTerminal(exception))
         {
             var failed = await _jobs.FailAsync(lease, ErrorCode.Validation, cancellationToken).ConfigureAwait(false);
-            return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, PlanningCommandOutcome.Failed, failed);
+            return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, OutcomeFor(failed, PlanningCommandOutcome.Failed), failed);
         }
         catch (ConcurrencyException)
         {
             var retried = await _jobs.ScheduleRetryAsync(
                 lease, ErrorCode.ConcurrencyLost, _clock.UtcNow + RetryBackoff, cancellationToken).ConfigureAwait(false);
-            return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, PlanningCommandOutcome.Retried, retried);
+            return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, OutcomeFor(retried, PlanningCommandOutcome.Retried), retried);
         }
 
         var completed = await _jobs.CompleteAsync(lease, cancellationToken).ConfigureAwait(false);
-        var outcome = completed is JobCommandOutcome.Applied or JobCommandOutcome.IdempotentReplay
-            ? PlanningCommandOutcome.Completed
-            : PlanningCommandOutcome.Fenced;
-        return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, outcome, completed);
+        return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, OutcomeFor(completed, PlanningCommandOutcome.Completed), completed);
     }
+
+    // B4: só reporta a transição (Completed/Failed/Retried) quando o comando de Job foi de fato aplicado
+    // (ou replay idempotente válido). FencedOut/NotFound ⇒ Fenced — nunca uma transição "aplicada".
+    private static PlanningCommandOutcome OutcomeFor(JobCommandOutcome jobOutcome, PlanningCommandOutcome appliedOutcome) =>
+        jobOutcome is JobCommandOutcome.Applied or JobCommandOutcome.IdempotentReplay
+            ? appliedOutcome
+            : PlanningCommandOutcome.Fenced;
 
     private async Task GuardContextAsync(PlanningCommand command, CancellationToken cancellationToken)
     {
-        PlanningCommandContextGuard.EnsureSchema(command.Context);
+        // Contexto obrigatório por tipo (fail-closed) + schema conhecido, antes de carregar o agregado.
+        PlanningCommandValidation.EnsureValid(command);
         switch (command.Kind)
         {
             case PlanningCommandKind.ValidateProject:

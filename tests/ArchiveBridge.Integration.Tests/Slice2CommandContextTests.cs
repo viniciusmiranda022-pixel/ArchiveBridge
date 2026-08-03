@@ -99,11 +99,15 @@ public sealed class Slice2CommandContextTests(SqlServerFixture fixture)
     }
 
     [Fact]
-    public async Task UnknownSchemaFailsCommand()
+    public async Task UnknownSchemaIsRejectedAtEnqueue()
     {
+        // Schema desconhecido é fail-closed já no enfileiramento (contexto obrigatório por tipo), antes
+        // de virar Job — mais forte que detectar só no processamento.
         var wave = await SeedWaveAsync();
         var command = PlanningCommandFactory.ValidateWave(wave, CorrelationId.New());
         var tampered = command with { Context = command.Context with { SchemaVersion = 999 } };
-        Assert.Equal(PlanningCommandOutcome.Failed, await EnqueueAndProcessAsync(wave, tampered));
+        var clock = new MutableClock(Slice2Support.Now);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            Slice2Support.Inbox(fixture, clock).EnqueueAsync(tampered, CancellationToken.None));
     }
 }

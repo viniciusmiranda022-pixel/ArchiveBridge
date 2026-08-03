@@ -30,23 +30,23 @@ public static class PlanningCommandFactory
             MappingSchemaVersion: null,
             MappingGeneratorVersion: null,
             MappingPolicyVersion: null);
-        return new PlanningCommand(PlanningCommandKind.ValidateProject, scope, Wave: null, ContentCodePage: null, GeneratedBy: null, correlation, context);
+        return Validated(new PlanningCommand(PlanningCommandKind.ValidateProject, scope, Wave: null, ContentCodePage: null, GeneratedBy: null, correlation, context));
     }
 
     /// <summary>Comando ValidateWave vinculado à versão/hash de seleção e destino correntes da onda.</summary>
     public static PlanningCommand ValidateWave(MigrationWave wave, CorrelationId correlation)
     {
         ArgumentNullException.ThrowIfNull(wave);
-        return new PlanningCommand(
-            PlanningCommandKind.ValidateWave, ScopeOf(wave), wave.Id, ContentCodePage: null, GeneratedBy: null, correlation, WaveContext(wave));
+        return Validated(new PlanningCommand(
+            PlanningCommandKind.ValidateWave, ScopeOf(wave), wave.Id, ContentCodePage: null, GeneratedBy: null, correlation, WaveContext(wave)));
     }
 
     /// <summary>Comando FreezeWave vinculado à versão/hash de seleção e destino correntes da onda.</summary>
     public static PlanningCommand FreezeWave(MigrationWave wave, CorrelationId correlation)
     {
         ArgumentNullException.ThrowIfNull(wave);
-        return new PlanningCommand(
-            PlanningCommandKind.FreezeWave, ScopeOf(wave), wave.Id, ContentCodePage: null, GeneratedBy: null, correlation, WaveContext(wave));
+        return Validated(new PlanningCommand(
+            PlanningCommandKind.FreezeWave, ScopeOf(wave), wave.Id, ContentCodePage: null, GeneratedBy: null, correlation, WaveContext(wave)));
     }
 
     /// <summary>Comando GenerateMappingCsv vinculado à onda e às versões de esquema/gerador/política do mapping.</summary>
@@ -61,8 +61,14 @@ public static class PlanningCommandFactory
             MappingGeneratorVersion = MappingCsvGenerator.GeneratorVersion,
             MappingPolicyVersion = policy.Version,
         };
-        return new PlanningCommand(
-            PlanningCommandKind.GenerateMappingCsv, ScopeOf(wave), wave.Id, contentCodePage.Value, generatedBy, correlation, context);
+        return Validated(new PlanningCommand(
+            PlanningCommandKind.GenerateMappingCsv, ScopeOf(wave), wave.Id, contentCodePage.Value, generatedBy, correlation, context));
+    }
+
+    private static PlanningCommand Validated(PlanningCommand command)
+    {
+        PlanningCommandValidation.EnsureValid(command);
+        return command;
     }
 
     private static TenantScope ScopeOf(MigrationWave wave) => new(wave.Tenant, wave.Project);

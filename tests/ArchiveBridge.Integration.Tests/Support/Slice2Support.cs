@@ -5,12 +5,14 @@ using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Mapping;
 using ArchiveBridge.Domain.Common;
+using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Domain.Mapping;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Domain.Waves;
 using ArchiveBridge.Infrastructure.Mapping;
 using ArchiveBridge.Infrastructure.Planning;
 using ArchiveBridge.Infrastructure.Projects;
+using ArchiveBridge.Infrastructure.Time;
 using ArchiveBridge.Infrastructure.Waves;
 
 namespace ArchiveBridge.Integration.Tests.Support;
@@ -20,51 +22,58 @@ internal static class Slice2Support
 {
     public static readonly DateTimeOffset Now = new(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
 
-    public static SqlProjectStore ProjectStore(SqlServerFixture fixture) => new(fixture.Factory);
+    private static readonly IClock DefaultClock = new SystemClock();
 
-    public static SqlWaveStore WaveStore(SqlServerFixture fixture) => new(fixture.Factory);
+    // Lease padrão dos comandos duráveis (deve coincidir com o do processador para o heartbeat/fencing).
+    public static readonly TimeSpan Lease = TimeSpan.FromMinutes(5);
 
-    public static SqlMappingStore MappingStore(SqlServerFixture fixture) => new(fixture.Factory);
+    public static SqlProjectStore ProjectStore(SqlServerFixture fixture, IClock? clock = null) => new(fixture.Factory, clock ?? DefaultClock);
 
-    public static SqlCapacityAssessmentDecisionStore DecisionStore(SqlServerFixture fixture) => new(fixture.Factory);
+    public static SqlWaveStore WaveStore(SqlServerFixture fixture, IClock? clock = null) => new(fixture.Factory, clock ?? DefaultClock);
+
+    public static SqlMappingStore MappingStore(SqlServerFixture fixture, IClock? clock = null) => new(fixture.Factory, clock ?? DefaultClock);
+
+    public static SqlCapacityAssessmentDecisionStore DecisionStore(SqlServerFixture fixture, IClock? clock = null) => new(fixture.Factory, clock ?? DefaultClock);
 
     public static FileSystemMappingArtifactStore ArtifactStore(SqlServerFixture fixture) => new(fixture.ArtifactRoot);
 
-    /// <summary>Persiste uma geração de mapping publicando o artefato imutável (como o caso de uso faz).</summary>
-    public static Task<MappingCsvVersion> SaveMapping(
-        SqlServerFixture fixture, TenantScope scope, MappingGenerationResult result, CancellationToken cancellationToken) =>
-        MappingStore(fixture).SaveAsync(
+    /// <summary>Persiste uma geração de mapping encenando e publicando o artefato imutável (como o caso de uso faz).</summary>
+    public static async Task<MappingCsvVersion> SaveMapping(
+        SqlServerFixture fixture, TenantScope scope, MappingGenerationResult result, CancellationToken cancellationToken)
+    {
+        var artifacts = ArtifactStore(fixture);
+        var staging = await artifacts.StageAsync(result.Document.GetBytes(), result.Document.ContentSha256, cancellationToken);
+        return await MappingStore(fixture).SaveAsync(
             scope,
             result,
             fence: null,
-            (version, token) => ArtifactStore(fixture).SaveAsync(
-                new MappingArtifactDescriptor(scope, result.Version.Wave, version),
-                result.Document.GetBytes(),
-                result.Document.ContentSha256,
-                token),
+            (version, token) => artifacts.PublishAsync(
+                staging, new MappingArtifactDescriptor(scope, result.Version.Wave, version), token),
             cancellationToken);
+    }
 
     public static SqlPlanningCommandInbox Inbox(SqlServerFixture fixture, IClock clock) => new(fixture.Factory, clock);
 
     public static ValidateWaveUseCase ValidateWave(SqlServerFixture fixture, IClock clock) =>
-        new(WaveStore(fixture), DecisionStore(fixture), clock);
+        new(WaveStore(fixture, clock), DecisionStore(fixture, clock), clock);
 
     public static GenerateMappingCsvUseCase GenerateMapping(SqlServerFixture fixture, IClock clock) =>
-        new(WaveStore(fixture), MappingStore(fixture), ArtifactStore(fixture), clock);
+        new(WaveStore(fixture, clock), MappingStore(fixture, clock), ArtifactStore(fixture), clock);
 
     public static RecordMicrosoftAssessmentDecisionUseCase RecordDecision(SqlServerFixture fixture, IClock clock) =>
-        new(WaveStore(fixture), DecisionStore(fixture), ValidateWave(fixture, clock), clock);
+        new(WaveStore(fixture, clock), DecisionStore(fixture, clock), ValidateWave(fixture, clock), clock);
 
     public static PlanningCommandProcessor Processor(SqlServerFixture fixture, IClock clock) =>
         new(
             Inbox(fixture, clock),
             fixture.Store(clock),
-            ProjectStore(fixture),
-            WaveStore(fixture),
-            new ValidateProjectUseCase(ProjectStore(fixture), clock),
+            fixture.LeaseManager(clock, RetryPolicy.Default, Lease),
+            ProjectStore(fixture, clock),
+            WaveStore(fixture, clock),
+            new ValidateProjectUseCase(ProjectStore(fixture, clock), clock),
             ValidateWave(fixture, clock),
             GenerateMapping(fixture, clock),
-            new FreezeWaveUseCase(WaveStore(fixture)),
+            new FreezeWaveUseCase(WaveStore(fixture, clock)),
             MappingPolicy.Default,
             clock);
 

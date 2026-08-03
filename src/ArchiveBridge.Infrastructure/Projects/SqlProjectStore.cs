@@ -1,4 +1,5 @@
 using System.Data;
+using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Approvals;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Projects;
@@ -19,7 +20,7 @@ namespace ArchiveBridge.Infrastructure.Projects;
 /// UPDATE confere o token lido e falha (<see cref="ConcurrencyException"/>) se nenhuma linha for
 /// afetada. RLS por SESSION_CONTEXT + filtro por project_id.
 /// </summary>
-public sealed class SqlProjectStore(TenantConnectionFactory connectionFactory) : IProjectStore
+public sealed class SqlProjectStore(TenantConnectionFactory connectionFactory, IClock clock) : IProjectStore
 {
     private const int ConcurrencyError = 50020;
 
@@ -87,6 +88,7 @@ public sealed class SqlProjectStore(TenantConnectionFactory connectionFactory) :
         """;
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
+    private readonly IClock _clock = clock;
 
     /// <inheritdoc />
     public async Task AddAsync(MigrationProject project, CorrelationId correlation, CancellationToken cancellationToken)
@@ -142,13 +144,31 @@ public sealed class SqlProjectStore(TenantConnectionFactory connectionFactory) :
         var scope = new TenantScope(project.Tenant, project.Id);
         await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken)
             .ConfigureAwait(false);
-        await using var command = new SqlCommand(SaveStatusSql, connection.Connection);
-        command.Parameters.Add(new SqlParameter("@status", SqlDbType.TinyInt) { Value = (byte)project.Status });
-        command.Parameters.Add(new SqlParameter("@updatedAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(project.UpdatedAtUtc) });
-        command.Parameters.Add(new SqlParameter("@projectId", SqlDbType.UniqueIdentifier) { Value = project.Id.Value });
-        command.Parameters.Add(new SqlParameter("@rowVersion", SqlDbType.Binary, 8) { Value = project.RowVersion.ToBytes() });
-        SqlJobFence.Bind(command, fence);
-        await SqlJobFence.ExecuteGuardedAsync(command, ConcurrencyError, "Projeto", cancellationToken).ConfigureAwait(false);
+        // Transação explícita: o lock do cercamento (UPDLOCK/HOLDLOCK) é retido até o commit, bloqueando
+        // o reaper entre a guarda e o efeito; revalida-se o lease com instante fresco antes de confirmar.
+        await using var transaction = (SqlTransaction)await connection.Connection
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using (var command = new SqlCommand(SaveStatusSql, connection.Connection, transaction))
+            {
+                command.Parameters.Add(new SqlParameter("@status", SqlDbType.TinyInt) { Value = (byte)project.Status });
+                command.Parameters.Add(new SqlParameter("@updatedAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(project.UpdatedAtUtc) });
+                command.Parameters.Add(new SqlParameter("@projectId", SqlDbType.UniqueIdentifier) { Value = project.Id.Value });
+                command.Parameters.Add(new SqlParameter("@rowVersion", SqlDbType.Binary, 8) { Value = project.RowVersion.ToBytes() });
+                SqlJobFence.Bind(command, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow));
+                await SqlJobFence.ExecuteGuardedAsync(command, ConcurrencyError, "Projeto", cancellationToken).ConfigureAwait(false);
+            }
+
+            await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow), cancellationToken)
+                .ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            throw;
+        }
     }
 
     /// <inheritdoc />

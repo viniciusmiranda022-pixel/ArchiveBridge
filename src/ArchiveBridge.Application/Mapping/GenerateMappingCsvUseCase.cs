@@ -58,26 +58,35 @@ public sealed class GenerateMappingCsvUseCase(
         var usable = await _mappings.GetUsableAsync(scope, waveId, cancellationToken).ConfigureAwait(false);
         if (usable is { } current && current.Fingerprint == fingerprint)
         {
-            // Reaproveitamento idempotente: devolve o artefato EXATO daquela versão (bytes verificados
-            // contra o SHA-256 da evidência), nunca o documento recém-gerado com evidência antiga.
-            var content = await _artifacts.GetAsync(current.ArtifactPath, cancellationToken).ConfigureAwait(false)
+            // Reaproveitamento idempotente: devolve o artefato EXATO daquela versão (conjunto validado
+            // e bytes conferidos contra o SHA-256 da evidência), nunca o documento recém-gerado.
+            var content = await _artifacts
+                .GetAsync(new MappingArtifactDescriptor(scope, waveId, current.Version), cancellationToken).ConfigureAwait(false)
                 ?? throw new MappingGenerationException(
                     "Versão utilizável sem artefato persistido; evidência inconsistente (fail-closed).");
             var persistedDocument = MappingDocument.FromPersisted(content.Bytes, current.RowCount, current.ContentSha256);
             return new MappingGenerationOutcome(persistedDocument, current, Regenerated: false);
         }
 
-        var persisted = await _mappings.SaveAsync(
-            scope,
-            result,
-            fence,
-            (version, ct) => _artifacts.SaveAsync(
-                new MappingArtifactDescriptor(scope, waveId, version),
-                result.Document.GetBytes(),
-                result.Document.ContentSha256,
-                ct),
-            cancellationToken).ConfigureAwait(false);
+        // Fase 1 (fora da transação): encena o artefato. Fase 2 (dentro da transação curta): publica.
+        var staging = await _artifacts
+            .StageAsync(result.Document.GetBytes(), result.Document.ContentSha256, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var persisted = await _mappings.SaveAsync(
+                scope,
+                result,
+                fence,
+                (version, ct) => _artifacts.PublishAsync(staging, new MappingArtifactDescriptor(scope, waveId, version), ct),
+                cancellationToken).ConfigureAwait(false);
 
-        return new MappingGenerationOutcome(result.Document, persisted, Regenerated: true);
+            return new MappingGenerationOutcome(result.Document, persisted, Regenerated: true);
+        }
+        catch
+        {
+            // Rollback: um staging não publicado (a publicação renomeia o diretório) é descartado.
+            await _artifacts.DiscardAsync(staging, cancellationToken).ConfigureAwait(false);
+            throw;
+        }
     }
 }

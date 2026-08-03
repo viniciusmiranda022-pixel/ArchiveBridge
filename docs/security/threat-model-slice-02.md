@@ -19,8 +19,11 @@ Purview/AzCopy/EV nesta slice).
 > das tabelas de planejamento há conteúdo de e-mail/PST, segredo, SAS ou token. Os
 > metadados sensíveis (caminho de origem, nome de PST, mailbox) são tratados
 > como PII de planejamento: ficam no SQL sob RLS, mas **nunca** aparecem em logs.
-> O único artefato fora do SQL é o **`mapping.csv` imutável** (metadados de
-> planejamento) persistido em filesystem on-premises versionado — sem Azure.
+> O único artefato fora do SQL é o **`mapping.csv` imutável** persistido em
+> filesystem on-premises versionado — sem Azure. **Esse CSV contém dados
+> pessoais/metadados de planejamento** (Mailbox, FilePath e nome de PST): a raiz
+> de artefatos **deve** ter ACL restritiva equivalente ao SQL sob RLS — não é
+> tratada como "sem PII".
 
 ## 1. Ativos críticos da slice
 
@@ -64,6 +67,13 @@ Purview/AzCopy/EV nesta slice).
 | **Liberação indevida de bloqueio** | desbloquear onda >100 GB sem decisão | só decisão **aprovada**, da versão corrente e do archive, libera (Blocked→Validating) atomicamente; append-only | `capacity_assessment_decisions` (append-only); RLS + FK composta |
 | **Estado parcial na validação** | avaliações sem transição (ou vice-versa) em falha | avaliações + transição + `row_version` numa **única transação** (rollback total em falha) | `SaveValidationAsync` transacional; `THROW 50021` em conflito |
 | **Identidade de archive ambígua** | aliases não resolvidos mascaram o volume real | identidade **não resolvida** (só mailbox) **bloqueia** a validação; produção exige `TargetArchiveId` do manifesto | `wave_entries.is_archive_resolved` preserva a resolução |
+| **Reaper corre com o efeito** | lease expira/recupera entre a guarda e a gravação | guarda com `UPDLOCK, HOLDLOCK` **retido até o commit** (bloqueia o UPDATE do reaper) + revalidação com instante fresco antes do commit | lock de linha do Job na `dbo.jobs` mantido na transação do efeito |
+| **Lease expirado persiste efeito** | dono grava com lease vencido (ainda não reaped) | a guarda exige `lease_expires_at_utc > @now`; heartbeat renova durante ops longas, e sua perda impede o efeito | `SqlJobLeaseManager.RenewAsync` (cercado) |
+| **Transição reportada sem aplicar** | reportar Completed/Failed/Retried quando o Job foi cercado | o processador só reporta a transição quando `CompleteAsync`/`FailAsync`/`ScheduleRetryAsync` retorna Applied/replay; senão ⇒ `Fenced` | trilha de idempotência por época/worker |
+| **Comando de tipo incompleto** | enfileirar comando sem os campos exigidos pelo tipo | validação fail-closed por `PlanningCommandKind` na factory, no enqueue e no processamento | `CK_pc_required_by_type` (por `command_type`) |
+| **Publicação parcial do artefato** | queda entre escrever os 3 arquivos deixa versão aparente | publicação como CONJUNTO por rename atômico de diretório (staging → destino); leitura valida os 3 + hash + manifesto (escopo) | — (falha fechada em conjunto incompleto) |
+| **Escape de caminho de artefato** | caminho irmão de prefixo semelhante, rooted ou symlink | contenção robusta (não `StartsWith` ingênuo) + rejeição de reparse points/symlinks | — |
+| **Versão de onda inexistente** | avaliação/decisão declara versão que não existe no escopo | FK composta para `wave_versions` (wave_id, wave_version, tenant, project) | `FK_pa_wave_version`, `FK_cad_wave_version` |
 
 ## 3. Higiene de logs (obrigatória)
 
