@@ -52,8 +52,10 @@ public sealed class SqlProjectStore(TenantConnectionFactory connectionFactory) :
         WHERE project_id = @projectId;
         """;
 
-    private const string SaveStatusSql =
-        """
+    private static readonly string SaveStatusSql =
+        $"""
+        SET NOCOUNT ON;
+        {SqlJobFence.GuardSql}
         UPDATE dbo.migration_projects SET status = @status, updated_at_utc = @updatedAt
         WHERE project_id = @projectId AND row_version = @rowVersion;
         IF @@ROWCOUNT = 0 THROW 50020, 'Projeto alterado concorrentemente (row_version divergente).', 1;
@@ -133,7 +135,8 @@ public sealed class SqlProjectStore(TenantConnectionFactory connectionFactory) :
     }
 
     /// <inheritdoc />
-    public async Task SaveStatusAsync(MigrationProject project, CorrelationId correlation, CancellationToken cancellationToken)
+    public async Task SaveStatusAsync(
+        MigrationProject project, CorrelationId correlation, CancellationToken cancellationToken, JobFence? fence = null)
     {
         ArgumentNullException.ThrowIfNull(project);
         var scope = new TenantScope(project.Tenant, project.Id);
@@ -144,7 +147,8 @@ public sealed class SqlProjectStore(TenantConnectionFactory connectionFactory) :
         command.Parameters.Add(new SqlParameter("@updatedAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(project.UpdatedAtUtc) });
         command.Parameters.Add(new SqlParameter("@projectId", SqlDbType.UniqueIdentifier) { Value = project.Id.Value });
         command.Parameters.Add(new SqlParameter("@rowVersion", SqlDbType.Binary, 8) { Value = project.RowVersion.ToBytes() });
-        await ExecuteConcurrencyGuardedAsync(command, cancellationToken).ConfigureAwait(false);
+        SqlJobFence.Bind(command, fence);
+        await SqlJobFence.ExecuteGuardedAsync(command, ConcurrencyError, "Projeto", cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc />

@@ -19,17 +19,23 @@ public sealed record MappingGenerationOutcome(MappingDocument Document, MappingC
 /// Corpo de execução do comando durável <c>GenerateMappingCsv</c>. Gera o CSV a partir de uma onda
 /// aprovada/congelada (fail-closed: injeção de fórmula, traversal, limite de 500 linhas, code page
 /// fora da política etc. fazem a operação falhar). A versão N+1 é atribuída atomicamente na
-/// persistência, sem sobrescrever a anterior (marcada Superseded). É idempotente em retry: se já há
-/// versão utilizável para a MESMA seleção, não gera outra. O artefato (bytes) é devolvido ao chamador;
-/// o SQL guarda apenas metadados e o sha256.
+/// persistência, sem sobrescrever a anterior (marcada Superseded), e o artefato imutável (mapping.csv
+/// + mapping.sha256 + manifesto) é PUBLICADO no armazenamento de artefatos antes do commit — uma
+/// versão persistida sempre tem artefato. É idempotente pela IMPRESSÃO DIGITAL COMPLETA de geração
+/// (<see cref="MappingGenerationFingerprint"/>): só reaproveita quando TODOS os parâmetros coincidem
+/// (configuração, seleção, pasta de destino, code page, esquema, gerador e política) — ao reaproveitar,
+/// devolve exatamente o artefato e a evidência daquela versão (o mesmo SHA-256), nunca um documento
+/// recém-gerado com evidência antiga.
 /// </summary>
-public sealed class GenerateMappingCsvUseCase(IWaveStore waves, IMappingStore mappings, IClock clock)
+public sealed class GenerateMappingCsvUseCase(
+    IWaveStore waves, IMappingStore mappings, IMappingArtifactStore artifacts, IClock clock)
 {
     private readonly IWaveStore _waves = waves;
     private readonly IMappingStore _mappings = mappings;
+    private readonly IMappingArtifactStore _artifacts = artifacts;
     private readonly IClock _clock = clock;
 
-    /// <summary>Gera (ou reaproveita) a versão do mapping da onda.</summary>
+    /// <summary>Gera (ou reaproveita) a versão do mapping da onda. Quando <paramref name="fence"/> é informado, o efeito é cercado pelo Job.</summary>
     public async Task<MappingGenerationOutcome> ExecuteAsync(
         TenantScope scope,
         WaveId waveId,
@@ -37,7 +43,8 @@ public sealed class GenerateMappingCsvUseCase(IWaveStore waves, IMappingStore ma
         MappingPolicy policy,
         string generatedBy,
         CorrelationId correlation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        JobFence? fence = null)
     {
         ArgumentNullException.ThrowIfNull(policy);
         _ = correlation;
@@ -46,15 +53,31 @@ public sealed class GenerateMappingCsvUseCase(IWaveStore waves, IMappingStore ma
 
         var result = MappingCsvGenerator.Generate(
             wave, contentCodePage, policy, MappingVersion.Initial, generatedBy, _clock.UtcNow);
+        var fingerprint = result.Version.Fingerprint;
 
         var usable = await _mappings.GetUsableAsync(scope, waveId, cancellationToken).ConfigureAwait(false);
-        if (usable is { } current && string.Equals(
-                current.SelectionHash.Value, wave.SelectionHash.Value, StringComparison.Ordinal))
+        if (usable is { } current && current.Fingerprint == fingerprint)
         {
-            return new MappingGenerationOutcome(result.Document, current, Regenerated: false);
+            // Reaproveitamento idempotente: devolve o artefato EXATO daquela versão (bytes verificados
+            // contra o SHA-256 da evidência), nunca o documento recém-gerado com evidência antiga.
+            var content = await _artifacts.GetAsync(current.ArtifactPath, cancellationToken).ConfigureAwait(false)
+                ?? throw new MappingGenerationException(
+                    "Versão utilizável sem artefato persistido; evidência inconsistente (fail-closed).");
+            var persistedDocument = MappingDocument.FromPersisted(content.Bytes, current.RowCount, current.ContentSha256);
+            return new MappingGenerationOutcome(persistedDocument, current, Regenerated: false);
         }
 
-        var persisted = await _mappings.SaveAsync(scope, result, cancellationToken).ConfigureAwait(false);
+        var persisted = await _mappings.SaveAsync(
+            scope,
+            result,
+            fence,
+            (version, ct) => _artifacts.SaveAsync(
+                new MappingArtifactDescriptor(scope, waveId, version),
+                result.Document.GetBytes(),
+                result.Document.ContentSha256,
+                ct),
+            cancellationToken).ConfigureAwait(false);
+
         return new MappingGenerationOutcome(result.Document, persisted, Regenerated: true);
     }
 }

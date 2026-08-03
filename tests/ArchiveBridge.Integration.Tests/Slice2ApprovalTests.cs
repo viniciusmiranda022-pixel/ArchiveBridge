@@ -26,7 +26,7 @@ public sealed class Slice2ApprovalTests(SqlServerFixture fixture)
         await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
         var wave = Slice2Support.NewWave(scope, new WaveSelection([Slice2Support.Entry("a.pst", "u@contoso.com", size)]));
         await Slice2Support.WaveStore(fixture).AddAsync(wave, CorrelationId.New(), CancellationToken.None);
-        await new ValidateWaveUseCase(Slice2Support.WaveStore(fixture), Slice2Support.PlanningStore(fixture), Clock())
+        await Slice2Support.ValidateWave(fixture, Clock())
             .ExecuteAsync(scope, wave.Id, CorrelationId.New(), CancellationToken.None);
         return (scope, wave.Id);
     }

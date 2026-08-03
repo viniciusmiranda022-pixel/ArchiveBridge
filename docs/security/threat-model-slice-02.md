@@ -15,10 +15,12 @@ Purview/AzCopy/EV nesta slice).
   Segurança/DPO.
 
 > [!NOTE]
-> A slice persiste **apenas metadados de planejamento e governança**. Não há, em
-> nenhuma das 9 tabelas, conteúdo de e-mail/PST, segredo, SAS ou token. Os
+> A slice persiste **apenas metadados de planejamento e governança**. Em nenhuma
+> das tabelas de planejamento há conteúdo de e-mail/PST, segredo, SAS ou token. Os
 > metadados sensíveis (caminho de origem, nome de PST, mailbox) são tratados
 > como PII de planejamento: ficam no SQL sob RLS, mas **nunca** aparecem em logs.
+> O único artefato fora do SQL é o **`mapping.csv` imutável** (metadados de
+> planejamento) persistido em filesystem on-premises versionado — sem Azure.
 
 ## 1. Ativos críticos da slice
 
@@ -28,7 +30,12 @@ Purview/AzCopy/EV nesta slice).
 - Pasta de destino (`TargetRootFolder`) aprovada e congelada.
 - Evidência de capacidade (`planning_assessments`) e de aprovação (`approvals`).
 - **CSV de mapping** e sua evidência versionada (`mapping.sha256`,
-  `mapping_csv_versions`, `mapping_csv_rows`).
+  `mapping_csv_versions`, `mapping_csv_rows`) e o **artefato imutável** publicado
+  em filesystem (`mapping.csv` + `mapping.sha256` + manifesto, por versão).
+- **Contexto versionado do comando durável** (`planning_commands`): vincula cada
+  operação à versão/estado que a originou.
+- **Decisões de avaliação Microsoft** (`capacity_assessment_decisions`): liberam,
+  de forma auditável e append-only, ondas bloqueadas por capacidade.
 
 ## 2. Ameaças e mitigações (delta STRIDE)
 
@@ -48,7 +55,15 @@ Purview/AzCopy/EV nesta slice).
 | **Exposição de UPN/PII em log** | logar lista de mailboxes/paths/nomes de PST | mensagens de validação e razões usam **índices e contagens**, nunca valores | — (ver §3) |
 | **Uso de versão obsoleta** | consumir CSV de versão substituída | geração marca a anterior como `Superseded`; só uma utilizável | `UX_mcv_single_usable` (índice único filtrado `status=0`) |
 | **Config aprovada alterada em silêncio** | mudar destino após aprovação | domínio bloqueia `UpdateConfiguration` fora de Draft/ReadyForAssessment/Blocked | gatilho `TR_migration_projects_freeze_config` |
-| **Bypass do limite de 100 GiB** | dividir artificialmente as entradas | `CapacityPlanner` agrupa por archive (mailbox); a soma é por archive | — |
+| **Bypass do limite de 100 GB** | dividir artificialmente as entradas | `CapacityPlanner` agrupa por **identidade canônica** (`TargetArchiveId`); soma por archive com `checked` (falha em overflow) | — |
+| **Comando durável obsoleto** | executar comando criado para v1 depois que a seleção virou v2 | contexto do comando é **vinculado à versão** (schema/config/seleção/destino); worker compara e recusa (`STALE_COMMAND_CONTEXT`) | `planning_commands.expected_*`; grants append-only |
+| **Job de controle sequestrado** | worker reivindica Job de controle sem contexto de planejamento | claim **exclusivo**: só Jobs com linha em `planning_commands` (EXISTS atômico com o carregamento do contexto); Job sem contexto não vira Processing | claim SQL com `EXISTS`; FK composta `planning_commands → jobs` |
+| **Efeito de dono defasado** | worker A perde o lease, B reivindica, A grava | efeitos **cercados** pelo mesmo fencing do Job (época/dono/Processing) na MESMA transação; `Completed` só quando aplicado | guarda `50030`; `owner_worker`+`lease_epoch` conferidos no UPDATE/INSERT |
+| **Documento novo com evidência antiga** | mesma seleção, code page diferente reaproveita versão | idempotência pela **impressão digital completa** (`MappingGenerationFingerprint`); reaproveitar devolve o artefato/hash daquela versão | `generation_fingerprint` gravado por versão |
+| **Mapping concluído sem artefato** | Job `Completed` mas o `mapping.csv` não existe | artefato **publicado antes do commit** (temp→flush→rename atômico); versão persistida sempre tem artefato | `artifact_path`/`artifact_size_bytes` na versão |
+| **Liberação indevida de bloqueio** | desbloquear onda >100 GB sem decisão | só decisão **aprovada**, da versão corrente e do archive, libera (Blocked→Validating) atomicamente; append-only | `capacity_assessment_decisions` (append-only); RLS + FK composta |
+| **Estado parcial na validação** | avaliações sem transição (ou vice-versa) em falha | avaliações + transição + `row_version` numa **única transação** (rollback total em falha) | `SaveValidationAsync` transacional; `THROW 50021` em conflito |
+| **Identidade de archive ambígua** | aliases não resolvidos mascaram o volume real | identidade **não resolvida** (só mailbox) **bloqueia** a validação; produção exige `TargetArchiveId` do manifesto | `wave_entries.is_archive_resolved` preserva a resolução |
 
 ## 3. Higiene de logs (obrigatória)
 

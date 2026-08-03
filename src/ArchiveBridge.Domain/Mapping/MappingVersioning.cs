@@ -52,7 +52,9 @@ public sealed record MappingCsvVersion(
     MappingValidationOutcome Validation,
     string GeneratedBy,
     DateTimeOffset CreatedAtUtc,
-    MappingVersionStatus Status)
+    MappingVersionStatus Status,
+    MappingGenerationFingerprint Fingerprint,
+    string ArtifactPath)
 {
     /// <summary>Marca esta versão como substituída (preservada como evidência, não utilizável).</summary>
     public MappingCsvVersion Supersede() =>

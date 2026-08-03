@@ -10,6 +10,12 @@ namespace ArchiveBridge.Domain.Mapping;
 /// </summary>
 public static class MappingCsvGenerator
 {
+    /// <summary>
+    /// Versão do gerador. Faz parte do <see cref="MappingGenerationFingerprint"/>: uma mudança na
+    /// lógica de geração invalida a idempotência de versões produzidas pela lógica anterior.
+    /// </summary>
+    public const int GeneratorVersion = 1;
+
     /// <summary>Gera o documento CSV e a evidência de versão para a onda aprovada.</summary>
     public static MappingGenerationResult Generate(
         MigrationWave wave,
@@ -52,6 +58,14 @@ public static class MappingCsvGenerator
 
         var content = MappingCsvSerializer.Serialize(rows);
         var document = new MappingDocument(content, rows.Count);
+        var fingerprint = MappingGenerationFingerprint.Compute(
+            wave.ConfigurationHash,
+            wave.SelectionHash,
+            wave.TargetRootFolder,
+            contentCodePage,
+            MappingSchema.Version,
+            GeneratorVersion,
+            policy.Version);
         var evidence = new MappingCsvVersion(
             version,
             wave.Project,
@@ -63,7 +77,9 @@ public static class MappingCsvGenerator
             MappingValidationOutcome.Passed,
             author,
             now,
-            MappingVersionStatus.Usable);
+            MappingVersionStatus.Usable,
+            fingerprint,
+            ArtifactPath: string.Empty);
 
         return new MappingGenerationResult(document, evidence, rows);
     }

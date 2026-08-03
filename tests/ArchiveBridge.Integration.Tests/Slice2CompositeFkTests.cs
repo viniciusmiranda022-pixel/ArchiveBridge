@@ -39,7 +39,7 @@ public sealed class Slice2CompositeFkTests(SqlServerFixture fixture)
         await waveStore.AddAsync(wave, CorrelationId.New(), CancellationToken.None);
         await waveStore.SaveStatusAsync(wave, CorrelationId.New(), CancellationToken.None);
         var result = MappingCsvGenerator.Generate(wave, CodePage, MappingPolicy.Default, MappingVersion.Initial, "do", Slice2Support.Now);
-        await Slice2Support.MappingStore(fixture).SaveAsync(scope, result, CancellationToken.None);
+        await Slice2Support.SaveMapping(fixture, scope, result, CancellationToken.None);
         return (scope, wave.Id);
     }
 

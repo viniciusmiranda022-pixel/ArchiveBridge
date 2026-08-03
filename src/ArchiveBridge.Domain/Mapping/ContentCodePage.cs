@@ -37,10 +37,15 @@ public sealed class MappingPolicy
 {
     private readonly HashSet<int> allowedContentCodePages;
 
-    /// <summary>Cria a política com os code pages aceitos e o padrão (que deve estar na lista).</summary>
-    public MappingPolicy(IEnumerable<int> allowedContentCodePages, ContentCodePage defaultContentCodePage)
+    /// <summary>Cria a política com os code pages aceitos, o padrão (que deve estar na lista) e a versão.</summary>
+    public MappingPolicy(IEnumerable<int> allowedContentCodePages, ContentCodePage defaultContentCodePage, int version = 1)
     {
         ArgumentNullException.ThrowIfNull(allowedContentCodePages);
+        if (version < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(version), version, "A versão da política deve ser >= 1.");
+        }
+
         this.allowedContentCodePages = [.. allowedContentCodePages];
         if (this.allowedContentCodePages.Count == 0)
         {
@@ -55,7 +60,15 @@ public sealed class MappingPolicy
         }
 
         DefaultContentCodePage = defaultContentCodePage;
+        Version = version;
     }
+
+    /// <summary>
+    /// Versão da política. Faz parte do <see cref="MappingGenerationFingerprint"/>: alterar a política
+    /// (ex.: ampliar os code pages aceitos) exige uma nova versão, invalidando a idempotência de
+    /// versões geradas sob a política anterior.
+    /// </summary>
+    public int Version { get; }
 
     /// <summary>Code page padrão quando nenhum é especificado.</summary>
     public ContentCodePage DefaultContentCodePage { get; }

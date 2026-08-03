@@ -44,3 +44,35 @@ public sealed class PlanningValidationException : Exception
     {
     }
 }
+
+/// <summary>
+/// Lançada quando um comando durável está OBSOLETO em relação ao estado corrente: a versão/estado que
+/// o originou (schema do comando, versão/hash de configuração do projeto, versão/hash de seleção da
+/// onda, pasta de destino ou versões de esquema/gerador/política do mapping) não coincide mais com o
+/// agregado carregado — por exemplo, a seleção avançou para uma versão posterior. Fail-closed: o
+/// comando NUNCA é executado silenciosamente contra uma versão diferente; falha terminalmente com o
+/// código <see cref="Code"/>.
+/// </summary>
+public sealed class StaleCommandContextException : Exception
+{
+    /// <summary>Código estável do erro (para diagnóstico/telemetria), sem PII.</summary>
+    public const string Code = "STALE_COMMAND_CONTEXT";
+
+    /// <summary>Cria a exceção sem mensagem.</summary>
+    public StaleCommandContextException()
+        : base(Code)
+    {
+    }
+
+    /// <summary>Cria a exceção com detalhe (prefixado pelo código).</summary>
+    public StaleCommandContextException(string message)
+        : base($"{Code}: {message}")
+    {
+    }
+
+    /// <summary>Cria a exceção com detalhe e causa.</summary>
+    public StaleCommandContextException(string message, Exception innerException)
+        : base($"{Code}: {message}", innerException)
+    {
+    }
+}

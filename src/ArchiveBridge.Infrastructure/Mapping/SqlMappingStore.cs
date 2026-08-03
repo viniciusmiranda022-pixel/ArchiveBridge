@@ -11,10 +11,12 @@ using Microsoft.Data.SqlClient;
 namespace ArchiveBridge.Infrastructure.Mapping;
 
 /// <summary>
-/// Persistência das versões de mapping e da evidência (linhas + sha256). Uma nova geração nunca
-/// sobrescreve: dentro de uma transação, marca a versão utilizável anterior como Superseded e insere
-/// a nova como utilizável; o índice único filtrado impõe no máximo uma utilizável por onda. A role
-/// da aplicação só pode atualizar a coluna <c>status</c> (hashes imutáveis). RLS por SESSION_CONTEXT.
+/// Persistência das versões de mapping e da evidência (linhas + sha256 + impressão digital + caminho
+/// do artefato). Uma nova geração nunca sobrescreve: dentro de uma transação (opcionalmente cercada
+/// pelo Job), calcula N+1 sob lock, marca a versão utilizável anterior como Superseded, PUBLICA o
+/// artefato imutável para a versão atribuída (antes do commit) e insere a nova versão como utilizável;
+/// o índice único filtrado impõe no máximo uma utilizável por onda. A role da aplicação só pode
+/// atualizar a coluna <c>status</c> (hashes/fingerprint/artefato imutáveis). RLS por SESSION_CONTEXT.
 /// </summary>
 public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) : IMappingStore
 {
@@ -33,7 +35,7 @@ public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) :
     private const string GetUsableSql =
         """
         SELECT wave_id, mapping_version, project_id, configuration_hash, selection_hash, content_sha256,
-               row_count, validation_result, generated_by, created_at_utc, status
+               row_count, validation_result, generated_by, created_at_utc, status, generation_fingerprint, artifact_path
         FROM dbo.mapping_csv_versions
         WHERE wave_id = @waveId AND project_id = @project AND status = 0;
         """;
@@ -42,10 +44,11 @@ public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) :
         """
         INSERT INTO dbo.mapping_csv_versions
             (wave_id, mapping_version, tenant_id, project_id, configuration_hash, selection_hash,
-             content_sha256, row_count, validation_result, generated_by, created_at_utc, status)
+             content_sha256, row_count, validation_result, generated_by, created_at_utc, status,
+             generation_fingerprint, artifact_path, artifact_size_bytes)
         VALUES
             (@waveId, @version, @tenant, @project, @cfgHash, @selHash, @contentHash, @rowCount,
-             @validation, @generatedBy, @createdAt, @status);
+             @validation, @generatedBy, @createdAt, @status, @fingerprint, @artifactPath, @artifactSize);
         """;
 
     private const string InsertRowSql =
@@ -57,6 +60,8 @@ public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) :
             (@waveId, @version, @tenant, @project, @rowNumber, @workload, @filePath, @name,
              @mailbox, @isArchive, @target, @codePage);
         """;
+
+    private static readonly string FenceGuardSql = $"SET NOCOUNT ON;\n{SqlJobFence.GuardSql}";
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
 
@@ -98,14 +103,21 @@ public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) :
             (MappingValidationOutcome)reader.GetByte(7),
             reader.GetString(8),
             SqlJobMapping.ReadUtc(reader.GetDateTime(9)),
-            (MappingVersionStatus)reader.GetByte(10));
+            (MappingVersionStatus)reader.GetByte(10),
+            new MappingGenerationFingerprint(new Sha256Hash(reader.GetString(11).TrimEnd())),
+            reader.GetString(12));
     }
 
     /// <inheritdoc />
     public async Task<MappingCsvVersion> SaveAsync(
-        TenantScope scope, MappingGenerationResult result, CancellationToken cancellationToken)
+        TenantScope scope,
+        MappingGenerationResult result,
+        JobFence? fence,
+        Func<MappingVersion, CancellationToken, Task<MappingArtifactReference>> publishArtifactAsync,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(result);
+        ArgumentNullException.ThrowIfNull(publishArtifactAsync);
         var source = result.Version;
         await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken)
             .ConfigureAwait(false);
@@ -113,6 +125,14 @@ public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) :
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            // Cercamento do Job (inerte quando não durável): valida na MESMA transação que o efeito é
+            // do dono corrente antes de qualquer gravação.
+            await using (var guard = new SqlCommand(FenceGuardSql, connection.Connection, transaction))
+            {
+                SqlJobFence.Bind(guard, fence);
+                await SqlJobFence.ExecuteGuardedAsync(guard, concurrencyError: -1, "Mapping", cancellationToken).ConfigureAwait(false);
+            }
+
             int nextVersion;
             await using (var command = new SqlCommand(LockedMaxVersionSql, connection.Connection, transaction))
             {
@@ -122,7 +142,13 @@ public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) :
                 nextVersion = (scalar is int value ? value : 0) + 1;
             }
 
-            var persisted = source with { Version = new MappingVersion(nextVersion) };
+            var mappingVersion = new MappingVersion(nextVersion);
+
+            // Publica o artefato IMUTÁVEL da versão atribuída ANTES do commit: uma versão persistida
+            // sempre tem artefato. Falha aqui aborta a transação (nenhuma versão sem artefato).
+            var artifact = await publishArtifactAsync(mappingVersion, cancellationToken).ConfigureAwait(false);
+
+            var persisted = source with { Version = mappingVersion, ArtifactPath = artifact.LogicalPath };
 
             await using (var command = new SqlCommand(SupersedeSql, connection.Connection, transaction))
             {
@@ -145,6 +171,9 @@ public sealed class SqlMappingStore(TenantConnectionFactory connectionFactory) :
                 command.Parameters.Add(new SqlParameter("@generatedBy", SqlDbType.NVarChar, 200) { Value = persisted.GeneratedBy });
                 command.Parameters.Add(new SqlParameter("@createdAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(persisted.CreatedAtUtc) });
                 command.Parameters.Add(new SqlParameter("@status", SqlDbType.TinyInt) { Value = (byte)persisted.Status });
+                command.Parameters.Add(new SqlParameter("@fingerprint", SqlDbType.Char, 64) { Value = persisted.Fingerprint.Value.Value });
+                command.Parameters.Add(new SqlParameter("@artifactPath", SqlDbType.NVarChar, 400) { Value = artifact.LogicalPath });
+                command.Parameters.Add(new SqlParameter("@artifactSize", SqlDbType.BigInt) { Value = artifact.SizeBytes });
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 

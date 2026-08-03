@@ -4,6 +4,7 @@ using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Waves;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.IdentityAndAccess;
+using ArchiveBridge.Domain.Planning;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Domain.Waves;
 using ArchiveBridge.Infrastructure.Approvals;
@@ -46,9 +47,21 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
     private const string InsertEntrySql =
         """
         INSERT INTO dbo.wave_entries
-            (wave_id, tenant_id, project_id, wave_version, file_path, pst_name, mailbox, target_archive_id, size_bytes, item_count)
+            (wave_id, tenant_id, project_id, wave_version, file_path, pst_name, mailbox, target_archive_id,
+             is_archive_resolved, size_bytes, item_count)
         VALUES
-            (@waveId, @tenant, @project, @version, @filePath, @pstName, @mailbox, @archiveId, @sizeBytes, @itemCount);
+            (@waveId, @tenant, @project, @version, @filePath, @pstName, @mailbox, @archiveId,
+             @resolved, @sizeBytes, @itemCount);
+        """;
+
+    private const string InsertAssessmentSql =
+        """
+        INSERT INTO dbo.planning_assessments
+            (tenant_id, project_id, wave_id, wave_version, target_archive_id, total_bytes, rule_code,
+             result, reason, correlation_id, assessed_at_utc, released_by)
+        VALUES
+            (@tenant, @project, @waveId, @version, @archiveId, @totalBytes, @ruleCode,
+             @result, @reason, @correlation, @assessedAt, @releasedBy);
         """;
 
     private const string GetWaveSql =
@@ -61,14 +74,16 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
 
     private const string GetEntriesSql =
         """
-        SELECT file_path, pst_name, mailbox, target_archive_id, size_bytes, item_count
+        SELECT file_path, pst_name, mailbox, target_archive_id, is_archive_resolved, size_bytes, item_count
         FROM dbo.wave_entries
         WHERE wave_id = @waveId AND wave_version = @version
         ORDER BY entry_id;
         """;
 
-    private const string SaveStatusSql =
-        """
+    private static readonly string SaveStatusSql =
+        $"""
+        SET NOCOUNT ON;
+        {SqlJobFence.GuardSql}
         UPDATE dbo.migration_waves
         SET status = @status, approved_at_utc = @approvedAt, approved_by = @approvedBy
         WHERE wave_id = @waveId AND project_id = @project AND row_version = @rowVersion;
@@ -168,9 +183,9 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
                 entries.Add(new WaveEntry(
                     reader.GetString(0),
                     reader.GetString(1),
-                    new ArchiveRef(reader.GetString(2), new TargetArchiveId(reader.GetString(3))),
-                    reader.GetInt64(4),
-                    reader.GetInt64(5)));
+                    ArchiveRef.Rehydrate(reader.GetString(2), new TargetArchiveId(reader.GetString(3)), reader.GetBoolean(4)),
+                    reader.GetInt64(5),
+                    reader.GetInt64(6)));
             }
         }
 
@@ -191,13 +206,73 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
     }
 
     /// <inheritdoc />
-    public async Task SaveStatusAsync(MigrationWave wave, CorrelationId correlation, CancellationToken cancellationToken)
+    public async Task SaveStatusAsync(
+        MigrationWave wave, CorrelationId correlation, CancellationToken cancellationToken, JobFence? fence = null)
     {
         ArgumentNullException.ThrowIfNull(wave);
         var scope = new TenantScope(wave.Tenant, wave.Project);
         await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken)
             .ConfigureAwait(false);
         await using var command = new SqlCommand(SaveStatusSql, connection.Connection);
+        BindStatus(command, wave, fence);
+        await SqlJobFence.ExecuteGuardedAsync(command, ConcurrencyError, "Onda", cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task SaveValidationAsync(
+        MigrationWave wave,
+        IReadOnlyList<PlanningAssessment> assessments,
+        CorrelationId correlation,
+        CancellationToken cancellationToken,
+        JobFence? fence = null)
+    {
+        ArgumentNullException.ThrowIfNull(wave);
+        ArgumentNullException.ThrowIfNull(assessments);
+        var scope = new TenantScope(wave.Tenant, wave.Project);
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken)
+            .ConfigureAwait(false);
+        await using var transaction = (SqlTransaction)await connection.Connection
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // Transição de estado (cercada + concorrência otimista) e avaliações na MESMA transação:
+            // uma falha rola tudo para trás (sem avaliações órfãs nem transição sem evidência).
+            await using (var command = new SqlCommand(SaveStatusSql, connection.Connection, transaction))
+            {
+                BindStatus(command, wave, fence);
+                await SqlJobFence.ExecuteGuardedAsync(command, ConcurrencyError, "Onda", cancellationToken).ConfigureAwait(false);
+            }
+
+            foreach (var assessment in assessments)
+            {
+                await using var command = new SqlCommand(InsertAssessmentSql, connection.Connection, transaction);
+                command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = wave.Tenant.Value });
+                command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = wave.Project.Value });
+                command.Parameters.Add(new SqlParameter("@waveId", SqlDbType.UniqueIdentifier) { Value = wave.Id.Value });
+                command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = wave.Version.Value });
+                command.Parameters.Add(new SqlParameter("@archiveId", SqlDbType.NVarChar, 320) { Value = assessment.Archive.Value });
+                command.Parameters.Add(new SqlParameter("@totalBytes", SqlDbType.BigInt) { Value = assessment.TotalBytes });
+                command.Parameters.Add(new SqlParameter("@ruleCode", SqlDbType.NVarChar, 64) { Value = assessment.RuleCode });
+                command.Parameters.Add(new SqlParameter("@result", SqlDbType.TinyInt) { Value = (byte)assessment.Result });
+                command.Parameters.Add(new SqlParameter("@reason", SqlDbType.NVarChar, 400) { Value = assessment.Reason });
+                command.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = assessment.Correlation.Value });
+                command.Parameters.Add(new SqlParameter("@assessedAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(assessment.AssessedAtUtc) });
+                command.Parameters.Add(new SqlParameter("@releasedBy", SqlDbType.NVarChar, 200)
+                { Value = (object?)assessment.ReleasedBy ?? DBNull.Value });
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private static void BindStatus(SqlCommand command, MigrationWave wave, JobFence? fence)
+    {
         command.Parameters.Add(new SqlParameter("@status", SqlDbType.TinyInt) { Value = (byte)wave.Status });
         command.Parameters.Add(new SqlParameter("@approvedAt", SqlDbType.DateTime2)
         { Value = wave.ApprovedAtUtc is { } at ? SqlJobMapping.ToDbUtc(at) : DBNull.Value });
@@ -206,7 +281,7 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
         command.Parameters.Add(new SqlParameter("@waveId", SqlDbType.UniqueIdentifier) { Value = wave.Id.Value });
         command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = wave.Project.Value });
         command.Parameters.Add(new SqlParameter("@rowVersion", SqlDbType.Binary, 8) { Value = wave.RowVersion.ToBytes() });
-        await ExecuteConcurrencyGuardedAsync(command, cancellationToken).ConfigureAwait(false);
+        SqlJobFence.Bind(command, fence);
     }
 
     /// <inheritdoc />
@@ -324,6 +399,7 @@ public sealed class SqlWaveStore(TenantConnectionFactory connectionFactory) : IW
             command.Parameters.Add(new SqlParameter("@pstName", SqlDbType.NVarChar, 260) { Value = entry.PstName });
             command.Parameters.Add(new SqlParameter("@mailbox", SqlDbType.NVarChar, 320) { Value = entry.Archive.Mailbox });
             command.Parameters.Add(new SqlParameter("@archiveId", SqlDbType.NVarChar, 320) { Value = entry.Archive.Identity.Value });
+            command.Parameters.Add(new SqlParameter("@resolved", SqlDbType.Bit) { Value = entry.Archive.IsIdentityResolved });
             command.Parameters.Add(new SqlParameter("@sizeBytes", SqlDbType.BigInt) { Value = entry.SizeBytes });
             command.Parameters.Add(new SqlParameter("@itemCount", SqlDbType.BigInt) { Value = entry.ItemCount });
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);

@@ -23,6 +23,32 @@ public sealed class MappingDocument
         ContentSha256 = DeterministicHash.ComputeBytes(contentBytes);
     }
 
+    private MappingDocument(byte[] bytes, int rowCount, Sha256Hash contentSha256)
+    {
+        contentBytes = bytes;
+        RowCount = rowCount;
+        ContentSha256 = contentSha256;
+        Content = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetString(bytes);
+    }
+
+    /// <summary>
+    /// Reconstrói o documento a partir dos bytes persistidos no armazenamento imutável de artefatos,
+    /// verificando que o SHA-256 recalculado coincide com a evidência esperada (fail-closed): assim o
+    /// reaproveitamento idempotente NUNCA devolve um documento cujo hash difere da evidência gravada.
+    /// </summary>
+    public static MappingDocument FromPersisted(ReadOnlyMemory<byte> bytes, int rowCount, Sha256Hash expectedSha256)
+    {
+        var copy = bytes.ToArray();
+        var actual = DeterministicHash.ComputeBytes(copy);
+        if (!string.Equals(actual.Value, expectedSha256.Value, StringComparison.Ordinal))
+        {
+            throw new MappingGenerationException(
+                "O artefato persistido diverge do SHA-256 da evidência (integridade violada); recusado.");
+        }
+
+        return new MappingDocument(copy, rowCount, expectedSha256);
+    }
+
     /// <summary>Texto integral do CSV (cabeçalho + linhas, terminadores CRLF).</summary>
     public string Content { get; }
 

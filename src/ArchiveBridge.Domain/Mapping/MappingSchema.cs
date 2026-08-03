@@ -7,6 +7,13 @@ namespace ArchiveBridge.Domain.Mapping;
 /// </summary>
 public static class MappingSchema
 {
+    /// <summary>
+    /// Versão do esquema do CSV (as 10 colunas, ordem e invariantes). Faz parte do
+    /// <see cref="MappingGenerationFingerprint"/>: uma mudança de esquema invalida a idempotência de
+    /// versões geradas com o esquema anterior.
+    /// </summary>
+    public const int Version = 1;
+
     /// <summary>Número exato de colunas do mapping.</summary>
     public const int ColumnCount = 10;
 

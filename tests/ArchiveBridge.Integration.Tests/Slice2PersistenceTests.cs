@@ -83,9 +83,9 @@ public sealed class Slice2PersistenceTests(SqlServerFixture fixture)
         Assert.Equal(0, await mappingStore.GetMaxVersionAsync(scope, wave.Id, CancellationToken.None));
 
         var v1 = MappingCsvGenerator.Generate(wave, CodePage, MappingPolicy.Default, MappingVersion.Initial, "do", Slice2Support.Now);
-        await mappingStore.SaveAsync(scope, v1, CancellationToken.None);
+        await Slice2Support.SaveMapping(fixture, scope, v1, CancellationToken.None);
         var v2 = MappingCsvGenerator.Generate(wave, CodePage, MappingPolicy.Default, new MappingVersion(1).Next(), "do", Slice2Support.Now);
-        await mappingStore.SaveAsync(scope, v2, CancellationToken.None);
+        await Slice2Support.SaveMapping(fixture, scope, v2, CancellationToken.None);
 
         Assert.Equal(2, await mappingStore.GetMaxVersionAsync(scope, wave.Id, CancellationToken.None));
 

@@ -107,12 +107,11 @@ public sealed class Slice2ConcurrencyTests(SqlServerFixture fixture)
     {
         var (scope, waveId) = await SeedWaveAsync(approved: true);
         var wave = await Slice2Support.WaveStore(fixture).GetAsync(scope, waveId, CancellationToken.None);
-        var store = Slice2Support.MappingStore(fixture);
 
         async Task<int> GenerateAsync()
         {
             var result = MappingCsvGenerator.Generate(wave!, CodePage, MappingPolicy.Default, MappingVersion.Initial, "do", Slice2Support.Now);
-            var persisted = await store.SaveAsync(scope, result, CancellationToken.None);
+            var persisted = await Slice2Support.SaveMapping(fixture, scope, result, CancellationToken.None);
             return persisted.Version.Value;
         }
 

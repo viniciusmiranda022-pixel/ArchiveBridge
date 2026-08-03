@@ -14,8 +14,7 @@ public sealed class Slice2CapacityUseCaseTests(SqlServerFixture fixture)
 {
     private const long Limit = CapacityRule.OneHundredGigabytesInBytes;
 
-    private ValidateWaveUseCase UseCase(MutableClock clock) =>
-        new(Slice2Support.WaveStore(fixture), Slice2Support.PlanningStore(fixture), clock);
+    private ValidateWaveUseCase UseCase(MutableClock clock) => Slice2Support.ValidateWave(fixture, clock);
 
     private async Task<(TenantScope Scope, WaveId WaveId)> SeedWaveAsync(WaveSelection selection)
     {

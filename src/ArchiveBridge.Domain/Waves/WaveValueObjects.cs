@@ -31,30 +31,58 @@ public readonly record struct WaveName
 /// <see cref="Mailbox"/> de exibição (metadado usado na coluna <c>Mailbox</c> do CSV, com a caixa
 /// preservada). Dividir artificialmente a mesma onda não contorna a regra, pois a soma é por
 /// <see cref="Identity"/>.
+/// <para>
+/// A <see cref="IsIdentityResolved"/> distingue uma identidade RESOLVIDA (fornecida explicitamente por
+/// um manifesto autorizado / resolvedor de diretório, que unifica aliases) de uma NÃO RESOLVIDA
+/// (derivada apenas da mailbox, sem prova de que aliases foram unificados). Enquanto não houver um
+/// resolvedor de diretório real, o fluxo de produção deve exigir identidade resolvida; uma entrada não
+/// resolvida bloqueia a validação da onda (fail-closed).
+/// </para>
 /// </summary>
 public readonly record struct ArchiveRef
 {
     private const int MaxLength = 320;
 
-    /// <summary>Cria uma referência derivando a identidade canônica da própria mailbox (só caixa).</summary>
+    /// <summary>
+    /// Cria uma referência derivando a identidade canônica da própria mailbox, marcada como NÃO
+    /// resolvida — aliases não foram unificados por um resolvedor autorizado. Uma entrada não resolvida
+    /// bloqueia a validação da onda; use o construtor com <see cref="TargetArchiveId"/> explícito no
+    /// fluxo de produção.
+    /// </summary>
     public ArchiveRef(string mailbox)
     {
         Mailbox = Normalize(mailbox);
         Identity = TargetArchiveId.FromMailbox(Mailbox);
+        IsIdentityResolved = false;
     }
 
-    /// <summary>Cria uma referência com a identidade canônica resolvida explicitamente (unifica aliases).</summary>
+    /// <summary>
+    /// Cria uma referência com a identidade canônica resolvida explicitamente (unifica aliases),
+    /// proveniente de um manifesto autorizado / resolvedor de diretório. Marcada como resolvida.
+    /// </summary>
     public ArchiveRef(string mailbox, TargetArchiveId identity)
     {
         Mailbox = Normalize(mailbox);
         Identity = identity;
+        IsIdentityResolved = true;
     }
+
+    /// <summary>Reidrata a referência a partir do estado persistido, preservando a resolução original.</summary>
+    public static ArchiveRef Rehydrate(string mailbox, TargetArchiveId identity, bool isIdentityResolved) =>
+        isIdentityResolved ? new ArchiveRef(mailbox, identity) : new ArchiveRef(mailbox);
 
     /// <summary>Mailbox de exibição (preserva a caixa; usada na coluna Mailbox do CSV).</summary>
     public string Mailbox { get; }
 
     /// <summary>Identidade canônica do archive (chave de agrupamento de capacidade).</summary>
     public TargetArchiveId Identity { get; }
+
+    /// <summary>
+    /// Verdadeiro quando a identidade foi resolvida explicitamente por um manifesto/resolvedor
+    /// autorizado (aliases unificados); falso quando apenas derivada da mailbox (não confiável para
+    /// unificar aliases). Não resolvida ⇒ a validação da onda é bloqueada.
+    /// </summary>
+    public bool IsIdentityResolved { get; }
 
     private static string Normalize(string mailbox)
     {

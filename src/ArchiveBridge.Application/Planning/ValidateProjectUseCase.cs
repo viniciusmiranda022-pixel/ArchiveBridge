@@ -21,9 +21,9 @@ public sealed class ValidateProjectUseCase(IProjectStore projects, IClock clock)
     private readonly IProjectStore _projects = projects;
     private readonly IClock _clock = clock;
 
-    /// <summary>Executa a validação do projeto do escopo.</summary>
+    /// <summary>Executa a validação do projeto do escopo. Quando <paramref name="fence"/> é informado, o efeito é cercado pelo Job.</summary>
     public async Task<ProjectValidationResult> ExecuteAsync(
-        TenantScope scope, CorrelationId correlation, CancellationToken cancellationToken)
+        TenantScope scope, CorrelationId correlation, CancellationToken cancellationToken, JobFence? fence = null)
     {
         var project = await _projects.GetAsync(scope, cancellationToken).ConfigureAwait(false)
             ?? throw new PlanningNotFoundException("Projeto não encontrado no escopo.");
@@ -39,7 +39,7 @@ public sealed class ValidateProjectUseCase(IProjectStore projects, IClock clock)
         if (project.Status == ProjectStatus.Draft)
         {
             project.SubmitForAssessment(_clock.UtcNow);
-            await _projects.SaveStatusAsync(project, correlation, cancellationToken).ConfigureAwait(false);
+            await _projects.SaveStatusAsync(project, correlation, cancellationToken, fence).ConfigureAwait(false);
         }
 
         return new ProjectValidationResult(project.Status);

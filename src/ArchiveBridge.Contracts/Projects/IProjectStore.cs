@@ -19,8 +19,13 @@ public interface IProjectStore
     /// <summary>Lê o projeto do escopo; <see langword="null"/> se inexistente/de outro tenant.</summary>
     Task<MigrationProject?> GetAsync(TenantScope scope, CancellationToken cancellationToken);
 
-    /// <summary>Persiste apenas a transição de estado (status + updated_at). Não toca na configuração.</summary>
-    Task SaveStatusAsync(MigrationProject project, CorrelationId correlation, CancellationToken cancellationToken);
+    /// <summary>
+    /// Persiste apenas a transição de estado (status + updated_at) com concorrência otimista por
+    /// <c>row_version</c>. Não toca na configuração. Quando <paramref name="fence"/> é informado
+    /// (execução durável), valida o cercamento do Job na MESMA transação — um dono defasado não persiste.
+    /// </summary>
+    Task SaveStatusAsync(
+        MigrationProject project, CorrelationId correlation, CancellationToken cancellationToken, JobFence? fence = null);
 
     /// <summary>
     /// Persiste uma nova versão de configuração: atualiza o agregado e insere a linha imutável de

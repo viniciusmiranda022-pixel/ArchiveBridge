@@ -23,11 +23,19 @@ public interface IMappingStore
     Task<MappingCsvVersion?> GetUsableAsync(TenantScope scope, WaveId waveId, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Persiste atomicamente a nova versão: dentro da transação, calcula o próximo número de versão
-    /// (N+1) sob lock (sequência atômica, sem TOCTOU), substitui a versão utilizável anterior
-    /// (Superseded) e grava a nova versão e suas linhas de evidência. O índice único filtrado garante
-    /// no máximo uma versão utilizável por onda (fail-closed). Retorna a evidência com a versão
-    /// efetivamente atribuída.
+    /// Persiste atomicamente a nova versão: dentro da transação, (opcionalmente) valida o cercamento do
+    /// Job (<paramref name="fence"/>), calcula o próximo número de versão (N+1) sob lock (sequência
+    /// atômica, sem TOCTOU), substitui a versão utilizável anterior (Superseded), PUBLICA o artefato
+    /// imutável para a versão atribuída via <paramref name="publishArtifactAsync"/> (antes do commit,
+    /// para que uma versão persistida sempre tenha artefato), e grava a nova versão (com fingerprint e
+    /// caminho do artefato) e as linhas de evidência. O índice único filtrado garante no máximo uma
+    /// versão utilizável por onda (fail-closed). Retorna a evidência com a versão e o artefato
+    /// efetivamente atribuídos.
     /// </summary>
-    Task<MappingCsvVersion> SaveAsync(TenantScope scope, MappingGenerationResult result, CancellationToken cancellationToken);
+    Task<MappingCsvVersion> SaveAsync(
+        TenantScope scope,
+        MappingGenerationResult result,
+        JobFence? fence,
+        Func<MappingVersion, CancellationToken, Task<MappingArtifactReference>> publishArtifactAsync,
+        CancellationToken cancellationToken);
 }

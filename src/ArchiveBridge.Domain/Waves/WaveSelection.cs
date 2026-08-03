@@ -100,6 +100,13 @@ public sealed record WaveSelection
     /// <summary>Entradas da seleção.</summary>
     public IReadOnlyList<WaveEntry> Entries { get; }
 
+    /// <summary>
+    /// Verdadeiro se QUALQUER entrada tem archive com identidade NÃO resolvida (derivada só da mailbox,
+    /// sem unificação de aliases). Fail-closed: a validação da onda deve recusar seleções com
+    /// identidade não resolvida enquanto não houver resolvedor de diretório real.
+    /// </summary>
+    public bool HasUnresolvedArchive => Entries.Any(entry => !entry.Archive.IsIdentityResolved);
+
     /// <summary>Total planejado de bytes.</summary>
     public long TotalBytes => Entries.Sum(entry => entry.SizeBytes);
 

@@ -18,9 +18,9 @@ public sealed class FreezeWaveUseCase(IWaveStore waves)
 {
     private readonly IWaveStore _waves = waves;
 
-    /// <summary>Congela a onda do escopo.</summary>
+    /// <summary>Congela a onda do escopo. Quando <paramref name="fence"/> é informado, o efeito é cercado pelo Job.</summary>
     public async Task<WaveFreezeResult> ExecuteAsync(
-        TenantScope scope, WaveId waveId, CorrelationId correlation, CancellationToken cancellationToken)
+        TenantScope scope, WaveId waveId, CorrelationId correlation, CancellationToken cancellationToken, JobFence? fence = null)
     {
         var wave = await _waves.GetAsync(scope, waveId, cancellationToken).ConfigureAwait(false)
             ?? throw new PlanningNotFoundException("Onda não encontrada no escopo.");
@@ -31,7 +31,7 @@ public sealed class FreezeWaveUseCase(IWaveStore waves)
         }
 
         wave.Freeze();
-        await _waves.SaveStatusAsync(wave, correlation, cancellationToken).ConfigureAwait(false);
+        await _waves.SaveStatusAsync(wave, correlation, cancellationToken, fence).ConfigureAwait(false);
 
         return new WaveFreezeResult(wave.Status);
     }

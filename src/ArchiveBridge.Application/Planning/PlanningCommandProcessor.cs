@@ -3,6 +3,8 @@ using ArchiveBridge.Application.Waves;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Planning;
+using ArchiveBridge.Contracts.Projects;
+using ArchiveBridge.Contracts.Waves;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Domain.Mapping;
@@ -14,14 +16,20 @@ namespace ArchiveBridge.Application.Planning;
 /// <summary>Desfecho do processamento de um comando durável.</summary>
 public enum PlanningCommandOutcome
 {
-    /// <summary>Executado e o Job concluído.</summary>
+    /// <summary>Executado e o Job concluído (efeito aplicado ou replay idempotente válido).</summary>
     Completed,
 
-    /// <summary>Erro de domínio (dado inválido): Job falhado de forma terminal.</summary>
+    /// <summary>Erro de domínio / contexto obsoleto: Job falhado de forma terminal.</summary>
     Failed,
 
     /// <summary>Erro transitório: nova tentativa agendada (retry).</summary>
     Retried,
+
+    /// <summary>
+    /// O cercamento (fencing) foi perdido: outra época/worker é dona do Job. Nenhum efeito deste
+    /// worker foi persistido e a conclusão NÃO é reivindicada — não é sucesso.
+    /// </summary>
+    Fenced,
 }
 
 /// <summary>Resultado do processamento de um comando reivindicado.</summary>
@@ -29,16 +37,21 @@ public sealed record PlanningCommandExecution(
     JobId Job, PlanningCommandKind Kind, PlanningCommandOutcome Outcome, JobCommandOutcome JobOutcome);
 
 /// <summary>
-/// Consumidor durável dos comandos de planejamento: reivindica o próximo Job de controle (com fencing
-/// por época), lê o seu contexto, executa a operação correspondente e <b>conclui</b> o Job — ou, em
-/// erro de domínio, o <b>falha</b> terminalmente; em erro transitório, agenda <b>retry</b>. Os corpos
-/// de execução são idempotentes, então a reexecução após queda (lease recuperado) converge sem
-/// duplicar efeito. Não há mais Job Pending decorativo: todo comando é criado pela fila e concluído
-/// aqui.
+/// Consumidor durável dos comandos de planejamento: reivindica o próximo Job de planejamento (claim
+/// EXCLUSIVO — só Jobs com contexto em <c>planning_commands</c>, com fencing por época), confere que o
+/// contexto do comando ainda corresponde ao estado corrente do agregado (senão o comando é obsoleto e
+/// falha com <c>STALE_COMMAND_CONTEXT</c>), executa a operação com os efeitos CERCADOS pelo mesmo
+/// fencing do Job e conclui — ou, em erro de domínio, falha terminalmente; em erro transitório, agenda
+/// retry. Se o cercamento é perdido durante os efeitos, nenhum efeito é persistido e a conclusão não é
+/// reivindicada (<see cref="PlanningCommandOutcome.Fenced"/>). Uma conclusão só é reportada como
+/// <see cref="PlanningCommandOutcome.Completed"/> quando <c>CompleteAsync</c> aplica de fato (ou é
+/// replay idempotente válido) — nunca em <c>FencedOut</c>/<c>NotFound</c>.
 /// </summary>
 public sealed class PlanningCommandProcessor(
     IPlanningCommandInbox queue,
     IJobStore jobs,
+    IProjectStore projects,
+    IWaveStore waves,
     ValidateProjectUseCase validateProject,
     ValidateWaveUseCase validateWave,
     GenerateMappingCsvUseCase generateMapping,
@@ -50,6 +63,8 @@ public sealed class PlanningCommandProcessor(
 
     private readonly IPlanningCommandInbox _queue = queue;
     private readonly IJobStore _jobs = jobs;
+    private readonly IProjectStore _projects = projects;
+    private readonly IWaveStore _waves = waves;
     private readonly ValidateProjectUseCase _validateProject = validateProject;
     private readonly ValidateWaveUseCase _validateWave = validateWave;
     private readonly GenerateMappingCsvUseCase _generateMapping = generateMapping;
@@ -70,10 +85,19 @@ public sealed class PlanningCommandProcessor(
 
         var command = claimed.Command;
         var lease = new LeaseCommand(scope, claimed.Job.JobId, worker, claimed.Job.Epoch, command.Correlation);
+        var fence = new JobFence(scope, claimed.Job.JobId, worker, claimed.Job.Epoch);
 
         try
         {
-            await DispatchAsync(command, cancellationToken).ConfigureAwait(false);
+            await GuardContextAsync(command, cancellationToken).ConfigureAwait(false);
+            await DispatchAsync(command, fence, cancellationToken).ConfigureAwait(false);
+        }
+        catch (FencedOutException)
+        {
+            // Cercamento perdido durante os efeitos: outra época é dona; nenhum efeito foi persistido e
+            // não reivindicamos conclusão nem falha (seriam recusadas por fencing de qualquer modo).
+            return new PlanningCommandExecution(
+                claimed.Job.JobId, command.Kind, PlanningCommandOutcome.Fenced, JobCommandOutcome.FencedOut);
         }
         catch (Exception exception) when (IsTerminal(exception))
         {
@@ -88,26 +112,58 @@ public sealed class PlanningCommandProcessor(
         }
 
         var completed = await _jobs.CompleteAsync(lease, cancellationToken).ConfigureAwait(false);
-        return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, PlanningCommandOutcome.Completed, completed);
+        var outcome = completed is JobCommandOutcome.Applied or JobCommandOutcome.IdempotentReplay
+            ? PlanningCommandOutcome.Completed
+            : PlanningCommandOutcome.Fenced;
+        return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, outcome, completed);
     }
 
-    private async Task DispatchAsync(PlanningCommand command, CancellationToken cancellationToken)
+    private async Task GuardContextAsync(PlanningCommand command, CancellationToken cancellationToken)
+    {
+        PlanningCommandContextGuard.EnsureSchema(command.Context);
+        switch (command.Kind)
+        {
+            case PlanningCommandKind.ValidateProject:
+                var project = await _projects.GetAsync(command.Scope, cancellationToken).ConfigureAwait(false)
+                    ?? throw new PlanningNotFoundException("Projeto não encontrado no escopo.");
+                PlanningCommandContextGuard.EnsureProject(command.Context, project);
+                break;
+            case PlanningCommandKind.ValidateWave:
+            case PlanningCommandKind.FreezeWave:
+                var wave = await LoadWaveAsync(command, cancellationToken).ConfigureAwait(false);
+                PlanningCommandContextGuard.EnsureWave(command.Context, wave, requireMapping: false);
+                break;
+            case PlanningCommandKind.GenerateMappingCsv:
+                var mappingWave = await LoadWaveAsync(command, cancellationToken).ConfigureAwait(false);
+                PlanningCommandContextGuard.EnsureWave(command.Context, mappingWave, requireMapping: true);
+                PlanningCommandContextGuard.EnsureMappingPolicy(command.Context, _policy);
+                break;
+            default:
+                throw new PlanningValidationException($"Tipo de comando de planejamento desconhecido: {command.Kind}.");
+        }
+    }
+
+    private async Task<MigrationWave> LoadWaveAsync(PlanningCommand command, CancellationToken cancellationToken) =>
+        await _waves.GetAsync(command.Scope, RequireWave(command), cancellationToken).ConfigureAwait(false)
+            ?? throw new PlanningNotFoundException("Onda não encontrada no escopo.");
+
+    private async Task DispatchAsync(PlanningCommand command, JobFence fence, CancellationToken cancellationToken)
     {
         switch (command.Kind)
         {
             case PlanningCommandKind.ValidateProject:
-                await _validateProject.ExecuteAsync(command.Scope, command.Correlation, cancellationToken).ConfigureAwait(false);
+                await _validateProject.ExecuteAsync(command.Scope, command.Correlation, cancellationToken, fence).ConfigureAwait(false);
                 break;
             case PlanningCommandKind.ValidateWave:
-                await _validateWave.ExecuteAsync(command.Scope, RequireWave(command), command.Correlation, cancellationToken).ConfigureAwait(false);
+                await _validateWave.ExecuteAsync(command.Scope, RequireWave(command), command.Correlation, cancellationToken, fence).ConfigureAwait(false);
                 break;
             case PlanningCommandKind.GenerateMappingCsv:
                 await _generateMapping.ExecuteAsync(
                     command.Scope, RequireWave(command), new ContentCodePage(RequireCodePage(command)),
-                    _policy, RequireGeneratedBy(command), command.Correlation, cancellationToken).ConfigureAwait(false);
+                    _policy, RequireGeneratedBy(command), command.Correlation, cancellationToken, fence).ConfigureAwait(false);
                 break;
             case PlanningCommandKind.FreezeWave:
-                await _freezeWave.ExecuteAsync(command.Scope, RequireWave(command), command.Correlation, cancellationToken).ConfigureAwait(false);
+                await _freezeWave.ExecuteAsync(command.Scope, RequireWave(command), command.Correlation, cancellationToken, fence).ConfigureAwait(false);
                 break;
             default:
                 throw new PlanningValidationException($"Tipo de comando de planejamento desconhecido: {command.Kind}.");
@@ -117,6 +173,7 @@ public sealed class PlanningCommandProcessor(
     private static bool IsTerminal(Exception exception) =>
         exception is PlanningValidationException
             or PlanningNotFoundException
+            or StaleCommandContextException
             or MappingGenerationException
             or MappingCsvInjectionException
             or MappingCsvFormatException
