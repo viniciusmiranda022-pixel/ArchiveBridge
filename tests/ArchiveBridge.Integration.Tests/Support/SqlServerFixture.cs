@@ -37,9 +37,15 @@ public sealed class SqlServerFixture : IAsyncLifetime
     /// <summary>Fábrica de conexões (app + manutenção) ligada ao banco de teste.</summary>
     public TenantConnectionFactory Factory { get; private set; } = null!;
 
+    /// <summary>Raiz temporária isolada para os artefatos imutáveis de mapping (filesystem on-premises).</summary>
+    public string ArtifactRoot { get; private set; } = string.Empty;
+
     /// <inheritdoc />
     public async Task InitializeAsync()
     {
+        ArtifactRoot = Path.Combine(Path.GetTempPath(), "ab_artifacts_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(ArtifactRoot);
+
         var baseConnectionString = Environment.GetEnvironmentVariable(EnvironmentVariable)
             ?? throw new InvalidOperationException(
                 $"Defina {EnvironmentVariable} com a conexão sa do SQL Server de teste " +
@@ -83,6 +89,18 @@ public sealed class SqlServerFixture : IAsyncLifetime
     /// <inheritdoc />
     public async Task DisposeAsync()
     {
+        if (!string.IsNullOrEmpty(ArtifactRoot) && Directory.Exists(ArtifactRoot))
+        {
+            try
+            {
+                Directory.Delete(ArtifactRoot, recursive: true);
+            }
+            catch (IOException)
+            {
+                // Melhor esforço na limpeza dos artefatos temporários.
+            }
+        }
+
         if (string.IsNullOrEmpty(_databaseName))
         {
             return;

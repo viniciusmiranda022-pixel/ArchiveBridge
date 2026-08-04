@@ -44,6 +44,20 @@ public sealed record LeaseCommand(
     LeaseEpoch Epoch,
     CorrelationId Correlation);
 
+/// <summary>
+/// Cercamento (fencing) de um Job para proteger os EFEITOS de uma operação durável. Diferente do
+/// <see cref="LeaseCommand"/> (que transita o Job), este token é levado até a gravação dos efeitos no
+/// SQL: a escrita valida, na MESMA transação, que o Job ainda está em Processing, é do mesmo
+/// <see cref="Worker"/> e <see cref="Epoch"/>, e o lease continua válido. Assim, um dono defasado
+/// (lease expirado/recuperado) não persiste efeito parcial. <see langword="null"/> em invocações
+/// não duráveis (sem Job).
+/// </summary>
+public sealed record JobFence(
+    TenantScope Scope,
+    JobId Job,
+    WorkerId Worker,
+    LeaseEpoch Epoch);
+
 /// <summary>Comando de falha: dispõe sobre retry (transitório) vs. terminal via <see cref="RetryDisposition"/>.</summary>
 public sealed record FailJobCommand(
     TenantScope Scope,
