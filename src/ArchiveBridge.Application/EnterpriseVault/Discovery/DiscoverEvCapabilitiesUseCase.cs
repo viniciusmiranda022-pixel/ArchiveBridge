@@ -13,11 +13,12 @@ public sealed record EvDiscoveryOutcome(EvDiscoveryRunResult Result, EvDiscovery
 /// Corpo de execução do comando durável <c>DiscoverEvCapabilities</c>. Sonda o ambiente de forma
 /// READ-ONLY (nenhuma modificação no Enterprise Vault, nenhuma exportação), seleciona o adapter por
 /// CAPACIDADES (política determinística), avalia o resultado (fail-closed) e persiste a evidência pelo
-/// protocolo recuperável em duas transações do Slice 2: encena a evidência canônica (determinística) →
-/// reserva a versão (tx1, cercada) → publica a evidência imutável FORA do SQL → finaliza (tx2, cercada,
-/// validando a evidência antes de abrir a transação). Uma queda entre as fases é reconciliável pelos
-/// hashes (config + evidência) — sem versão indevida; a versão anterior permanece utilizável até a
-/// promoção. Quando cercado (<paramref name="fence"/>), o efeito é do dono corrente do Job.
+/// protocolo recuperável em duas transações do Slice 2. Calcula os TRÊS hashes que identificam a evidência
+/// completa — configuração (<see cref="EvDiscoveryConfiguration"/>), evidência semântica
+/// (<see cref="EvDiscoverySemanticFingerprint"/>) e conteúdo (SHA-256 do <c>evidence.json</c>) — e os passa
+/// à reserva ATÔMICA. Uma queda entre as fases é reconciliável pelos três hashes — sem versão indevida; a
+/// versão anterior permanece utilizável até a promoção. Quando cercado (<paramref name="fence"/>), o efeito
+/// é do dono corrente do Job.
 /// </summary>
 public sealed class DiscoverEvCapabilitiesUseCase(
     IEvCapabilityDiscovery discovery,
@@ -39,6 +40,8 @@ public sealed class DiscoverEvCapabilitiesUseCase(
         TenantScope scope,
         EvEnvironmentDescriptor environment,
         EvDiscoveryPolicy policy,
+        int expectedProjectConfigurationVersion,
+        Sha256Hash expectedConfigurationHash,
         CorrelationId correlation,
         CancellationToken cancellationToken,
         JobFence? fence = null)
@@ -47,29 +50,27 @@ public sealed class DiscoverEvCapabilitiesUseCase(
         ArgumentNullException.ThrowIfNull(policy);
 
         var startedAtUtc = _clock.UtcNow;
-        // Sonda READ-ONLY: nunca modifica o Enterprise Vault, nunca exporta.
         var observation = await _discovery.ProbeAsync(environment, policy, cancellationToken).ConfigureAwait(false);
         var selection = _adapterEvaluator.Select(observation, policy);
         var completedAtUtc = _clock.UtcNow;
         var result = EvDiscoveryEvaluator.Evaluate(
             DiscoveryRunId.New(), observation, selection, policy, startedAtUtc, completedAtUtc);
 
+        var configuration = EvDiscoveryConfiguration.For(environment.EnvironmentId, policy, expectedProjectConfigurationVersion, expectedConfigurationHash);
+        var configurationHash = configuration.ComputeHash();
+        var semanticEvidenceHash = EvDiscoverySemanticFingerprint.Compute(result);
         var evidenceBytes = _serializer.Serialize(result);
-
-        // Reconciliação: existe uma reserva PENDENTE dos mesmos hashes (queda entre reservar e finalizar)?
-        var pending = await _store.GetPendingByHashesAsync(
-            scope, environment.EnvironmentId, result.CapabilitySet.ConfigurationHash, result.CapabilitySet.EvidenceHash, cancellationToken)
-            .ConfigureAwait(false);
 
         var staging = await _evidence
             .StageAsync(evidenceBytes.Bytes, evidenceBytes.ContentSha256, cancellationToken).ConfigureAwait(false);
         try
         {
-            var reservation = pending
-                ?? await _store.ReserveAsync(scope, environment.EnvironmentId, result, staging.SizeBytes, correlation, fence, cancellationToken).ConfigureAwait(false);
+            // Reserva ATÔMICA (verifica pendente equivalente + insere sob lock, na mesma transação).
+            var reservation = await _store.ReserveAsync(
+                scope, environment.EnvironmentId, result, configurationHash, semanticEvidenceHash, evidenceBytes.ContentSha256,
+                staging.SizeBytes, correlation, fence, cancellationToken).ConfigureAwait(false);
             var descriptor = new EvDiscoveryEvidenceDescriptor(scope, environment.EnvironmentId, reservation.DiscoveryVersion);
 
-            // Publica a evidência imutável FORA de qualquer transação SQL (rename atômico; republicação valida o bundle).
             await _evidence.PublishAsync(staging, descriptor, cancellationToken).ConfigureAwait(false);
 
             var record = await _store.FinalizeAsync(
@@ -83,7 +84,7 @@ public sealed class DiscoverEvCapabilitiesUseCase(
                 },
                 cancellationToken).ConfigureAwait(false);
 
-            return new EvDiscoveryOutcome(result, record, Reconciled: pending is not null);
+            return new EvDiscoveryOutcome(result, record, reservation.Reconciled);
         }
         catch
         {

@@ -38,6 +38,15 @@ public static class EvDiscoverySchema
 {
     /// <summary>Versão corrente do esquema de descoberta/evidência. Um esquema desconhecido é recusado.</summary>
     public const int Version = 1;
+
+    /// <summary>Versão do envelope JSON de saída das sondas. Um schema desconhecido falha fechado.</summary>
+    public const int ProbeEnvelopeVersion = 1;
+
+    /// <summary>Versão do CATÁLOGO de sondas (scripts internos fixos). Faz parte do <c>ConfigurationHash</c>.</summary>
+    public const int ProbeCatalogVersion = 1;
+
+    /// <summary>Versão do CATÁLOGO de adapters registrados. Faz parte do <c>ConfigurationHash</c>.</summary>
+    public const int AdapterCatalogVersion = 1;
 }
 
 /// <summary>
@@ -79,4 +88,5 @@ public sealed record EvDiscoveryFinding(
     EvDiscoveryResultCode ResultCode,
     EvCapabilityCode? CapabilityCode,
     string Reason,
-    DateTimeOffset DiscoveredAtUtc);
+    DateTimeOffset DiscoveredAtUtc,
+    EvErrorCategory ErrorCategory = EvErrorCategory.None);

@@ -23,21 +23,23 @@ DiscoverEvCapabilities (comando durável, workload EnterpriseVault)
   → claim EXCLUSIVO (EXISTS ev_discovery_commands, fencing por época)
   → guarda de contexto (versão/hash de config + política) — STALE_COMMAND_CONTEXT se divergir
   → heartbeat PERIÓDICO (lease/3) durante toda a operação
-  → IEvCapabilityDiscovery.ProbeAsync  (read-only, via IEvPowerShellExecutor controlado)
+  → IEvCapabilityDiscovery.ProbeAsync  (read-only, sondas TIPADAS via IEvPowerShellHost + EvProbeExecutor fail-closed)
         → EvDiscoveryObservation (fatos por capacidade + assinatura observada)
   → AdapterCompatibilityEvaluator (todos os IEvVersionAdapter) → AdapterSelectionPolicy
         → EvAdapterSelection (Supported / Blocked / Unsupported / NotFound / Ambiguous)
   → EvDiscoveryEvaluator → EvDiscoveryRunResult (capacidades + status + result code)
-  → evidência canônica (determinística) → StageAsync → ReserveAsync (tx1) → PublishAsync (fora do SQL)
-        → FinalizeAsync (tx2) — promove Pending → terminal, superseder a anterior
+  → TRÊS hashes (configuração completa + evidência semântica completa + SHA-256 do conteúdo)
+  → evidência canônica (determinística) → StageAsync → ReserveAsync ATÔMICA (tx1) → PublishAsync (fora do SQL)
+        → FinalizeAsync (tx2) — valida os três hashes, promove Pending → terminal, superseder a anterior
   → complete / fail / retry (fencing)
 ```
 
 Camadas (hexagonal): **Domain** (modelo de capacidades, máquina de estados, política de seleção,
-hashes) → **Contracts** (portas: `IEvPowerShellExecutor`, `IEvCapabilityDiscovery`, `IEvVersionAdapter`,
-`IEvDiscoveryStore`, `IEvDiscoveryEvidenceStore`, `IEvDiscoveryCommandInbox`) → **Application** (use case,
-avaliador de adapter, adapters concretos, processador durável) → **Infrastructure** (SQL, evidência em
-filesystem, executor controlado, descoberta PowerShell).
+perfil/maturidade da assinatura, hashes/impressões digitais) → **Contracts** (portas: `IEvPowerShellHost`,
+`IEvCapabilityDiscovery`, `IEvVersionAdapter`, `IEvDiscoveryStore`, `IEvDiscoveryEvidenceStore`,
+`IEvDiscoveryCommandInbox`) → **Application** (use case, avaliador de adapter, adapters concretos,
+processador durável) → **Infrastructure** (SQL, evidência em filesystem, host PowerShell tipado com scripts
+internos fixos + executor fail-closed, descoberta PowerShell).
 
 ## 3. Modelo de capacidades
 
@@ -79,21 +81,42 @@ Determinística e fail-closed (`AdapterSelectionPolicy`):
 
 Cada adapter (`IEvVersionAdapter`) reconhece um conjunto COMPROVADO de capacidades e valida
 compatibilidade pela **assinatura observada** (não pela versão textual). Não existe adapter genérico
-que alegue suportar todas as versões do EV. Nesta slice há dois adapters de referência: **moderno**
-(assinatura com `OutputPath` + tamanho/relatório/filtragem) e **legado** (`ExportPath`).
+que alegue suportar todas as versões do EV. Nesta slice há **um** adapter de referência, para o **perfil
+oficial documentado do EV 15.1** (`EV_EXPORT_PROFILE_DOCUMENTED_15_1`): identifica-se pela assinatura
+documentada de `Export-EVArchive` — `ArchiveId` + `OutputDirectory` + `Format` — e documenta ainda
+`SearchString`, `MaxThreads`, `Retry` e `MaxPSTSizeMB`. **Não há** parâmetro `GenerateReport`: o relatório
+de exportação é gerado **automaticamente** (`ExportReport_<datetime>.txt`), portanto
+`EV_EXPORT_REPORT_SUPPORTED` **não** depende de parâmetro. A maturidade do perfil é registrada
+**separadamente** — `RuntimeObserved` (forma observada em runtime), `OfficialDocumentation` (bate com a
+documentação oficial) e `LaboratoryValidated` (homologado com produto real). Esta slice **nunca** declara
+`LaboratoryValidated`: é `RuntimeObserved`/`OfficialDocumentation`, `LaboratoryValidated = false`.
 
-## 5. Execução PowerShell controlada
+## 5. Host PowerShell tipado (sondas fixas, fail-closed)
 
-`IEvPowerShellExecutor` (impl. `GuardedEvPowerShellExecutor`) delega a um `IEvPowerShellHost` específico
-de SO **somente após** impor:
+Não há comando arbitrário nem `CommandName` livre. `IEvPowerShellHost` recebe uma **sonda TIPADA**
+(`EvPowerShellProbeKind`: `PowerShellEnvironment`, `RegisteredEvSnapin`, `AvailableEvModule`, `EvSite`,
+`EvServer`, `EvVaultStore`, `EvArchive`, `ExportEvArchiveCommandMetadata`, `StagingPathAccess`) e a mapeia
+para um **script interno FIXO, imutável e versionado** (catálogo). Os scripts usam apenas comandos
+documentados de leitura (`Get-Command`, `Get-EVSite`, `Get-EVServer`, `Get-EVVaultStore`, `Get-EVArchive`,
+`Test-Path`) e emitem um **envelope JSON versionado** `{schemaVersion, probe, success, errorCode, data}`.
+**Nenhuma** sonda executa `Export-EVArchive` — a de metadados apenas lê a assinatura via `Get-Command`.
 
-- allowlist explícita de comandos (fora dela ⇒ recusa, host nunca chamado);
-- recusa de `Invoke-Expression`;
-- parâmetros TIPADOS (nome = identificador; valor sem `; | & `` ` `` $( ${` nova linha/redirecionamento);
-- timeout obrigatório e positivo (estouro ⇒ `TimedOut`, fail-closed);
-- limite de tamanho de saída (truncamento sinalizado);
-- sanitização de segredos na saída (`password=/token=/sas=` → `[REDACTED]`);
-- execução não interativa; working directory controlado; compatível com Windows Worker isolado.
+O `WindowsEvPowerShellHost` (Windows Worker) monta o processo com `EvPowerShellCommandBuilder`
+(`-NoProfile -NonInteractive -NoLogo`, script interno fixo, working directory controlado, PATH restrito ao
+diretório do executável, **argumentos tipados por variável de ambiente** `EV_PROBE_ARG_*` — nunca na linha
+de comando, nunca concatenados, sem credencial) e o executa com `ByteLimitedProcessRunner` (contagem em
+**bytes reais** UTF-8, limite por stream, drenagem concorrente sem deadlock, processo morto ao exceder o
+limite ou o timeout). **A prova contra Enterprise Vault real é pendente de laboratório**: fora do Windows o
+host lança `PlatformNotSupportedException`, enquanto o construtor de comando e o runner byte-limitado
+permanecem testáveis de forma portável.
+
+O `EvProbeExecutor` valida **fail-closed antes de interpretar qualquer dado**: recusa argumentos com
+metacaracteres de injeção (`; | & `` ` `` $( ${` nova linha/redirecionamento, `Invoke-Expression`) sem
+chamar o host; e então recusa `TimedOut`, limite de saída excedido, `ExitCode != 0`, `stderr` não vazio
+(política explícita), `stdout` vazio e envelope inválido (schema desconhecido, propriedade obrigatória
+ausente, tipo errado, `probe` divergente, `data` não-objeto). Cada sonda produz seu **próprio** resultado
+(status + evidência + código + categoria de erro): a falha ou `PermissionDenied` de uma sonda **não**
+colapsa as demais.
 
 Nunca armazena senha/token/credencial/conteúdo de mensagem/PST; nunca concatena entrada em script.
 
@@ -107,11 +130,25 @@ Nunca armazena senha/token/credencial/conteúdo de mensagem/PST; nunca concatena
 ## 7. Persistência (SQL + evidência)
 
 SQL guarda **apenas metadados**: `ev_environments`, `ev_discovery_commands`, `ev_discovery_runs`
-(âncora de versão + ciclo de vida + hashes + adapter + caminho lógico + timestamps), `ev_capabilities`,
-`ev_adapter_evaluations`, `ev_discovery_findings` (append-only), e as projeções `ev_capability_sets` /
-`ev_discovery_evidence`. Migration **aditiva e protegida por hash** `0011`; RLS por tenant; FKs
-compostas `(…, tenant_id, project_id)`; `rowversion`; índice único filtrado da versão corrente. O único
-`UPDATE` permitido à aplicação em `ev_discovery_runs` é da coluna `status`.
+(âncora de versão + ciclo de vida + **três hashes** + adapter + caminho lógico + timestamps),
+`ev_capabilities`, `ev_adapter_evaluations` (agora com `profile_id` + maturidade `runtime_observed` /
+`official_documentation` / `laboratory_validated`), `ev_discovery_findings` (append-only, com
+`error_category`), e as projeções `ev_capability_sets` / `ev_discovery_evidence`. Migrations **aditivas e
+protegidas por hash** `0011` (base) e `0012` (esta revisão: coluna `content_sha256`, índice único filtrado
+de reserva pendente por impressão digital, colunas de perfil/maturidade e `error_category`); RLS por
+tenant; FKs compostas `(…, tenant_id, project_id)`; `rowversion`. O único `UPDATE` permitido à aplicação
+em `ev_discovery_runs` é da coluna `status`.
+
+Uma reserva é identificada pelos **três hashes**: `configuration_hash` (configuração completa — ambiente,
+versão/hash de config do projeto, versão da política, capacidades exigidas ordenadas, limites, versões de
+esquema/catálogo), `evidence_hash` (**evidência semântica completa** — identidade integral do ambiente,
+versão observada, capacidades, assinatura normalizada, avaliações de adapter/precedência/perfil, achados,
+status e código) e `content_sha256` (bytes do `evidence.json`). Qualquer diferença semântica muda o hash e
+**não** reaproveita uma reserva incompatível. A reserva é **ATÔMICA**: na mesma transação, sob lock,
+verifica a pendente equivalente pelos três hashes e a insere (ou a reutiliza) — um **índice único filtrado**
+`UX_evd_pending_fingerprint` (status Pending) impede duas versões Pending para a mesma evidência, e uma
+colisão concorrente é reconciliada relendo a pendente. A finalização revalida os três hashes antes de
+promover.
 
 A evidência detalhada é um **artefato imutável** (`evidence.json` + `evidence.sha256` + `manifest.json`)
 publicado por rename atômico de diretório, versionado por ambiente. O mesmo padrão da Slice 2:

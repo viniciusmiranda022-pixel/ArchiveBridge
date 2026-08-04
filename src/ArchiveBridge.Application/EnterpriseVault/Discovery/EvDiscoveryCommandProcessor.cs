@@ -154,8 +154,11 @@ public sealed class EvDiscoveryCommandProcessor(
     private async Task DispatchAsync(EvDiscoveryCommand command, JobFence fence, CancellationToken cancellationToken)
     {
         var environment = new EvEnvironmentDescriptor(command.EnvironmentId, command.SiteName, command.DirectoryServer);
-        await _discover.ExecuteAsync(command.Scope, environment, _policy, command.Correlation, cancellationToken, fence)
-            .ConfigureAwait(false);
+        // O contexto (versão/hash de configuração do projeto) já foi validado como presente por GuardContextAsync.
+        await _discover.ExecuteAsync(
+            command.Scope, environment, _policy,
+            command.Context.ExpectedProjectConfigurationVersion!.Value, command.Context.ExpectedConfigurationHash!.Value,
+            command.Correlation, cancellationToken, fence).ConfigureAwait(false);
     }
 
     private static bool IsTerminal(Exception exception) =>

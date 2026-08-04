@@ -4,14 +4,18 @@ using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 namespace ArchiveBridge.Application.EnterpriseVault.Discovery;
 
 /// <summary>
-/// Base de um adapter de versão POR CAPACIDADES: interpreta a observação factual e a assinatura observada
-/// do cmdlet de exportação contra a FORMA que este adapter reconhece — nunca pela versão textual. Declara
-/// compatibilidade (Supported quando reconhece a assinatura; Blocked quando reconhece o EV mas o cmdlet não
-/// está disponível; Unsupported caso contrário) e compõe o conjunto de capacidades = fatos observados +
-/// julgamentos de suporte (assinatura/PST/tamanho/relatório/filtragem/versão). Nunca executa exportação.
+/// Adapter de versão POR CAPACIDADES para um <see cref="EvExportProfile"/> documentado: interpreta a
+/// observação factual e a assinatura observada do <c>Export-EVArchive</c> contra a FORMA documentada do
+/// perfil — nunca pela versão textual. Declara compatibilidade (Supported quando reconhece a assinatura
+/// identificadora; Blocked quando reconhece o EV mas o cmdlet não está disponível; Unsupported caso
+/// contrário) e compõe capacidades = fatos observados + julgamentos de suporte. O suporte a RELATÓRIO
+/// NÃO depende de parâmetro (o relatório é gerado automaticamente). Registra o perfil e sua maturidade
+/// (runtime observado + documentação oficial; nunca laboratório validado). Nunca executa exportação.
 /// </summary>
-public abstract class EvVersionAdapterBase : IEvVersionAdapter
+public abstract class EvVersionAdapterBase(EvExportProfile profile) : IEvVersionAdapter
 {
+    private readonly EvExportProfile _profile = profile;
+
     /// <inheritdoc />
     public abstract EvAdapterId AdapterId { get; }
 
@@ -20,9 +24,6 @@ public abstract class EvVersionAdapterBase : IEvVersionAdapter
 
     /// <summary>Precedência determinística de desempate (maior vence). Empate entre compatíveis ⇒ ambíguo.</summary>
     protected abstract int Precedence { get; }
-
-    /// <summary>Parâmetro de saída que ESTA forma de assinatura exige (ex.: <c>OutputPath</c>/<c>ExportPath</c>).</summary>
-    protected abstract string OutputParameter { get; }
 
     /// <inheritdoc />
     public EvAdapterEvaluation Evaluate(EvDiscoveryObservation observation, EvDiscoveryPolicy policy)
@@ -39,13 +40,16 @@ public abstract class EvVersionAdapterBase : IEvVersionAdapter
         var requirements = new[]
         {
             new EvAdapterRequirement(new EvCapabilityCode(EvCapabilityCodes.EvExportCmdletAvailable), "cmdlet de exportação presente"),
-            new EvAdapterRequirement(new EvCapabilityCode(EvCapabilityCodes.EvExportCmdletSignatureSupported), $"assinatura com {OutputParameter} e ArchiveId"),
+            new EvAdapterRequirement(new EvCapabilityCode(EvCapabilityCodes.EvExportCmdletSignatureSupported),
+                $"assinatura documentada ({string.Join(" + ", _profile.IdentifyingParameters)})"),
         };
 
         if (recognizesSignature)
         {
             var capabilities = BuildCapabilities(observation, signature!, supported: true, now);
-            return new EvAdapterEvaluation(AdapterId, AdapterVersion, AdapterCompatibility.Supported, capabilities, requirements, [], Precedence);
+            var maturity = _profile.DocumentedMaturity with { RuntimeObserved = true };
+            return new EvAdapterEvaluation(
+                AdapterId, AdapterVersion, AdapterCompatibility.Supported, capabilities, requirements, [], Precedence, _profile.ProfileId, maturity);
         }
 
         var compatibility = recognizesEv ? AdapterCompatibility.Blocked : AdapterCompatibility.Unsupported;
@@ -54,14 +58,17 @@ public abstract class EvVersionAdapterBase : IEvVersionAdapter
         {
             new EvDiscoveryFinding(new EvDiscoveryResultCode(resultCode),
                 new EvCapabilityCode(EvCapabilityCodes.EvExportCmdletSignatureSupported),
-                $"Adapter {AdapterId} não reconhece a assinatura observada.", now),
+                $"Adapter {AdapterId} não reconhece a assinatura documentada {_profile.ProfileId}.", now),
         };
         var unsupportedCapabilities = BuildCapabilities(observation, signature, supported: false, now);
-        return new EvAdapterEvaluation(AdapterId, AdapterVersion, compatibility, unsupportedCapabilities, requirements, findings, Precedence);
+        return new EvAdapterEvaluation(
+            AdapterId, AdapterVersion, compatibility, unsupportedCapabilities, requirements, findings, Precedence,
+            _profile.ProfileId, _profile.DocumentedMaturity);
     }
 
+    // Reconhece a assinatura pela forma IDENTIFICADORA do perfil (todos os parâmetros identificadores).
     private bool RecognizesSignature(EvExportSignature signature) =>
-        signature.HasParameter("ArchiveId") && signature.HasParameter(OutputParameter);
+        _profile.IdentifyingParameters.All(signature.HasParameter);
 
     private EvCapability[] BuildCapabilities(EvDiscoveryObservation observation, EvExportSignature? signature, bool supported, DateTimeOffset now)
     {
@@ -69,12 +76,15 @@ public abstract class EvVersionAdapterBase : IEvVersionAdapter
             .Select(probe => new EvCapability(probe.CapabilityCode, 1, probe.Availability, probe.EvidenceReference, probe.BlockingReason, now))
             .ToList();
 
+        var hasFormat = signature is not null && signature.HasParameter(EvExportParameters.Format);
         capabilities.Add(Judge(EvCapabilityCodes.EvExportCmdletSignatureSupported, supported, now));
         capabilities.Add(Judge(EvCapabilityCodes.EvVersionSupportedByAdapter, supported, now));
-        capabilities.Add(Judge(EvCapabilityCodes.EvExportPstSupported, supported && signature is not null && signature.HasParameter(OutputParameter), now));
-        capabilities.Add(Judge(EvCapabilityCodes.EvExportSizeParameterSupported, supported && signature is not null && signature.HasParameter("MaxSizeMB"), now));
-        capabilities.Add(Judge(EvCapabilityCodes.EvExportReportSupported, supported && signature is not null && signature.HasParameter("GenerateReport"), now));
-        capabilities.Add(Judge(EvCapabilityCodes.EvExportFilteringSupported, supported && signature is not null && signature.HasParameter("Filter"), now));
+        // Format documentado com suporte a PST ⇒ exportação PST suportada.
+        capabilities.Add(Judge(EvCapabilityCodes.EvExportPstSupported, supported && hasFormat, now));
+        capabilities.Add(Judge(EvCapabilityCodes.EvExportSizeParameterSupported, supported && signature is not null && signature.HasParameter(EvExportParameters.MaxPstSizeMb), now));
+        // Relatório é gerado AUTOMATICAMENTE (não depende de parâmetro): suportado quando a exportação é suportada.
+        capabilities.Add(Judge(EvCapabilityCodes.EvExportReportSupported, supported, now));
+        capabilities.Add(Judge(EvCapabilityCodes.EvExportFilteringSupported, supported && signature is not null && signature.HasParameter(EvExportParameters.SearchString), now));
         return [.. capabilities];
     }
 
@@ -87,39 +97,19 @@ public abstract class EvVersionAdapterBase : IEvVersionAdapter
 }
 
 /// <summary>
-/// Adapter para a forma MODERNA da assinatura de exportação (parâmetro de saída <c>OutputPath</c>, com
-/// suporte a tamanho/relatório/filtragem quando presentes). Precedência maior que a forma legada.
+/// Adapter do perfil OFICIAL DOCUMENTADO do Enterprise Vault 15.1 (<c>EV_EXPORT_PROFILE_DOCUMENTED_15_1</c>):
+/// reconhece a assinatura documentada do <c>Export-EVArchive</c> (<c>ArchiveId</c> + <c>OutputDirectory</c> +
+/// <c>Format</c>, com <c>MaxPSTSizeMB</c>/<c>SearchString</c>/<c>MaxThreads</c>/<c>Retry</c>). Maturidade:
+/// documentação oficial, **sem** homologação em laboratório. Não há adapter genérico universal.
 /// </summary>
-public sealed class EvExportModernAdapter : EvVersionAdapterBase
+public sealed class EvExportDocumented151Adapter() : EvVersionAdapterBase(EvExportProfile.Documented151)
 {
     /// <inheritdoc />
-    public override EvAdapterId AdapterId { get; } = new("ev-export-adapter-modern");
+    public override EvAdapterId AdapterId { get; } = new("ev-export-adapter-documented-15-1");
 
     /// <inheritdoc />
     public override int AdapterVersion => 1;
 
     /// <inheritdoc />
     protected override int Precedence => 20;
-
-    /// <inheritdoc />
-    protected override string OutputParameter => "OutputPath";
-}
-
-/// <summary>
-/// Adapter para a forma LEGADA da assinatura de exportação (parâmetro de saída <c>ExportPath</c>). Só
-/// reconhece assinaturas antigas; nunca alega suporte universal a todas as versões do Enterprise Vault.
-/// </summary>
-public sealed class EvExportLegacyAdapter : EvVersionAdapterBase
-{
-    /// <inheritdoc />
-    public override EvAdapterId AdapterId { get; } = new("ev-export-adapter-legacy");
-
-    /// <inheritdoc />
-    public override int AdapterVersion => 1;
-
-    /// <inheritdoc />
-    protected override int Precedence => 10;
-
-    /// <inheritdoc />
-    protected override string OutputParameter => "ExportPath";
 }

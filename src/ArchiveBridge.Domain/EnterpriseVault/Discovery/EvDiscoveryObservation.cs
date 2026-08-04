@@ -9,7 +9,9 @@ public sealed record EvProbeResult(
     EvCapabilityCode CapabilityCode,
     CapabilityAvailability Availability,
     string EvidenceReference,
-    string? BlockingReason);
+    string? BlockingReason,
+    EvDiscoveryResultCode? ErrorCode = null,
+    EvErrorCategory ErrorCategory = EvErrorCategory.None);
 
 /// <summary>
 /// Observação FACTUAL de um ambiente Enterprise Vault produzida por uma execução de descoberta read-only:

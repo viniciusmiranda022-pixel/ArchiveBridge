@@ -6,27 +6,15 @@ using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 namespace ArchiveBridge.Infrastructure.EnterpriseVault.Discovery;
 
 /// <summary>
-/// Descoberta READ-ONLY de capacidades via PowerShell CONTROLADO (allowlist). Executa um pequeno conjunto
-/// de sondas — um snapshot de ambiente e a DESCOBERTA DO COMANDO de exportação (<c>Get-Command</c>) — e
-/// interpreta as saídas JSON em observações FACTUAIS por capacidade. NUNCA executa exportação, nunca
-/// modifica o Enterprise Vault. Uma saída malformada ⇒ achado <c>EV_DISCOVERY_OUTPUT_INVALID</c>; um
-/// timeout ⇒ <c>EV_DISCOVERY_TIMEOUT</c> (fatais para a avaliação). A interpretação de SUPORTE por versão
-/// é dos adapters — aqui só se reportam fatos.
+/// Descoberta READ-ONLY de capacidades via sondas TIPADAS (<see cref="EvPowerShellProbeKind"/>) executadas
+/// pelo <see cref="EvProbeExecutor"/> (fail-closed) sobre um <see cref="IEvPowerShellHost"/>. Cada sonda
+/// produz seu PRÓPRIO resultado (status + evidência + código + categoria de erro): a falha/PermissionDenied
+/// de uma sonda não colapsa as demais. Nenhuma sonda executa <c>Export-EVArchive</c> — apenas descobre seus
+/// metadados. A interpretação de SUPORTE por versão é dos adapters; aqui só se reportam fatos.
 /// </summary>
-public sealed class PowerShellEvCapabilityDiscovery(IEvPowerShellExecutor executor, IClock clock) : IEvCapabilityDiscovery
+public sealed class PowerShellEvCapabilityDiscovery(IEvPowerShellHost host, IClock clock) : IEvCapabilityDiscovery
 {
-    /// <summary>Comando de snapshot read-only do ambiente (allowlisted). Não modifica nada.</summary>
-    public const string SnapshotCommand = "Get-EvEnvironmentSnapshot";
-
-    /// <summary>Comando de descoberta de comando (allowlisted). Descobre o cmdlet de exportação sem executá-lo.</summary>
-    public const string GetCommandCommand = "Get-Command";
-
-    /// <summary>Nome do cmdlet de exportação cuja DISPONIBILIDADE é descoberta (nunca executado).</summary>
-    public const string ExportCmdletName = "Export-EVArchive";
-
-    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
-
-    private readonly IEvPowerShellExecutor _executor = executor;
+    private readonly EvProbeExecutor _executor = new(host);
     private readonly IClock _clock = clock;
 
     /// <inheritdoc />
@@ -36,110 +24,158 @@ public sealed class PowerShellEvCapabilityDiscovery(IEvPowerShellExecutor execut
         ArgumentNullException.ThrowIfNull(environment);
         ArgumentNullException.ThrowIfNull(policy);
         var now = _clock.UtcNow;
+        var args = new[] { new EvProbeArgument("DirectoryServer", environment.DirectoryServer), new EvProbeArgument("SiteName", environment.SiteName) };
+        var probes = new List<EvProbeResult>();
         var findings = new List<EvDiscoveryFinding>();
+        var anyPermissionDenied = false;
 
-        var snapshotResult = await _executor.InvokeAsync(
-            new EvPowerShellRequest(SnapshotCommand,
-                [new EvPowerShellParameter("DirectoryServer", environment.DirectoryServer), new EvPowerShellParameter("SiteName", environment.SiteName)],
-                policy.ProbeTimeout),
-            cancellationToken).ConfigureAwait(false);
+        async Task<EvProbeOutcome> Run(EvPowerShellProbeKind kind) =>
+            await _executor.RunAsync(kind, args, policy.ProbeTimeout, policy.MaxOutputBytes, cancellationToken).ConfigureAwait(false);
 
-        if (snapshotResult.TimedOut)
-        {
-            return Fatal(environment, EvDiscoveryResultCodes.DiscoveryTimeout, "Timeout na sonda de snapshot.", now);
-        }
+        // PowerShell environment.
+        var psEnv = await Run(EvPowerShellProbeKind.PowerShellEnvironment).ConfigureAwait(false);
+        probes.Add(BoolCapability(EvCapabilityCodes.EvPowershellAvailable, psEnv, static d => TryGetString(d, "psVersion") is { Length: > 0 }, "probe:powershell", now, findings, ref anyPermissionDenied));
 
-        var snapshot = TryParse<SnapshotOutput>(snapshotResult.StandardOutput);
-        if (snapshot is null)
-        {
-            return Fatal(environment, EvDiscoveryResultCodes.DiscoveryOutputInvalid, "Saída de snapshot inválida.", now);
-        }
+        var moduleOutcome = await Run(EvPowerShellProbeKind.AvailableEvModule).ConfigureAwait(false);
+        probes.Add(BoolCapability(EvCapabilityCodes.EvModuleAvailable, moduleOutcome, static d => TryGetBool(d, "present") == true, "probe:module", now, findings, ref anyPermissionDenied));
 
-        var commandResult = await _executor.InvokeAsync(
-            new EvPowerShellRequest(GetCommandCommand, [new EvPowerShellParameter("Name", ExportCmdletName)], policy.ProbeTimeout),
-            cancellationToken).ConfigureAwait(false);
-        if (commandResult.TimedOut)
-        {
-            return Fatal(environment, EvDiscoveryResultCodes.DiscoveryTimeout, "Timeout na descoberta do cmdlet.", now);
-        }
+        var snapinOutcome = await Run(EvPowerShellProbeKind.RegisteredEvSnapin).ConfigureAwait(false);
+        probes.Add(BoolCapability(EvCapabilityCodes.EvSnapinAvailable, snapinOutcome, static d => TryGetBool(d, "present") == true, "probe:snapin", now, findings, ref anyPermissionDenied));
 
-        var command = TryParse<CommandOutput>(commandResult.StandardOutput);
-        if (command is null)
-        {
-            return Fatal(environment, EvDiscoveryResultCodes.DiscoveryOutputInvalid, "Saída de Get-Command inválida.", now);
-        }
+        var siteOutcome = await Run(EvPowerShellProbeKind.EvSite).ConfigureAwait(false);
+        probes.Add(CountCapability(EvCapabilityCodes.EvSiteDiscovery, siteOutcome, "probe:site", now, findings, ref anyPermissionDenied));
+        // Conectividade de directory: derivada do sucesso da sonda de sites (a consulta ao directory funcionou).
+        probes.Add(DerivedCapability(EvCapabilityCodes.EvDirectoryConnectivity, siteOutcome, "probe:directory", now, findings, ref anyPermissionDenied));
+
+        var serverOutcome = await Run(EvPowerShellProbeKind.EvServer).ConfigureAwait(false);
+        probes.Add(CountCapability(EvCapabilityCodes.EvServerDiscovery, serverOutcome, "probe:server", now, findings, ref anyPermissionDenied));
+
+        var vaultOutcome = await Run(EvPowerShellProbeKind.EvVaultStore).ConfigureAwait(false);
+        probes.Add(CountCapability(EvCapabilityCodes.EvVaultStoreDiscovery, vaultOutcome, "probe:vaultstore", now, findings, ref anyPermissionDenied));
+
+        var archiveOutcome = await Run(EvPowerShellProbeKind.EvArchive).ConfigureAwait(false);
+        probes.Add(CountCapability(EvCapabilityCodes.EvArchiveDiscovery, archiveOutcome, "probe:archive", now, findings, ref anyPermissionDenied));
+
+        var stagingOutcome = await Run(EvPowerShellProbeKind.StagingPathAccess).ConfigureAwait(false);
+        probes.Add(BoolCapability(EvCapabilityCodes.EvStagingPathAccess, stagingOutcome, static d => TryGetBool(d, "accessible") == true, "probe:staging", now, findings, ref anyPermissionDenied));
+
+        var metaOutcome = await Run(EvPowerShellProbeKind.ExportEvArchiveCommandMetadata).ConfigureAwait(false);
+        var cmdletAvailable = metaOutcome.Ok && TryGetBool(metaOutcome.Data, "available") == true;
+        probes.Add(BoolCapability(EvCapabilityCodes.EvExportCmdletAvailable, metaOutcome, static d => TryGetBool(d, "available") == true, "probe:export-metadata", now, findings, ref anyPermissionDenied));
+        var signature = cmdletAvailable ? TryReadSignature(metaOutcome.Data, now) : null;
+
+        // Permissões: derivada — Available apenas se NENHUMA sonda reportou PermissionDenied.
+        probes.Add(new EvProbeResult(
+            new EvCapabilityCode(EvCapabilityCodes.EvRequiredPermissions),
+            anyPermissionDenied ? CapabilityAvailability.PermissionDenied : CapabilityAvailability.Available,
+            "probe:permissions",
+            anyPermissionDenied ? "Uma ou mais sondas foram barradas por permissão." : null,
+            anyPermissionDenied ? new EvDiscoveryResultCode(EvDiscoveryResultCodes.PermissionInsufficient) : null,
+            anyPermissionDenied ? EvErrorCategory.PermissionDenied : EvErrorCategory.None));
 
         var identity = new EvEnvironmentIdentity(
             environment.EnvironmentId, environment.SiteName, environment.DirectoryServer,
-            snapshot.ObservedVersion ?? string.Empty, snapshot.ProductVersion ?? string.Empty,
-            snapshot.DiscoverySource ?? "PowerShell", now);
-
-        var signature = command.Available && command.Signature is { } sig
-            ? EvExportSignature.Create(
-                sig.CommandName ?? ExportCmdletName, sig.ModuleSource ?? string.Empty, sig.Version ?? string.Empty,
-                sig.CommandType ?? "Cmdlet", sig.Parameters ?? [], sig.Mandatory ?? [], sig.ParameterSets ?? [], now)
-            : null;
-
-        var probes = new List<EvProbeResult>
-        {
-            Probe(EvCapabilityCodes.EvPowershellAvailable, snapshot.PowershellAvailable, snapshot.PermissionDenied, "snapshot:powershell", now),
-            Probe(EvCapabilityCodes.EvModuleAvailable, snapshot.ModuleAvailable, snapshot.PermissionDenied, "snapshot:module", now),
-            Probe(EvCapabilityCodes.EvSnapinAvailable, snapshot.SnapinAvailable, snapshot.PermissionDenied, "snapshot:snapin", now),
-            Probe(EvCapabilityCodes.EvDirectoryConnectivity, snapshot.DirectoryConnectivity, snapshot.PermissionDenied, "snapshot:directory", now),
-            Probe(EvCapabilityCodes.EvSiteDiscovery, snapshot.Sites > 0, snapshot.PermissionDenied, "snapshot:sites", now),
-            Probe(EvCapabilityCodes.EvServerDiscovery, snapshot.Servers > 0, snapshot.PermissionDenied, "snapshot:servers", now),
-            Probe(EvCapabilityCodes.EvVaultStoreDiscovery, snapshot.VaultStores > 0, snapshot.PermissionDenied, "snapshot:vaultstores", now),
-            Probe(EvCapabilityCodes.EvArchiveDiscovery, snapshot.Archives > 0, snapshot.PermissionDenied, "snapshot:archives", now),
-            Probe(EvCapabilityCodes.EvExportCmdletAvailable, command.Available, denied: false, "getcommand:export", now),
-            Probe(EvCapabilityCodes.EvStagingPathAccess, snapshot.StagingPathAccess, snapshot.PermissionDenied, "snapshot:staging", now),
-            Probe(EvCapabilityCodes.EvRequiredPermissions, snapshot.RequiredPermissions, snapshot.PermissionDenied, "snapshot:permissions", now),
-        };
+            metaOutcome.Ok ? TryGetString(metaOutcome.Data, "observedVersion") ?? string.Empty : string.Empty,
+            metaOutcome.Ok ? TryGetString(metaOutcome.Data, "productVersion") ?? string.Empty : string.Empty,
+            "PowerShell", now);
 
         return new EvDiscoveryObservation(identity, probes, signature, findings);
     }
 
-    private static EvDiscoveryObservation Fatal(EvEnvironmentDescriptor environment, string resultCode, string reason, DateTimeOffset now)
+    private static EvProbeResult BoolCapability(
+        string code, EvProbeOutcome outcome, Func<JsonElement, bool> present, string evidence, DateTimeOffset now,
+        List<EvDiscoveryFinding> findings, ref bool anyPermissionDenied)
     {
-        var identity = new EvEnvironmentIdentity(
-            environment.EnvironmentId, environment.SiteName, environment.DirectoryServer, string.Empty, string.Empty, "PowerShell", now);
-        var finding = new EvDiscoveryFinding(new EvDiscoveryResultCode(resultCode), CapabilityCode: null, reason, now);
-        return new EvDiscoveryObservation(identity, [], ExportSignature: null, [finding]);
+        if (!outcome.Ok)
+        {
+            return Failed(code, outcome, evidence, now, findings, ref anyPermissionDenied);
+        }
+
+        var available = present(outcome.Data);
+        return new EvProbeResult(new EvCapabilityCode(code), available ? CapabilityAvailability.Available : CapabilityAvailability.Unavailable, evidence,
+            available ? null : "Sonda não comprovou a capacidade.");
     }
 
-    private static EvProbeResult Probe(string code, bool present, bool denied, string evidenceReference, DateTimeOffset now)
+    private static EvProbeResult CountCapability(
+        string code, EvProbeOutcome outcome, string evidence, DateTimeOffset now, List<EvDiscoveryFinding> findings, ref bool anyPermissionDenied)
     {
-        var availability = denied
+        if (!outcome.Ok)
+        {
+            return Failed(code, outcome, evidence, now, findings, ref anyPermissionDenied);
+        }
+
+        var count = TryGetInt(outcome.Data, "count");
+        if (count is null || count < 0)
+        {
+            findings.Add(new EvDiscoveryFinding(new EvDiscoveryResultCode(EvDiscoveryResultCodes.DiscoveryOutputInvalid), new EvCapabilityCode(code), "contagem ausente/negativa", now, EvErrorCategory.OutputInvalid));
+            return new EvProbeResult(new EvCapabilityCode(code), CapabilityAvailability.Indeterminate, evidence, "contagem inválida",
+                new EvDiscoveryResultCode(EvDiscoveryResultCodes.DiscoveryOutputInvalid), EvErrorCategory.OutputInvalid);
+        }
+
+        return new EvProbeResult(new EvCapabilityCode(code), count > 0 ? CapabilityAvailability.Available : CapabilityAvailability.Unavailable, evidence,
+            count > 0 ? null : "Nenhum item descoberto.");
+    }
+
+    private static EvProbeResult DerivedCapability(
+        string code, EvProbeOutcome outcome, string evidence, DateTimeOffset now, List<EvDiscoveryFinding> findings, ref bool anyPermissionDenied)
+    {
+        if (!outcome.Ok)
+        {
+            return Failed(code, outcome, evidence, now, findings, ref anyPermissionDenied);
+        }
+
+        return new EvProbeResult(new EvCapabilityCode(code), CapabilityAvailability.Available, evidence, null);
+    }
+
+    private static EvProbeResult Failed(
+        string code, EvProbeOutcome outcome, string evidence, DateTimeOffset now, List<EvDiscoveryFinding> findings, ref bool anyPermissionDenied)
+    {
+        if (outcome.Category == EvErrorCategory.PermissionDenied)
+        {
+            anyPermissionDenied = true;
+        }
+
+        var availability = outcome.Category == EvErrorCategory.PermissionDenied
             ? CapabilityAvailability.PermissionDenied
-            : present ? CapabilityAvailability.Available : CapabilityAvailability.Unavailable;
-        var reason = availability == CapabilityAvailability.Available ? null : $"Sonda não comprovou a capacidade ({availability}).";
-        return new EvProbeResult(new EvCapabilityCode(code), availability, evidenceReference, reason);
+            : CapabilityAvailability.Indeterminate;
+        findings.Add(new EvDiscoveryFinding(outcome.ErrorCode ?? new EvDiscoveryResultCode(EvDiscoveryResultCodes.DiscoveryFailed), new EvCapabilityCode(code), outcome.Detail, now, outcome.Category));
+        return new EvProbeResult(new EvCapabilityCode(code), availability, evidence, outcome.Detail, outcome.ErrorCode, outcome.Category);
     }
 
-    private static T? TryParse<T>(string json) where T : class
+    private static EvExportSignature? TryReadSignature(JsonElement data, DateTimeOffset now)
     {
-        if (string.IsNullOrWhiteSpace(json))
+        if (!data.TryGetProperty("signature", out var sig) || sig.ValueKind != JsonValueKind.Object)
         {
             return null;
         }
 
-        try
-        {
-            return JsonSerializer.Deserialize<T>(json, JsonOptions);
-        }
-        catch (JsonException)
+        var commandName = TryGetString(sig, "commandName");
+        if (string.IsNullOrWhiteSpace(commandName))
         {
             return null;
         }
+
+        return EvExportSignature.Create(
+            commandName, TryGetString(sig, "moduleSource") ?? string.Empty, TryGetString(sig, "version") ?? string.Empty,
+            TryGetString(sig, "commandType") ?? "Cmdlet", ReadArray(sig, "parameters"), ReadArray(sig, "mandatory"), ReadArray(sig, "parameterSets"), now);
     }
 
-    private sealed record SnapshotOutput(
-        bool PowershellAvailable, bool ModuleAvailable, bool SnapinAvailable, bool DirectoryConnectivity,
-        int Sites, int Servers, int VaultStores, int Archives, bool StagingPathAccess, bool RequiredPermissions,
-        bool PermissionDenied, string? ObservedVersion, string? ProductVersion, string? DiscoverySource);
+    private static string[] ReadArray(JsonElement element, string name)
+    {
+        if (!element.TryGetProperty(name, out var array) || array.ValueKind != JsonValueKind.Array)
+        {
+            return [];
+        }
 
-    private sealed record CommandOutput(bool Available, SignatureOutput? Signature);
+        return array.EnumerateArray().Where(static e => e.ValueKind == JsonValueKind.String).Select(static e => e.GetString()!).ToArray();
+    }
 
-    private sealed record SignatureOutput(
-        string? CommandName, string? ModuleSource, string? Version, string? CommandType,
-        string[]? Parameters, string[]? Mandatory, string[]? ParameterSets);
+    private static string? TryGetString(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+
+    private static bool? TryGetBool(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False ? value.GetBoolean() : null;
+
+    private static int? TryGetInt(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var n) ? n : null;
 }

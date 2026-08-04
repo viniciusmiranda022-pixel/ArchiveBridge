@@ -5,10 +5,11 @@ using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 namespace ArchiveBridge.Contracts.EnterpriseVault.Discovery;
 
 /// <summary>
-/// Reserva de uma versão de descoberta (fase 2 do protocolo recuperável): a versão foi atribuída sob
-/// lock e os metadados gravados como <see cref="EvDiscoveryStatus.Pending"/>, mas a evidência ainda não
-/// foi publicada nem promovida a utilizável. Carrega o caminho lógico esperado e os hashes que a
-/// finalização confere contra a evidência publicada.
+/// Reserva de uma versão de descoberta (fase 2 do protocolo recuperável): a versão foi atribuída sob lock
+/// e os metadados gravados como <see cref="EvDiscoveryStatus.Pending"/>, identificados pelos TRÊS hashes —
+/// configuração completa, evidência semântica completa e SHA-256 do conteúdo do <c>evidence.json</c>.
+/// <see cref="Reconciled"/> indica que a reserva foi RECUPERADA (já existia uma pendente equivalente), não
+/// criada agora.
 /// </summary>
 public sealed record EvDiscoveryReservation(
     EvEnvironmentId Environment,
@@ -16,8 +17,10 @@ public sealed record EvDiscoveryReservation(
     DiscoveryRunId RunId,
     string EvidenceLogicalPath,
     Sha256Hash ConfigurationHash,
-    Sha256Hash EvidenceHash,
-    long SizeBytes);
+    Sha256Hash SemanticEvidenceHash,
+    Sha256Hash ContentSha256,
+    long SizeBytes,
+    bool Reconciled);
 
 /// <summary>Registro persistido (metadados) de uma versão de descoberta — nunca a evidência bruta.</summary>
 public sealed record EvDiscoveryRecord(
@@ -30,16 +33,18 @@ public sealed record EvDiscoveryRecord(
     int? AdapterVersion,
     string ObservedVersion,
     Sha256Hash ConfigurationHash,
-    Sha256Hash EvidenceHash,
+    Sha256Hash SemanticEvidenceHash,
+    Sha256Hash ContentSha256,
     string EvidenceLogicalPath);
 
 /// <summary>
-/// Porta de persistência dos METADADOS de descoberta (nunca a evidência bruta): versão, status, hashes,
-/// adapter selecionado, caminho lógico. Mesmo protocolo em DUAS transações curtas do Slice 2 (sem I/O de
-/// filesystem sob transação): <see cref="ReserveAsync"/> (tx1) → publicação FORA do SQL →
-/// <see cref="FinalizeAsync"/> (tx2). Uma nova descoberta não sobrescreve a anterior; a anterior só é
-/// marcada <see cref="EvDiscoveryStatus.Superseded"/> após a nova estar completa e validada. A
-/// reconciliação de uma queda entre as fases usa os hashes (config + evidência).
+/// Porta de persistência dos METADADOS de descoberta (nunca a evidência bruta): versão, status, os três
+/// hashes (configuração/evidência semântica/conteúdo), adapter selecionado, caminho lógico. Mesmo protocolo
+/// em DUAS transações curtas do Slice 2 (sem I/O de filesystem sob transação): <see cref="ReserveAsync"/>
+/// (tx1) → publicação FORA do SQL → <see cref="FinalizeAsync"/> (tx2). A reserva é ATÔMICA: verifica a
+/// pendente equivalente e a insere na MESMA transação sob lock (sem duas versões Pending para a mesma
+/// evidência). Uma nova descoberta não sobrescreve a anterior; a anterior só vira
+/// <see cref="EvDiscoveryStatus.Superseded"/> após a nova estar completa e validada.
 /// </summary>
 public interface IEvDiscoveryStore
 {
@@ -50,22 +55,19 @@ public interface IEvDiscoveryStore
     Task<EvDiscoveryRecord?> GetUsableAsync(TenantScope scope, EvEnvironmentId environmentId, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Reserva PENDENTE dos mesmos hashes (config + evidência) — <see langword="null"/> se nenhuma.
-    /// Recupera, após uma queda entre reserva e finalização, a versão já reservada (mesma evidência
-    /// semântica), em vez de criar um novo número de versão.
-    /// </summary>
-    Task<EvDiscoveryReservation?> GetPendingByHashesAsync(
-        TenantScope scope, EvEnvironmentId environmentId, Sha256Hash configurationHash, Sha256Hash evidenceHash, CancellationToken cancellationToken);
-
-    /// <summary>
-    /// Transação 1 (curta, SEM I/O de filesystem): valida o cercamento, calcula a próxima versão sob lock
-    /// e insere os metadados como <see cref="EvDiscoveryStatus.Pending"/> (com hashes, caminho lógico
-    /// esperado e tamanho). Não substitui a versão utilizável anterior. Retorna a reserva.
+    /// Transação 1 (curta, SEM I/O de filesystem): valida o cercamento e, ATOMICAMENTE sob lock, verifica
+    /// se já existe uma reserva PENDENTE dos mesmos três hashes — se existir devolve-a
+    /// (<see cref="EvDiscoveryReservation.Reconciled"/> = true); senão calcula N+1 e insere a versão como
+    /// <see cref="EvDiscoveryStatus.Pending"/>. Não substitui a versão utilizável anterior. Um índice único
+    /// filtrado impede duas Pending para a mesma evidência.
     /// </summary>
     Task<EvDiscoveryReservation> ReserveAsync(
         TenantScope scope,
         EvEnvironmentId environmentId,
         EvDiscoveryRunResult result,
+        Sha256Hash configurationHash,
+        Sha256Hash semanticEvidenceHash,
+        Sha256Hash contentSha256,
         long evidenceSizeBytes,
         CorrelationId correlation,
         JobFence? fence,
@@ -74,9 +76,9 @@ public interface IEvDiscoveryStore
     /// <summary>
     /// Transação 2 (curta): valida a evidência publicada FORA da transação
     /// (<paramref name="validatePublishedEvidenceAsync"/>, ANTES de abrir a transação/lock), revalida o
-    /// cercamento, confere que a reserva pendente ainda corresponde (versão + hashes) e então promove
+    /// cercamento, confere que a reserva pendente ainda corresponde aos TRÊS hashes e então promove
     /// <see cref="EvDiscoveryStatus.Pending"/> → estado terminal, marcando a utilizável anterior como
-    /// Superseded somente agora. Idempotente. Inconsistência falha fechada, sem commit.
+    /// Superseded somente agora. Idempotente; inconsistência falha fechada, sem commit.
     /// </summary>
     Task<EvDiscoveryRecord> FinalizeAsync(
         TenantScope scope,

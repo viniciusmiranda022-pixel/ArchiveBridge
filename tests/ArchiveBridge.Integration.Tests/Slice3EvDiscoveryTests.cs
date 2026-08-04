@@ -1,4 +1,5 @@
 using ArchiveBridge.Application.EnterpriseVault.Discovery;
+using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
@@ -12,14 +13,17 @@ namespace ArchiveBridge.Integration.Tests;
 
 /// <summary>
 /// Slice 3 — descoberta durável sobre SQL real: fluxo enqueue→claim→descoberta read-only→persistência
-/// cercada→conclusão; contexto obsoleto bloqueado; reconciliação de quedas; versão anterior utilizável até
-/// a nova finalizar; worker defasado não persiste; isolamento por tenant; evidência imutável.
+/// cercada→conclusão; contexto obsoleto bloqueado; reconciliação de quedas pelos TRÊS hashes; versão
+/// anterior utilizável até a nova finalizar; worker defasado não persiste; reserva pendente ATÔMICA sob
+/// concorrência (uma só versão por evidência); mudança de configuração não reaproveita reserva; isolamento
+/// por tenant; evidência imutável.
 /// </summary>
 [Collection(SqlServerCollectionDefinition.Name)]
 public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
 {
     private static readonly WorkerId WorkerA = new("worker-A");
     private static readonly EvDiscoveryPolicy Policy = EvDiscoveryPolicy.Default;
+    private const string DocumentedAdapterId = "ev-export-adapter-documented-15-1";
 
     private async Task<(TenantScope Scope, MigrationProject Project)> SeedProjectAsync()
     {
@@ -33,6 +37,11 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
         new(scope, env.EnvironmentId, env.SiteName, env.DirectoryServer, "do", CorrelationId.New(),
             new EvDiscoveryCommandContext(EvDiscoveryCommandContext.CurrentSchemaVersion,
                 project.ConfigurationVersion.Value, overrideHash ?? project.ConfigurationHash, EvDiscoveryPolicy.CurrentVersion));
+
+    private Task<EvDiscoveryOutcome> RunUseCaseAsync(
+        TenantScope scope, MigrationProject project, EvEnvironmentDescriptor env, FixtureEvPowerShellHost host, IClock clock) =>
+        Slice3Support.UseCase(fixture, host, clock).ExecuteAsync(
+            scope, env, Policy, project.ConfigurationVersion.Value, project.ConfigurationHash, CorrelationId.New(), CancellationToken.None);
 
     [Fact]
     public async Task DurableFlowReachesReadyAndUsable()
@@ -50,7 +59,7 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
         var usable = await Slice3Support.Store(fixture, clock).GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None);
         Assert.NotNull(usable);
         Assert.Equal(EvDiscoveryStatus.Ready, usable!.Status);
-        Assert.Equal("ev-export-adapter-modern", usable.SelectedAdapter!.Value.Value);
+        Assert.Equal(DocumentedAdapterId, usable.SelectedAdapter!.Value.Value);
         Assert.Equal(EvDiscoveryResultCodes.DiscoveryCompleted, usable.ResultCode.Value);
     }
 
@@ -74,27 +83,22 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
     public async Task CrashAfterReserveBeforePublishRecoversSameVersion()
     {
         var clock = new MutableClock(Slice2Support.Now);
-        var (scope, _) = await SeedProjectAsync();
+        var (scope, project) = await SeedProjectAsync();
         var env = Slice3Support.NewEnvironment();
         var host = Slice3Support.ReadyHost();
 
-        var observation = await Slice3Support.Discovery(host, clock).ProbeAsync(env, Policy, CancellationToken.None);
-        var result = EvDiscoveryEvaluator.Evaluate(DiscoveryRunId.New(), observation, Slice3Support.Adapters().Select(observation, Policy), Policy, clock.UtcNow, clock.UtcNow);
-        var bytes = new Infrastructure.EnterpriseVault.Discovery.EvDiscoveryEvidenceSerializer().Serialize(result);
-        var evidence = Slice3Support.Evidence(fixture);
-        var staging = await evidence.StageAsync(bytes.Bytes, bytes.ContentSha256, CancellationToken.None);
-        _ = await Slice3Support.Store(fixture, clock).ReserveAsync(scope, env.EnvironmentId, result, staging.SizeBytes, CorrelationId.New(), fence: null, CancellationToken.None);
-        await evidence.DiscardAsync(staging, CancellationToken.None); // queda: staging perdido, nada publicado
+        // Reserva (tx1) e queda antes de publicar: staging descartado, nada publicado, v1 pendente.
+        _ = await Slice3Support.ReserveAsync(
+            fixture, scope, env, host, clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: false);
 
         var store = Slice3Support.Store(fixture, clock);
         Assert.Null(await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None));
         Assert.Equal(1, await store.GetMaxVersionAsync(scope, env.EnvironmentId, CancellationToken.None));
 
-        var outcome = await Slice3Support.UseCase(fixture, host, new MutableClock(Slice2Support.Now))
-            .ExecuteAsync(scope, env, Policy, CorrelationId.New(), CancellationToken.None);
+        var outcome = await RunUseCaseAsync(scope, project, env, host, new MutableClock(Slice2Support.Now));
 
         Assert.True(outcome.Reconciled);
-        Assert.Equal(1, outcome.Record.DiscoveryVersion); // recuperou a MESMA versão
+        Assert.Equal(1, outcome.Record.DiscoveryVersion); // recuperou a MESMA versão pelos três hashes
         Assert.Equal(1, await store.GetMaxVersionAsync(scope, env.EnvironmentId, CancellationToken.None));
         Assert.NotNull(await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None));
     }
@@ -103,24 +107,18 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
     public async Task CrashAfterPublishBeforeFinalizeRecovers()
     {
         var clock = new MutableClock(Slice2Support.Now);
-        var (scope, _) = await SeedProjectAsync();
+        var (scope, project) = await SeedProjectAsync();
         var env = Slice3Support.NewEnvironment();
         var host = Slice3Support.ReadyHost();
 
-        var observation = await Slice3Support.Discovery(host, clock).ProbeAsync(env, Policy, CancellationToken.None);
-        var result = EvDiscoveryEvaluator.Evaluate(DiscoveryRunId.New(), observation, Slice3Support.Adapters().Select(observation, Policy), Policy, clock.UtcNow, clock.UtcNow);
-        var bytes = new Infrastructure.EnterpriseVault.Discovery.EvDiscoveryEvidenceSerializer().Serialize(result);
-        var evidence = Slice3Support.Evidence(fixture);
-        var staging = await evidence.StageAsync(bytes.Bytes, bytes.ContentSha256, CancellationToken.None);
-        var reservation = await Slice3Support.Store(fixture, clock).ReserveAsync(scope, env.EnvironmentId, result, staging.SizeBytes, CorrelationId.New(), fence: null, CancellationToken.None);
-        await evidence.PublishAsync(staging, new EvDiscoveryEvidenceDescriptor(scope, env.EnvironmentId, reservation.DiscoveryVersion), CancellationToken.None);
-        // queda antes de finalizar: pendente + evidência publicada
+        // Reserva + publicação e queda antes de finalizar: pendente + evidência publicada.
+        _ = await Slice3Support.ReserveAsync(
+            fixture, scope, env, host, clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: true);
 
         var store = Slice3Support.Store(fixture, clock);
         Assert.Null(await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None));
 
-        var outcome = await Slice3Support.UseCase(fixture, host, new MutableClock(Slice2Support.Now))
-            .ExecuteAsync(scope, env, Policy, CorrelationId.New(), CancellationToken.None);
+        var outcome = await RunUseCaseAsync(scope, project, env, host, new MutableClock(Slice2Support.Now));
 
         Assert.True(outcome.Reconciled);
         Assert.Equal(1, outcome.Record.DiscoveryVersion);
@@ -131,32 +129,28 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
     public async Task PreviousVersionStaysUsableUntilNewOneFinalized()
     {
         var clock = new MutableClock(Slice2Support.Now);
-        var (scope, _) = await SeedProjectAsync();
+        var (scope, project) = await SeedProjectAsync();
         var env = Slice3Support.NewEnvironment();
         var store = Slice3Support.Store(fixture, clock);
 
         // v1 (Ready) finalizada.
-        await Slice3Support.UseCase(fixture, Slice3Support.ReadyHost(), clock).ExecuteAsync(scope, env, Policy, CorrelationId.New(), CancellationToken.None);
+        await RunUseCaseAsync(scope, project, env, Slice3Support.ReadyHost(), clock);
         var v1 = await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None);
         Assert.Equal(1, v1!.DiscoveryVersion);
+        Assert.Equal(EvDiscoveryStatus.Ready, v1.Status);
 
-        // v2 (Blocked — permissões ausentes) apenas RESERVADA: a v1 permanece corrente.
-        var blockedHost = new FixtureEvPowerShellHost(Slice3Support.BlockedSnapshotJson, Slice3Support.ModernCommandJson);
-        var observation = await Slice3Support.Discovery(blockedHost, clock).ProbeAsync(env, Policy, CancellationToken.None);
-        var result = EvDiscoveryEvaluator.Evaluate(DiscoveryRunId.New(), observation, Slice3Support.Adapters().Select(observation, Policy), Policy, clock.UtcNow, clock.UtcNow);
-        var bytes = new Infrastructure.EnterpriseVault.Discovery.EvDiscoveryEvidenceSerializer().Serialize(result);
-        var evidence = Slice3Support.Evidence(fixture);
-        var staging = await evidence.StageAsync(bytes.Bytes, bytes.ContentSha256, CancellationToken.None);
-        _ = await store.ReserveAsync(scope, env.EnvironmentId, result, staging.SizeBytes, CorrelationId.New(), fence: null, CancellationToken.None);
+        // v2 (Blocked — permissão negada) apenas RESERVADA: a v1 permanece corrente.
+        var blockedHost = Slice3Support.ArchivePermissionDeniedHost();
+        _ = await Slice3Support.ReserveAsync(
+            fixture, scope, env, blockedHost, clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: false);
 
         var stillV1 = await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None);
         Assert.Equal(1, stillV1!.DiscoveryVersion); // v1 ainda corrente enquanto v2 pendente
         Assert.Equal(2, await store.GetMaxVersionAsync(scope, env.EnvironmentId, CancellationToken.None));
-        await evidence.DiscardAsync(staging, CancellationToken.None);
 
         // Retry da geração bloqueada reconcilia v2 e a finaliza (v1 vira Superseded).
-        var outcome = await Slice3Support.UseCase(fixture, blockedHost, new MutableClock(Slice2Support.Now))
-            .ExecuteAsync(scope, env, Policy, CorrelationId.New(), CancellationToken.None);
+        var outcome = await RunUseCaseAsync(scope, project, env, blockedHost, new MutableClock(Slice2Support.Now));
+        Assert.True(outcome.Reconciled);
         Assert.Equal(2, outcome.Record.DiscoveryVersion);
         var current = await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None);
         Assert.Equal(2, current!.DiscoveryVersion);
@@ -175,18 +169,15 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
         Assert.NotNull(claimed);
         var fence = new JobFence(scope, claimed!.Job.JobId, WorkerA, claimed.Job.Epoch);
 
-        var observation = await Slice3Support.Discovery(host, clock).ProbeAsync(env, Policy, CancellationToken.None);
-        var result = EvDiscoveryEvaluator.Evaluate(DiscoveryRunId.New(), observation, Slice3Support.Adapters().Select(observation, Policy), Policy, clock.UtcNow, clock.UtcNow);
-        var bytes = new Infrastructure.EnterpriseVault.Discovery.EvDiscoveryEvidenceSerializer().Serialize(result);
-        var evidence = Slice3Support.Evidence(fixture);
-        var store = Slice3Support.Store(fixture, clock);
-        var staging = await evidence.StageAsync(bytes.Bytes, bytes.ContentSha256, CancellationToken.None);
-        var reservation = await store.ReserveAsync(scope, env.EnvironmentId, result, staging.SizeBytes, CorrelationId.New(), fence, CancellationToken.None);
+        // Reserva + publicação sob o fence válido (lease vigente).
+        var reservation = await Slice3Support.ReserveAsync(
+            fixture, scope, env, host, clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: true, fence);
         var descriptor = new EvDiscoveryEvidenceDescriptor(scope, env.EnvironmentId, reservation.DiscoveryVersion);
-        await evidence.PublishAsync(staging, descriptor, CancellationToken.None);
 
         clock.Advance(TimeSpan.FromMinutes(7)); // lease vencido: worker defasado
 
+        var store = Slice3Support.Store(fixture, clock);
+        var evidence = Slice3Support.Evidence(fixture);
         await Assert.ThrowsAsync<FencedOutException>(() => store.FinalizeAsync(
             scope, reservation, fence,
             async token => _ = await evidence.GetAsync(descriptor, token) ?? throw new EvDiscoveryEvidenceException("ausente"),
@@ -196,12 +187,75 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task ConcurrentReserveOfSameEvidenceYieldsOnePendingVersion()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var store = Slice3Support.Store(fixture, clock);
+
+        // Dois "workers" reservam a MESMA evidência concorrentemente.
+        Task<EvDiscoveryReservation> Reserve() => Slice3Support.ReserveAsync(
+            fixture, scope, env, Slice3Support.ReadyHost(), clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: false);
+
+        var results = await Task.WhenAll(Reserve(), Reserve());
+
+        Assert.Equal(results[0].DiscoveryVersion, results[1].DiscoveryVersion); // ambos obtêm a MESMA reserva
+        Assert.Equal(1, await store.GetMaxVersionAsync(scope, env.EnvironmentId, CancellationToken.None)); // uma só versão pendente
+        Assert.True(results[0].Reconciled ^ results[1].Reconciled); // exatamente um criou; o outro reconciliou
+    }
+
+    [Fact]
+    public async Task ConcurrentReserveOfDifferentEvidenceYieldsDistinctVersions()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var store = Slice3Support.Store(fixture, clock);
+
+        // Evidências DIFERENTES (Ready vs. permissão negada) no mesmo ambiente ⇒ hashes distintos ⇒ versões distintas.
+        Task<EvDiscoveryReservation> Reserve(FixtureEvPowerShellHost host) => Slice3Support.ReserveAsync(
+            fixture, scope, env, host, clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: false);
+
+        var results = await Task.WhenAll(Reserve(Slice3Support.ReadyHost()), Reserve(Slice3Support.ArchivePermissionDeniedHost()));
+
+        Assert.NotEqual(results[0].DiscoveryVersion, results[1].DiscoveryVersion);
+        var versions = new[] { results[0].DiscoveryVersion, results[1].DiscoveryVersion }.OrderBy(v => v).ToArray();
+        Assert.Equal(1, versions[0]);
+        Assert.Equal(2, versions[1]);
+        Assert.Equal(2, await store.GetMaxVersionAsync(scope, env.EnvironmentId, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task DifferentConfigurationDoesNotReuseIncompatibleReservation()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var store = Slice3Support.Store(fixture, clock);
+        var host = Slice3Support.ReadyHost();
+
+        // Mesma evidência semântica/observada, mas HASH DE CONFIGURAÇÃO diferente (contexto de projeto distinto).
+        var configA = project.ConfigurationHash;
+        var configB = new Sha256Hash(new string('a', 64));
+
+        var first = await Slice3Support.ReserveAsync(fixture, scope, env, host, clock, project.ConfigurationVersion.Value, configA, publish: false);
+        var second = await Slice3Support.ReserveAsync(fixture, scope, env, host, clock, project.ConfigurationVersion.Value, configB, publish: false);
+
+        Assert.Equal(1, first.DiscoveryVersion);
+        Assert.False(first.Reconciled);
+        Assert.Equal(2, second.DiscoveryVersion); // configuração incompatível ⇒ NÃO reaproveita a reserva
+        Assert.False(second.Reconciled);
+        Assert.NotEqual(first.ConfigurationHash.Value, second.ConfigurationHash.Value);
+    }
+
+    [Fact]
     public async Task DiscoveryIsIsolatedByTenant()
     {
         var clock = new MutableClock(Slice2Support.Now);
-        var (scopeA, _) = await SeedProjectAsync();
+        var (scopeA, project) = await SeedProjectAsync();
         var env = Slice3Support.NewEnvironment();
-        await Slice3Support.UseCase(fixture, Slice3Support.ReadyHost(), clock).ExecuteAsync(scopeA, env, Policy, CorrelationId.New(), CancellationToken.None);
+        await RunUseCaseAsync(scopeA, project, env, Slice3Support.ReadyHost(), clock);
 
         // Outro tenant não enxerga a descoberta do tenant A (RLS por SESSION_CONTEXT).
         var scopeB = SqlServerFixture.NewScope();
@@ -212,9 +266,9 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
     public async Task TamperedEvidenceFailsClosed()
     {
         var clock = new MutableClock(Slice2Support.Now);
-        var (scope, _) = await SeedProjectAsync();
+        var (scope, project) = await SeedProjectAsync();
         var env = Slice3Support.NewEnvironment();
-        await Slice3Support.UseCase(fixture, Slice3Support.ReadyHost(), clock).ExecuteAsync(scope, env, Policy, CorrelationId.New(), CancellationToken.None);
+        await RunUseCaseAsync(scope, project, env, Slice3Support.ReadyHost(), clock);
 
         var descriptor = new EvDiscoveryEvidenceDescriptor(scope, env.EnvironmentId, 1);
         var finalDir = Path.Combine(fixture.ArtifactRoot, scope.Tenant.Value.ToString("N"), scope.Project.Value.ToString("N"),

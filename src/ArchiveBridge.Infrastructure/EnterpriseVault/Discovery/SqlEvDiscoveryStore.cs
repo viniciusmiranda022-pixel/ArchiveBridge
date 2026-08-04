@@ -11,14 +11,17 @@ namespace ArchiveBridge.Infrastructure.EnterpriseVault.Discovery;
 
 /// <summary>
 /// Persistência dos METADADOS de descoberta (nunca a evidência bruta). Protocolo recuperável em DUAS
-/// transações curtas (Slice 2), sem I/O de filesystem sob transação: <see cref="ReserveAsync"/> insere a
-/// versão como Pending (0) sob lock, cercada; a evidência é publicada FORA do SQL; <see cref="FinalizeAsync"/>
-/// valida a evidência ANTES de abrir a transação, promove Pending → estado terminal e marca a anterior
-/// como Superseded (6). O índice único filtrado (status corrente 2..5) garante uma versão corrente. Só a
-/// coluna status é atualizável (hashes/evidência imutáveis). RLS por SESSION_CONTEXT.
+/// transações curtas (Slice 2), sem I/O de filesystem sob transação. A reserva (<see cref="ReserveAsync"/>)
+/// é ATÔMICA: valida o cercamento e, sob lock, verifica a pendente equivalente pelos TRÊS hashes
+/// (configuração/evidência semântica/conteúdo) e a insere na MESMA transação — um índice único filtrado
+/// (status Pending) impede duas versões Pending para a mesma evidência; uma colisão concorrente é
+/// reconciliada relendo a pendente. A finalização promove Pending → terminal e substitui a anterior.
 /// </summary>
 public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactory, IClock clock) : IEvDiscoveryStore
 {
+    private const int UniqueViolation = 2601;
+    private const int PrimaryKeyViolation = 2627;
+
     private const string EnsureEnvironmentSql =
         """
         IF NOT EXISTS (SELECT 1 FROM dbo.ev_environments WHERE environment_id = @environment)
@@ -42,7 +45,7 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
 
     private const string RecordColumns =
         "environment_id, discovery_version, run_id, status, result_status, result_code, selected_adapter, " +
-        "adapter_version, observed_version, configuration_hash, evidence_hash, evidence_path";
+        "adapter_version, observed_version, configuration_hash, evidence_hash, content_sha256, evidence_path";
 
     private const string GetCurrentSql =
         $"SELECT {RecordColumns} FROM dbo.ev_discovery_runs " +
@@ -52,26 +55,23 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
         $"SELECT {RecordColumns} FROM dbo.ev_discovery_runs WITH (UPDLOCK, HOLDLOCK) " +
         "WHERE environment_id = @environment AND project_id = @project AND discovery_version = @version;";
 
-    private const string GetPendingByHashesSql =
-        """
-        SELECT TOP (1) environment_id, discovery_version, run_id, evidence_path, configuration_hash, evidence_hash, evidence_size_bytes
-        FROM dbo.ev_discovery_runs
-        WHERE environment_id = @environment AND project_id = @project AND status = 0
-          AND configuration_hash = @configHash AND evidence_hash = @evidenceHash
-        ORDER BY discovery_version ASC;
-        """;
+    private const string SelectPendingByHashesSql =
+        $"SELECT TOP (1) {RecordColumns} FROM dbo.ev_discovery_runs WITH (UPDLOCK, HOLDLOCK) " +
+        "WHERE environment_id = @environment AND project_id = @project AND status = 0 " +
+        "AND configuration_hash = @configHash AND evidence_hash = @semanticHash AND content_sha256 = @contentHash " +
+        "ORDER BY discovery_version ASC;";
 
     private const string InsertRunSql =
         """
         INSERT INTO dbo.ev_discovery_runs
             (environment_id, discovery_version, tenant_id, project_id, run_id, status, result_status, result_code,
              selected_adapter, adapter_version, observed_version, discovery_schema_version, configuration_hash,
-             evidence_hash, evidence_path, evidence_size_bytes, requested_by, worker_id, correlation_id,
+             evidence_hash, content_sha256, evidence_path, evidence_size_bytes, requested_by, worker_id, correlation_id,
              started_at_utc, completed_at_utc)
         VALUES
             (@environment, @version, @tenant, @project, @runId, 0, @resultStatus, @resultCode,
              @selectedAdapter, @adapterVersion, @observedVersion, @schema, @configHash,
-             @evidenceHash, @evidencePath, @evidenceSize, @requestedBy, @worker, @correlation,
+             @semanticHash, @contentHash, @evidencePath, @evidenceSize, @requestedBy, @worker, @correlation,
              @startedAt, @completedAt);
         """;
 
@@ -85,15 +85,17 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
     private const string InsertEvaluationSql =
         """
         INSERT INTO dbo.ev_adapter_evaluations
-            (environment_id, discovery_version, tenant_id, project_id, adapter_id, adapter_version, compatibility, precedence)
-        VALUES (@environment, @version, @tenant, @project, @adapterId, @adapterVersion, @compatibility, @precedence);
+            (environment_id, discovery_version, tenant_id, project_id, adapter_id, adapter_version, compatibility, precedence,
+             profile_id, runtime_observed, official_documentation, laboratory_validated)
+        VALUES (@environment, @version, @tenant, @project, @adapterId, @adapterVersion, @compatibility, @precedence,
+                @profileId, @runtimeObserved, @officialDoc, @labValidated);
         """;
 
     private const string InsertFindingSql =
         """
         INSERT INTO dbo.ev_discovery_findings
-            (environment_id, discovery_version, tenant_id, project_id, result_code, capability_code, reason, discovered_at_utc)
-        VALUES (@environment, @version, @tenant, @project, @resultCode, @capabilityCode, @reason, @discoveredAt);
+            (environment_id, discovery_version, tenant_id, project_id, result_code, capability_code, reason, discovered_at_utc, error_category)
+        VALUES (@environment, @version, @tenant, @project, @resultCode, @capabilityCode, @reason, @discoveredAt, @errorCategory);
         """;
 
     private static readonly string FenceGuardSql = $"SET NOCOUNT ON;\n{SqlJobFence.GuardSql}";
@@ -124,37 +126,41 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
     }
 
     /// <inheritdoc />
-    public async Task<EvDiscoveryReservation?> GetPendingByHashesAsync(
-        TenantScope scope, EvEnvironmentId environmentId, Sha256Hash configurationHash, Sha256Hash evidenceHash, CancellationToken cancellationToken)
-    {
-        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
-        await using var command = new SqlCommand(GetPendingByHashesSql, connection.Connection);
-        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
-        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
-        command.Parameters.Add(new SqlParameter("@configHash", SqlDbType.Char, 64) { Value = configurationHash.Value });
-        command.Parameters.Add(new SqlParameter("@evidenceHash", SqlDbType.Char, 64) { Value = evidenceHash.Value });
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            return null;
-        }
-
-        return new EvDiscoveryReservation(
-            new EvEnvironmentId(reader.GetGuid(0)),
-            reader.GetInt32(1),
-            new DiscoveryRunId(reader.GetGuid(2)),
-            reader.GetString(3),
-            new Sha256Hash(reader.GetString(4).TrimEnd()),
-            new Sha256Hash(reader.GetString(5).TrimEnd()),
-            reader.GetInt64(6));
-    }
-
-    /// <inheritdoc />
     public async Task<EvDiscoveryReservation> ReserveAsync(
-        TenantScope scope, EvEnvironmentId environmentId, EvDiscoveryRunResult result, long evidenceSizeBytes,
+        TenantScope scope, EvEnvironmentId environmentId, EvDiscoveryRunResult result,
+        Sha256Hash configurationHash, Sha256Hash semanticEvidenceHash, Sha256Hash contentSha256, long evidenceSizeBytes,
         CorrelationId correlation, JobFence? fence, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(result);
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                return await TryReserveAsync(
+                    scope, environmentId, result, configurationHash, semanticEvidenceHash, contentSha256, evidenceSizeBytes, correlation, fence, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (SqlException exception) when (exception.Number is UniqueViolation or PrimaryKeyViolation)
+            {
+                // Colisão concorrente: se for a MESMA evidência, relê a pendente e a reaproveita; se for
+                // outra evidência que colidiu no número de versão, recalcula N+1 e tenta de novo.
+                var existing = await ReadPendingByHashesAsync(scope, environmentId, configurationHash, semanticEvidenceHash, contentSha256, cancellationToken)
+                    .ConfigureAwait(false);
+                if (existing is not null)
+                {
+                    return existing;
+                }
+            }
+        }
+
+        throw new EvDiscoveryPersistenceException("Não foi possível reservar a descoberta após colisões concorrentes (fail-closed).");
+    }
+
+    private async Task<EvDiscoveryReservation> TryReserveAsync(
+        TenantScope scope, EvEnvironmentId environmentId, EvDiscoveryRunResult result,
+        Sha256Hash configurationHash, Sha256Hash semanticEvidenceHash, Sha256Hash contentSha256, long evidenceSizeBytes,
+        CorrelationId correlation, JobFence? fence, CancellationToken cancellationToken)
+    {
         await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqlTransaction)await connection.Connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -175,6 +181,15 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
                 await ensure.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            // Verificação ATÔMICA da pendente equivalente sob lock, na MESMA transação.
+            var pending = await ReadPendingInTransactionAsync(connection.Connection, transaction, scope, environmentId, configurationHash, semanticEvidenceHash, contentSha256, cancellationToken)
+                .ConfigureAwait(false);
+            if (pending is not null)
+            {
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return pending;
+            }
+
             int nextVersion;
             await using (var maxCommand = new SqlCommand(LockedMaxVersionSql, connection.Connection, transaction))
             {
@@ -185,15 +200,14 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
             }
 
             var logicalPath = new EvDiscoveryEvidenceDescriptor(scope, environmentId, nextVersion).LogicalPath;
-            await InsertRunAsync(connection.Connection, transaction, scope, environmentId, nextVersion, result, evidenceSizeBytes, logicalPath, correlation, fence, cancellationToken).ConfigureAwait(false);
+            await InsertRunAsync(connection.Connection, transaction, scope, environmentId, nextVersion, result, configurationHash, semanticEvidenceHash, contentSha256, evidenceSizeBytes, logicalPath, correlation, fence, cancellationToken).ConfigureAwait(false);
             await InsertChildrenAsync(connection.Connection, transaction, scope, environmentId, nextVersion, result, cancellationToken).ConfigureAwait(false);
 
             await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow), cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
             return new EvDiscoveryReservation(
-                environmentId, nextVersion, result.RunId, logicalPath,
-                result.CapabilitySet.ConfigurationHash, result.CapabilitySet.EvidenceHash, evidenceSizeBytes);
+                environmentId, nextVersion, result.RunId, logicalPath, configurationHash, semanticEvidenceHash, contentSha256, evidenceSizeBytes, Reconciled: false);
         }
         catch
         {
@@ -209,8 +223,6 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
     {
         ArgumentNullException.ThrowIfNull(reservation);
         ArgumentNullException.ThrowIfNull(validatePublishedEvidenceAsync);
-
-        // Valida a evidência publicada ANTES de abrir a transação/lock (nenhum I/O de filesystem sob a transação).
         await validatePublishedEvidenceAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
@@ -226,15 +238,15 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
             var current = await ReadByVersionAsync(connection.Connection, transaction, scope, reservation.Environment, reservation.DiscoveryVersion, cancellationToken).ConfigureAwait(false)
                 ?? throw new EvDiscoveryPersistenceException("Reserva de descoberta ausente na finalização (fail-closed).");
 
-            if (!string.Equals(current.ConfigurationHash.Value, reservation.ConfigurationHash.Value, StringComparison.Ordinal)
-                || !string.Equals(current.EvidenceHash.Value, reservation.EvidenceHash.Value, StringComparison.Ordinal))
+            if (!Matches(current.ConfigurationHash, reservation.ConfigurationHash)
+                || !Matches(current.SemanticEvidenceHash, reservation.SemanticEvidenceHash)
+                || !Matches(current.ContentSha256, reservation.ContentSha256))
             {
-                throw new EvDiscoveryPersistenceException("Versão reservada não corresponde aos hashes da finalização (fail-closed).");
+                throw new EvDiscoveryPersistenceException("Versão reservada não corresponde aos três hashes da finalização (fail-closed).");
             }
 
             if (current.Status != EvDiscoveryStatus.Pending)
             {
-                // Já finalizada (replay idempotente): nenhum novo efeito.
                 await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow), cancellationToken).ConfigureAwait(false);
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 return current;
@@ -274,9 +286,42 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
         }
     }
 
+    private static bool Matches(Sha256Hash a, Sha256Hash b) => string.Equals(a.Value, b.Value, StringComparison.Ordinal);
+
+    private async Task<EvDiscoveryReservation?> ReadPendingByHashesAsync(
+        TenantScope scope, EvEnvironmentId environmentId, Sha256Hash configHash, Sha256Hash semanticHash, Sha256Hash contentHash, CancellationToken cancellationToken)
+    {
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        return await ReadPendingInTransactionAsync(connection.Connection, transaction: null, scope, environmentId, configHash, semanticHash, contentHash, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<EvDiscoveryReservation?> ReadPendingInTransactionAsync(
+        SqlConnection connection, SqlTransaction? transaction, TenantScope scope, EvEnvironmentId environmentId,
+        Sha256Hash configHash, Sha256Hash semanticHash, Sha256Hash contentHash, CancellationToken cancellationToken)
+    {
+        var sql = transaction is null ? SelectPendingByHashesSql.Replace(" WITH (UPDLOCK, HOLDLOCK)", string.Empty, StringComparison.Ordinal) : SelectPendingByHashesSql;
+        await using var command = transaction is null ? new SqlCommand(sql, connection) : new SqlCommand(sql, connection, transaction);
+        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        command.Parameters.Add(new SqlParameter("@configHash", SqlDbType.Char, 64) { Value = configHash.Value });
+        command.Parameters.Add(new SqlParameter("@semanticHash", SqlDbType.Char, 64) { Value = semanticHash.Value });
+        command.Parameters.Add(new SqlParameter("@contentHash", SqlDbType.Char, 64) { Value = contentHash.Value });
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        var record = ReadRecord(reader);
+        return new EvDiscoveryReservation(
+            record.Environment, record.DiscoveryVersion, record.RunId, record.EvidenceLogicalPath,
+            record.ConfigurationHash, record.SemanticEvidenceHash, record.ContentSha256, 0, Reconciled: true);
+    }
+
     private static async Task InsertRunAsync(
         SqlConnection connection, SqlTransaction transaction, TenantScope scope, EvEnvironmentId environmentId, int version,
-        EvDiscoveryRunResult result, long evidenceSizeBytes, string logicalPath, CorrelationId correlation, JobFence? fence, CancellationToken cancellationToken)
+        EvDiscoveryRunResult result, Sha256Hash configHash, Sha256Hash semanticHash, Sha256Hash contentHash, long evidenceSizeBytes,
+        string logicalPath, CorrelationId correlation, JobFence? fence, CancellationToken cancellationToken)
     {
         await using var command = new SqlCommand(InsertRunSql, connection, transaction);
         command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
@@ -290,8 +335,9 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
         command.Parameters.Add(new SqlParameter("@adapterVersion", SqlDbType.Int) { Value = (object?)result.CapabilitySet.AdapterVersion ?? DBNull.Value });
         command.Parameters.Add(new SqlParameter("@observedVersion", SqlDbType.NVarChar, 100) { Value = result.Environment.ObservedVersion });
         command.Parameters.Add(new SqlParameter("@schema", SqlDbType.Int) { Value = result.CapabilitySet.DiscoverySchemaVersion });
-        command.Parameters.Add(new SqlParameter("@configHash", SqlDbType.Char, 64) { Value = result.CapabilitySet.ConfigurationHash.Value });
-        command.Parameters.Add(new SqlParameter("@evidenceHash", SqlDbType.Char, 64) { Value = result.CapabilitySet.EvidenceHash.Value });
+        command.Parameters.Add(new SqlParameter("@configHash", SqlDbType.Char, 64) { Value = configHash.Value });
+        command.Parameters.Add(new SqlParameter("@semanticHash", SqlDbType.Char, 64) { Value = semanticHash.Value });
+        command.Parameters.Add(new SqlParameter("@contentHash", SqlDbType.Char, 64) { Value = contentHash.Value });
         command.Parameters.Add(new SqlParameter("@evidencePath", SqlDbType.NVarChar, 400) { Value = logicalPath });
         command.Parameters.Add(new SqlParameter("@evidenceSize", SqlDbType.BigInt) { Value = evidenceSizeBytes });
         command.Parameters.Add(new SqlParameter("@requestedBy", SqlDbType.NVarChar, 200) { Value = DBNull.Value });
@@ -326,6 +372,10 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
             command.Parameters.Add(new SqlParameter("@adapterVersion", SqlDbType.Int) { Value = evaluation.AdapterVersion });
             command.Parameters.Add(new SqlParameter("@compatibility", SqlDbType.TinyInt) { Value = (byte)evaluation.Compatibility });
             command.Parameters.Add(new SqlParameter("@precedence", SqlDbType.Int) { Value = evaluation.Precedence });
+            command.Parameters.Add(new SqlParameter("@profileId", SqlDbType.NVarChar, 200) { Value = (object?)evaluation.ProfileId ?? DBNull.Value });
+            command.Parameters.Add(new SqlParameter("@runtimeObserved", SqlDbType.Bit) { Value = (object?)evaluation.Maturity?.RuntimeObserved ?? DBNull.Value });
+            command.Parameters.Add(new SqlParameter("@officialDoc", SqlDbType.Bit) { Value = (object?)evaluation.Maturity?.OfficialDocumentation ?? DBNull.Value });
+            command.Parameters.Add(new SqlParameter("@labValidated", SqlDbType.Bit) { Value = (object?)evaluation.Maturity?.LaboratoryValidated ?? DBNull.Value });
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -337,6 +387,7 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
             command.Parameters.Add(new SqlParameter("@capabilityCode", SqlDbType.NVarChar, 64) { Value = (object?)finding.CapabilityCode?.Value ?? DBNull.Value });
             command.Parameters.Add(new SqlParameter("@reason", SqlDbType.NVarChar, 400) { Value = finding.Reason });
             command.Parameters.Add(new SqlParameter("@discoveredAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(finding.DiscoveredAtUtc) });
+            command.Parameters.Add(new SqlParameter("@errorCategory", SqlDbType.TinyInt) { Value = (byte)finding.ErrorCategory });
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -352,9 +403,8 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
     private static async Task<EvDiscoveryRecord?> ReadByVersionAsync(
         SqlConnection connection, SqlTransaction? transaction, TenantScope scope, EvEnvironmentId environmentId, int version, CancellationToken cancellationToken)
     {
-        await using var command = transaction is null
-            ? new SqlCommand(SelectByVersionSql.Replace(" WITH (UPDLOCK, HOLDLOCK)", string.Empty, StringComparison.Ordinal), connection)
-            : new SqlCommand(SelectByVersionSql, connection, transaction);
+        var sql = transaction is null ? SelectByVersionSql.Replace(" WITH (UPDLOCK, HOLDLOCK)", string.Empty, StringComparison.Ordinal) : SelectByVersionSql;
+        await using var command = transaction is null ? new SqlCommand(sql, connection) : new SqlCommand(sql, connection, transaction);
         command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
         command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
         command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = version });
@@ -374,5 +424,6 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
             reader.GetString(8),
             new Sha256Hash(reader.GetString(9).TrimEnd()),
             new Sha256Hash(reader.GetString(10).TrimEnd()),
-            reader.GetString(11));
+            new Sha256Hash(reader.GetString(11).TrimEnd()),
+            reader.GetString(12));
 }

@@ -29,4 +29,6 @@ public sealed record EvAdapterEvaluation(
     IReadOnlyList<EvCapability> Capabilities,
     IReadOnlyList<EvAdapterRequirement> Requirements,
     IReadOnlyList<EvDiscoveryFinding> Findings,
-    int Precedence);
+    int Precedence,
+    string? ProfileId = null,
+    EvExportMaturity? Maturity = null);
