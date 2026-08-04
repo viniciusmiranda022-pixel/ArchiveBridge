@@ -1,0 +1,378 @@
+using System.Data;
+using ArchiveBridge.Contracts.Abstractions;
+using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
+using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Domain.Common;
+using ArchiveBridge.Domain.EnterpriseVault.Discovery;
+using ArchiveBridge.Infrastructure.Persistence;
+using Microsoft.Data.SqlClient;
+
+namespace ArchiveBridge.Infrastructure.EnterpriseVault.Discovery;
+
+/// <summary>
+/// Persistência dos METADADOS de descoberta (nunca a evidência bruta). Protocolo recuperável em DUAS
+/// transações curtas (Slice 2), sem I/O de filesystem sob transação: <see cref="ReserveAsync"/> insere a
+/// versão como Pending (0) sob lock, cercada; a evidência é publicada FORA do SQL; <see cref="FinalizeAsync"/>
+/// valida a evidência ANTES de abrir a transação, promove Pending → estado terminal e marca a anterior
+/// como Superseded (6). O índice único filtrado (status corrente 2..5) garante uma versão corrente. Só a
+/// coluna status é atualizável (hashes/evidência imutáveis). RLS por SESSION_CONTEXT.
+/// </summary>
+public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactory, IClock clock) : IEvDiscoveryStore
+{
+    private const string EnsureEnvironmentSql =
+        """
+        IF NOT EXISTS (SELECT 1 FROM dbo.ev_environments WHERE environment_id = @environment)
+            INSERT INTO dbo.ev_environments (environment_id, tenant_id, project_id, site_name, directory_server)
+            VALUES (@environment, @tenant, @project, @site, @directory);
+        """;
+
+    private const string MaxVersionSql =
+        "SELECT ISNULL(MAX(discovery_version), 0) FROM dbo.ev_discovery_runs WHERE environment_id = @environment AND project_id = @project;";
+
+    private const string LockedMaxVersionSql =
+        "SELECT ISNULL(MAX(discovery_version), 0) FROM dbo.ev_discovery_runs WITH (UPDLOCK, HOLDLOCK) " +
+        "WHERE environment_id = @environment AND project_id = @project;";
+
+    private const string SupersedeSql =
+        "UPDATE dbo.ev_discovery_runs SET status = 6 WHERE environment_id = @environment AND project_id = @project AND status IN (2, 3, 4, 5);";
+
+    private const string PromoteSql =
+        "SET NOCOUNT OFF; UPDATE dbo.ev_discovery_runs SET status = result_status " +
+        "WHERE environment_id = @environment AND project_id = @project AND discovery_version = @version AND status = 0;";
+
+    private const string RecordColumns =
+        "environment_id, discovery_version, run_id, status, result_status, result_code, selected_adapter, " +
+        "adapter_version, observed_version, configuration_hash, evidence_hash, evidence_path";
+
+    private const string GetCurrentSql =
+        $"SELECT {RecordColumns} FROM dbo.ev_discovery_runs " +
+        "WHERE environment_id = @environment AND project_id = @project AND status IN (2, 3, 4, 5);";
+
+    private const string SelectByVersionSql =
+        $"SELECT {RecordColumns} FROM dbo.ev_discovery_runs WITH (UPDLOCK, HOLDLOCK) " +
+        "WHERE environment_id = @environment AND project_id = @project AND discovery_version = @version;";
+
+    private const string GetPendingByHashesSql =
+        """
+        SELECT TOP (1) environment_id, discovery_version, run_id, evidence_path, configuration_hash, evidence_hash, evidence_size_bytes
+        FROM dbo.ev_discovery_runs
+        WHERE environment_id = @environment AND project_id = @project AND status = 0
+          AND configuration_hash = @configHash AND evidence_hash = @evidenceHash
+        ORDER BY discovery_version ASC;
+        """;
+
+    private const string InsertRunSql =
+        """
+        INSERT INTO dbo.ev_discovery_runs
+            (environment_id, discovery_version, tenant_id, project_id, run_id, status, result_status, result_code,
+             selected_adapter, adapter_version, observed_version, discovery_schema_version, configuration_hash,
+             evidence_hash, evidence_path, evidence_size_bytes, requested_by, worker_id, correlation_id,
+             started_at_utc, completed_at_utc)
+        VALUES
+            (@environment, @version, @tenant, @project, @runId, 0, @resultStatus, @resultCode,
+             @selectedAdapter, @adapterVersion, @observedVersion, @schema, @configHash,
+             @evidenceHash, @evidencePath, @evidenceSize, @requestedBy, @worker, @correlation,
+             @startedAt, @completedAt);
+        """;
+
+    private const string InsertCapabilitySql =
+        """
+        INSERT INTO dbo.ev_capabilities
+            (environment_id, discovery_version, tenant_id, project_id, capability_code, capability_version, availability, evidence_reference, blocking_reason)
+        VALUES (@environment, @version, @tenant, @project, @code, @capVersion, @availability, @evidenceRef, @blockingReason);
+        """;
+
+    private const string InsertEvaluationSql =
+        """
+        INSERT INTO dbo.ev_adapter_evaluations
+            (environment_id, discovery_version, tenant_id, project_id, adapter_id, adapter_version, compatibility, precedence)
+        VALUES (@environment, @version, @tenant, @project, @adapterId, @adapterVersion, @compatibility, @precedence);
+        """;
+
+    private const string InsertFindingSql =
+        """
+        INSERT INTO dbo.ev_discovery_findings
+            (environment_id, discovery_version, tenant_id, project_id, result_code, capability_code, reason, discovered_at_utc)
+        VALUES (@environment, @version, @tenant, @project, @resultCode, @capabilityCode, @reason, @discoveredAt);
+        """;
+
+    private static readonly string FenceGuardSql = $"SET NOCOUNT ON;\n{SqlJobFence.GuardSql}";
+
+    private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
+    private readonly IClock _clock = clock;
+
+    /// <inheritdoc />
+    public async Task<int> GetMaxVersionAsync(TenantScope scope, EvEnvironmentId environmentId, CancellationToken cancellationToken)
+    {
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var command = new SqlCommand(MaxVersionSql, connection.Connection);
+        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        var scalar = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return scalar is int value ? value : 0;
+    }
+
+    /// <inheritdoc />
+    public async Task<EvDiscoveryRecord?> GetUsableAsync(TenantScope scope, EvEnvironmentId environmentId, CancellationToken cancellationToken)
+    {
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var command = new SqlCommand(GetCurrentSql, connection.Connection);
+        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadRecord(reader) : null;
+    }
+
+    /// <inheritdoc />
+    public async Task<EvDiscoveryReservation?> GetPendingByHashesAsync(
+        TenantScope scope, EvEnvironmentId environmentId, Sha256Hash configurationHash, Sha256Hash evidenceHash, CancellationToken cancellationToken)
+    {
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var command = new SqlCommand(GetPendingByHashesSql, connection.Connection);
+        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        command.Parameters.Add(new SqlParameter("@configHash", SqlDbType.Char, 64) { Value = configurationHash.Value });
+        command.Parameters.Add(new SqlParameter("@evidenceHash", SqlDbType.Char, 64) { Value = evidenceHash.Value });
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        return new EvDiscoveryReservation(
+            new EvEnvironmentId(reader.GetGuid(0)),
+            reader.GetInt32(1),
+            new DiscoveryRunId(reader.GetGuid(2)),
+            reader.GetString(3),
+            new Sha256Hash(reader.GetString(4).TrimEnd()),
+            new Sha256Hash(reader.GetString(5).TrimEnd()),
+            reader.GetInt64(6));
+    }
+
+    /// <inheritdoc />
+    public async Task<EvDiscoveryReservation> ReserveAsync(
+        TenantScope scope, EvEnvironmentId environmentId, EvDiscoveryRunResult result, long evidenceSizeBytes,
+        CorrelationId correlation, JobFence? fence, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var transaction = (SqlTransaction)await connection.Connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using (var guard = new SqlCommand(FenceGuardSql, connection.Connection, transaction))
+            {
+                SqlJobFence.Bind(guard, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow));
+                await SqlJobFence.ExecuteGuardedAsync(guard, concurrencyError: -1, "EvDiscovery", cancellationToken).ConfigureAwait(false);
+            }
+
+            await using (var ensure = new SqlCommand(EnsureEnvironmentSql, connection.Connection, transaction))
+            {
+                ensure.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
+                ensure.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+                ensure.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+                ensure.Parameters.Add(new SqlParameter("@site", SqlDbType.NVarChar, 200) { Value = result.Environment.SiteName });
+                ensure.Parameters.Add(new SqlParameter("@directory", SqlDbType.NVarChar, 260) { Value = result.Environment.DirectoryServer });
+                await ensure.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            int nextVersion;
+            await using (var maxCommand = new SqlCommand(LockedMaxVersionSql, connection.Connection, transaction))
+            {
+                maxCommand.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
+                maxCommand.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+                var scalar = await maxCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+                nextVersion = (scalar is int value ? value : 0) + 1;
+            }
+
+            var logicalPath = new EvDiscoveryEvidenceDescriptor(scope, environmentId, nextVersion).LogicalPath;
+            await InsertRunAsync(connection.Connection, transaction, scope, environmentId, nextVersion, result, evidenceSizeBytes, logicalPath, correlation, fence, cancellationToken).ConfigureAwait(false);
+            await InsertChildrenAsync(connection.Connection, transaction, scope, environmentId, nextVersion, result, cancellationToken).ConfigureAwait(false);
+
+            await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow), cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            return new EvDiscoveryReservation(
+                environmentId, nextVersion, result.RunId, logicalPath,
+                result.CapabilitySet.ConfigurationHash, result.CapabilitySet.EvidenceHash, evidenceSizeBytes);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<EvDiscoveryRecord> FinalizeAsync(
+        TenantScope scope, EvDiscoveryReservation reservation, JobFence? fence,
+        Func<CancellationToken, Task> validatePublishedEvidenceAsync, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(reservation);
+        ArgumentNullException.ThrowIfNull(validatePublishedEvidenceAsync);
+
+        // Valida a evidência publicada ANTES de abrir a transação/lock (nenhum I/O de filesystem sob a transação).
+        await validatePublishedEvidenceAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var transaction = (SqlTransaction)await connection.Connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using (var guard = new SqlCommand(FenceGuardSql, connection.Connection, transaction))
+            {
+                SqlJobFence.Bind(guard, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow));
+                await SqlJobFence.ExecuteGuardedAsync(guard, concurrencyError: -1, "EvDiscovery", cancellationToken).ConfigureAwait(false);
+            }
+
+            var current = await ReadByVersionAsync(connection.Connection, transaction, scope, reservation.Environment, reservation.DiscoveryVersion, cancellationToken).ConfigureAwait(false)
+                ?? throw new EvDiscoveryPersistenceException("Reserva de descoberta ausente na finalização (fail-closed).");
+
+            if (!string.Equals(current.ConfigurationHash.Value, reservation.ConfigurationHash.Value, StringComparison.Ordinal)
+                || !string.Equals(current.EvidenceHash.Value, reservation.EvidenceHash.Value, StringComparison.Ordinal))
+            {
+                throw new EvDiscoveryPersistenceException("Versão reservada não corresponde aos hashes da finalização (fail-closed).");
+            }
+
+            if (current.Status != EvDiscoveryStatus.Pending)
+            {
+                // Já finalizada (replay idempotente): nenhum novo efeito.
+                await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow), cancellationToken).ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return current;
+            }
+
+            await using (var supersede = new SqlCommand(SupersedeSql, connection.Connection, transaction))
+            {
+                supersede.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = reservation.Environment.Value });
+                supersede.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+                await supersede.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            int promoted;
+            await using (var promote = new SqlCommand(PromoteSql, connection.Connection, transaction))
+            {
+                promote.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = reservation.Environment.Value });
+                promote.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+                promote.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = reservation.DiscoveryVersion });
+                promoted = await promote.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (promoted != 1)
+            {
+                throw new EvDiscoveryPersistenceException("Falha ao promover a reserva de descoberta (fail-closed).");
+            }
+
+            await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(_clock.UtcNow), cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            return await ReadByVersionAsync(connection.Connection, transaction: null, scope, reservation.Environment, reservation.DiscoveryVersion, cancellationToken).ConfigureAwait(false)
+                ?? throw new EvDiscoveryPersistenceException("Versão finalizada ilegível (fail-closed).");
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private static async Task InsertRunAsync(
+        SqlConnection connection, SqlTransaction transaction, TenantScope scope, EvEnvironmentId environmentId, int version,
+        EvDiscoveryRunResult result, long evidenceSizeBytes, string logicalPath, CorrelationId correlation, JobFence? fence, CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(InsertRunSql, connection, transaction);
+        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
+        command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = version });
+        command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        command.Parameters.Add(new SqlParameter("@runId", SqlDbType.UniqueIdentifier) { Value = result.RunId.Value });
+        command.Parameters.Add(new SqlParameter("@resultStatus", SqlDbType.TinyInt) { Value = (byte)result.Status });
+        command.Parameters.Add(new SqlParameter("@resultCode", SqlDbType.NVarChar, 64) { Value = result.ResultCode.Value });
+        command.Parameters.Add(new SqlParameter("@selectedAdapter", SqlDbType.NVarChar, 200) { Value = (object?)result.CapabilitySet.AdapterId?.Value ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@adapterVersion", SqlDbType.Int) { Value = (object?)result.CapabilitySet.AdapterVersion ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@observedVersion", SqlDbType.NVarChar, 100) { Value = result.Environment.ObservedVersion });
+        command.Parameters.Add(new SqlParameter("@schema", SqlDbType.Int) { Value = result.CapabilitySet.DiscoverySchemaVersion });
+        command.Parameters.Add(new SqlParameter("@configHash", SqlDbType.Char, 64) { Value = result.CapabilitySet.ConfigurationHash.Value });
+        command.Parameters.Add(new SqlParameter("@evidenceHash", SqlDbType.Char, 64) { Value = result.CapabilitySet.EvidenceHash.Value });
+        command.Parameters.Add(new SqlParameter("@evidencePath", SqlDbType.NVarChar, 400) { Value = logicalPath });
+        command.Parameters.Add(new SqlParameter("@evidenceSize", SqlDbType.BigInt) { Value = evidenceSizeBytes });
+        command.Parameters.Add(new SqlParameter("@requestedBy", SqlDbType.NVarChar, 200) { Value = DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@worker", SqlDbType.NVarChar, 200) { Value = (object?)fence?.Worker.Value ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = correlation.Value });
+        command.Parameters.Add(new SqlParameter("@startedAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(result.StartedAtUtc) });
+        command.Parameters.Add(new SqlParameter("@completedAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(result.CompletedAtUtc) });
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task InsertChildrenAsync(
+        SqlConnection connection, SqlTransaction transaction, TenantScope scope, EvEnvironmentId environmentId, int version,
+        EvDiscoveryRunResult result, CancellationToken cancellationToken)
+    {
+        foreach (var capability in result.CapabilitySet.Capabilities)
+        {
+            await using var command = new SqlCommand(InsertCapabilitySql, connection, transaction);
+            AddScope(command, scope, environmentId, version);
+            command.Parameters.Add(new SqlParameter("@code", SqlDbType.NVarChar, 64) { Value = capability.CapabilityCode.Value });
+            command.Parameters.Add(new SqlParameter("@capVersion", SqlDbType.Int) { Value = capability.CapabilityVersion });
+            command.Parameters.Add(new SqlParameter("@availability", SqlDbType.TinyInt) { Value = (byte)capability.Availability });
+            command.Parameters.Add(new SqlParameter("@evidenceRef", SqlDbType.NVarChar, 200) { Value = capability.EvidenceReference });
+            command.Parameters.Add(new SqlParameter("@blockingReason", SqlDbType.NVarChar, 400) { Value = (object?)capability.BlockingReason ?? DBNull.Value });
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        foreach (var evaluation in result.Selection.Evaluations)
+        {
+            await using var command = new SqlCommand(InsertEvaluationSql, connection, transaction);
+            AddScope(command, scope, environmentId, version);
+            command.Parameters.Add(new SqlParameter("@adapterId", SqlDbType.NVarChar, 200) { Value = evaluation.AdapterId.Value });
+            command.Parameters.Add(new SqlParameter("@adapterVersion", SqlDbType.Int) { Value = evaluation.AdapterVersion });
+            command.Parameters.Add(new SqlParameter("@compatibility", SqlDbType.TinyInt) { Value = (byte)evaluation.Compatibility });
+            command.Parameters.Add(new SqlParameter("@precedence", SqlDbType.Int) { Value = evaluation.Precedence });
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        foreach (var finding in result.BlockingFindings)
+        {
+            await using var command = new SqlCommand(InsertFindingSql, connection, transaction);
+            AddScope(command, scope, environmentId, version);
+            command.Parameters.Add(new SqlParameter("@resultCode", SqlDbType.NVarChar, 64) { Value = finding.ResultCode.Value });
+            command.Parameters.Add(new SqlParameter("@capabilityCode", SqlDbType.NVarChar, 64) { Value = (object?)finding.CapabilityCode?.Value ?? DBNull.Value });
+            command.Parameters.Add(new SqlParameter("@reason", SqlDbType.NVarChar, 400) { Value = finding.Reason });
+            command.Parameters.Add(new SqlParameter("@discoveredAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(finding.DiscoveredAtUtc) });
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static void AddScope(SqlCommand command, TenantScope scope, EvEnvironmentId environmentId, int version)
+    {
+        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
+        command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = version });
+        command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+    }
+
+    private static async Task<EvDiscoveryRecord?> ReadByVersionAsync(
+        SqlConnection connection, SqlTransaction? transaction, TenantScope scope, EvEnvironmentId environmentId, int version, CancellationToken cancellationToken)
+    {
+        await using var command = transaction is null
+            ? new SqlCommand(SelectByVersionSql.Replace(" WITH (UPDLOCK, HOLDLOCK)", string.Empty, StringComparison.Ordinal), connection)
+            : new SqlCommand(SelectByVersionSql, connection, transaction);
+        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = version });
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadRecord(reader) : null;
+    }
+
+    private static EvDiscoveryRecord ReadRecord(SqlDataReader reader) =>
+        new(
+            new EvEnvironmentId(reader.GetGuid(0)),
+            reader.GetInt32(1),
+            new DiscoveryRunId(reader.GetGuid(2)),
+            (EvDiscoveryStatus)reader.GetByte(3),
+            new EvDiscoveryResultCode(reader.GetString(5)),
+            reader.IsDBNull(6) ? null : new EvAdapterId(reader.GetString(6)),
+            reader.IsDBNull(7) ? null : reader.GetInt32(7),
+            reader.GetString(8),
+            new Sha256Hash(reader.GetString(9).TrimEnd()),
+            new Sha256Hash(reader.GetString(10).TrimEnd()),
+            reader.GetString(11));
+}
