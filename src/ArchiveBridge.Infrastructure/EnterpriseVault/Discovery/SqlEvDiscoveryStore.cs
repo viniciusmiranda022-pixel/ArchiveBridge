@@ -55,8 +55,10 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
         $"SELECT {RecordColumns} FROM dbo.ev_discovery_runs WITH (UPDLOCK, HOLDLOCK) " +
         "WHERE environment_id = @environment AND project_id = @project AND discovery_version = @version;";
 
+    // Inclui evidence_size_bytes (após as 13 colunas de RecordColumns, índice 13) para a reserva
+    // reconciliada recuperar o TAMANHO REAL do SQL — nunca zero.
     private const string SelectPendingByHashesSql =
-        $"SELECT TOP (1) {RecordColumns} FROM dbo.ev_discovery_runs WITH (UPDLOCK, HOLDLOCK) " +
+        $"SELECT TOP (1) {RecordColumns}, evidence_size_bytes FROM dbo.ev_discovery_runs WITH (UPDLOCK, HOLDLOCK) " +
         "WHERE environment_id = @environment AND project_id = @project AND status = 0 " +
         "AND configuration_hash = @configHash AND evidence_hash = @semanticHash AND content_sha256 = @contentHash " +
         "ORDER BY discovery_version ASC;";
@@ -219,11 +221,21 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
     /// <inheritdoc />
     public async Task<EvDiscoveryRecord> FinalizeAsync(
         TenantScope scope, EvDiscoveryReservation reservation, JobFence? fence,
-        Func<CancellationToken, Task> validatePublishedEvidenceAsync, CancellationToken cancellationToken)
+        Func<CancellationToken, Task<EvDiscoveryEvidenceReference>> readPublishedEvidenceAsync, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(reservation);
-        ArgumentNullException.ThrowIfNull(validatePublishedEvidenceAsync);
-        await validatePublishedEvidenceAsync(cancellationToken).ConfigureAwait(false);
+        ArgumentNullException.ThrowIfNull(readPublishedEvidenceAsync);
+
+        // Lê o artefato publicado FORA da transação e CONFERE contra a reserva (caminho lógico + tamanho +
+        // SHA-256 do conteúdo). Divergência ⇒ fail-closed, antes de abrir qualquer transação/lock.
+        var published = await readPublishedEvidenceAsync(cancellationToken).ConfigureAwait(false);
+        if (!string.Equals(published.LogicalPath, reservation.EvidenceLogicalPath, StringComparison.Ordinal)
+            || published.SizeBytes != reservation.SizeBytes
+            || !Matches(published.ContentSha256, reservation.ContentSha256))
+        {
+            throw new EvDiscoveryPersistenceException(
+                "Evidência publicada diverge da reserva (caminho/tamanho/conteúdo) — finalização recusada (fail-closed).");
+        }
 
         await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqlTransaction)await connection.Connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
@@ -313,9 +325,10 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
         }
 
         var record = ReadRecord(reader);
+        var sizeBytes = reader.GetInt64(13); // evidence_size_bytes — tamanho REAL persistido (nunca zero na reconciliação)
         return new EvDiscoveryReservation(
             record.Environment, record.DiscoveryVersion, record.RunId, record.EvidenceLogicalPath,
-            record.ConfigurationHash, record.SemanticEvidenceHash, record.ContentSha256, 0, Reconciled: true);
+            record.ConfigurationHash, record.SemanticEvidenceHash, record.ContentSha256, sizeBytes, Reconciled: true);
     }
 
     private static async Task InsertRunAsync(

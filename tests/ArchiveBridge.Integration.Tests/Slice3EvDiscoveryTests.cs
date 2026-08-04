@@ -180,7 +180,11 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
         var evidence = Slice3Support.Evidence(fixture);
         await Assert.ThrowsAsync<FencedOutException>(() => store.FinalizeAsync(
             scope, reservation, fence,
-            async token => _ = await evidence.GetAsync(descriptor, token) ?? throw new EvDiscoveryEvidenceException("ausente"),
+            async token =>
+            {
+                var content = await evidence.GetAsync(descriptor, token) ?? throw new EvDiscoveryEvidenceException("ausente");
+                return new EvDiscoveryEvidenceReference(descriptor.LogicalPath, content.Bytes.Length, content.ContentSha256);
+            },
             CancellationToken.None));
 
         Assert.Null(await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None)); // nunca promovida
@@ -277,5 +281,146 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
 
         await Assert.ThrowsAsync<EvDiscoveryEvidenceException>(() =>
             Slice3Support.Evidence(fixture).GetAsync(descriptor, CancellationToken.None));
+    }
+
+    // ---- Evidência publicada vs. reserva: a finalização confere caminho/tamanho/conteúdo + hashes autoritativos ----
+
+    private async Task<EvDiscoveryEvidenceReference> PublishedReferenceAsync(TenantScope scope, EvEnvironmentDescriptor env, int version)
+    {
+        var descriptor = new EvDiscoveryEvidenceDescriptor(scope, env.EnvironmentId, version);
+        var content = await Slice3Support.Evidence(fixture).GetAsync(descriptor, CancellationToken.None);
+        Assert.NotNull(content);
+        return new EvDiscoveryEvidenceReference(descriptor.LogicalPath, content!.Bytes.Length, content.ContentSha256);
+    }
+
+    [Fact]
+    public async Task FinalizeRejectsPublishedContentShaDifferentFromReservation()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var reservation = await Slice3Support.ReserveAsync(
+            fixture, scope, env, Slice3Support.ReadyHost(), clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: true);
+        var store = Slice3Support.Store(fixture, clock);
+
+        // Bundle internamente consistente, porém com SHA de conteúdo diferente do reservado.
+        var wrong = new EvDiscoveryEvidenceReference(reservation.EvidenceLogicalPath, reservation.SizeBytes, new Sha256Hash(new string('b', 64)));
+        await Assert.ThrowsAsync<EvDiscoveryPersistenceException>(() => store.FinalizeAsync(
+            scope, reservation, fence: null, _ => Task.FromResult(wrong), CancellationToken.None));
+        Assert.Null(await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None)); // não finalizou
+    }
+
+    [Fact]
+    public async Task FinalizeRejectsPublishedSizeDifferentFromReservation()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var reservation = await Slice3Support.ReserveAsync(
+            fixture, scope, env, Slice3Support.ReadyHost(), clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: true);
+        var store = Slice3Support.Store(fixture, clock);
+
+        var wrong = (await PublishedReferenceAsync(scope, env, reservation.DiscoveryVersion)) with { SizeBytes = reservation.SizeBytes + 1 };
+        await Assert.ThrowsAsync<EvDiscoveryPersistenceException>(() => store.FinalizeAsync(
+            scope, reservation, fence: null, _ => Task.FromResult(wrong), CancellationToken.None));
+        Assert.Null(await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task FinalizeRejectsPublishedLogicalPathDifferentFromReservation()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var reservation = await Slice3Support.ReserveAsync(
+            fixture, scope, env, Slice3Support.ReadyHost(), clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: true);
+        var store = Slice3Support.Store(fixture, clock);
+
+        var wrong = (await PublishedReferenceAsync(scope, env, reservation.DiscoveryVersion)) with { LogicalPath = reservation.EvidenceLogicalPath + "-tampered" };
+        await Assert.ThrowsAsync<EvDiscoveryPersistenceException>(() => store.FinalizeAsync(
+            scope, reservation, fence: null, _ => Task.FromResult(wrong), CancellationToken.None));
+        Assert.Null(await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task FinalizeRejectsReservationConfigurationHashDivergentFromSql()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var reservation = await Slice3Support.ReserveAsync(
+            fixture, scope, env, Slice3Support.ReadyHost(), clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: true);
+        var store = Slice3Support.Store(fixture, clock);
+
+        // ConfigurationHash AUTORITATIVO divergente do que foi gravado no SQL para a reserva.
+        var real = await PublishedReferenceAsync(scope, env, reservation.DiscoveryVersion);
+        var tampered = reservation with { ConfigurationHash = new Sha256Hash(new string('c', 64)) };
+        await Assert.ThrowsAsync<EvDiscoveryPersistenceException>(() => store.FinalizeAsync(
+            scope, tampered, fence: null, _ => Task.FromResult(real), CancellationToken.None));
+        Assert.Null(await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task FinalizeRejectsReservationSemanticHashDivergentFromSql()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var reservation = await Slice3Support.ReserveAsync(
+            fixture, scope, env, Slice3Support.ReadyHost(), clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: true);
+        var store = Slice3Support.Store(fixture, clock);
+
+        var real = await PublishedReferenceAsync(scope, env, reservation.DiscoveryVersion);
+        var tampered = reservation with { SemanticEvidenceHash = new Sha256Hash(new string('d', 64)) };
+        await Assert.ThrowsAsync<EvDiscoveryPersistenceException>(() => store.FinalizeAsync(
+            scope, tampered, fence: null, _ => Task.FromResult(real), CancellationToken.None));
+        Assert.Null(await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ReconciledReservationRecoversRealSizeFromSql()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+
+        var first = await Slice3Support.ReserveAsync(
+            fixture, scope, env, Slice3Support.ReadyHost(), clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: false);
+        Assert.False(first.Reconciled);
+        Assert.True(first.SizeBytes > 0);
+
+        // Segunda reserva da MESMA evidência ⇒ reconciliada, recuperando o TAMANHO REAL do SQL (não zero).
+        var second = await Slice3Support.ReserveAsync(
+            fixture, scope, env, Slice3Support.ReadyHost(), clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: false);
+        Assert.True(second.Reconciled);
+        Assert.Equal(first.DiscoveryVersion, second.DiscoveryVersion);
+        Assert.Equal(first.SizeBytes, second.SizeBytes);
+        Assert.True(second.SizeBytes > 0);
+    }
+
+    [Fact]
+    public async Task FinalizeFailureDoesNotSupersedePreviousUsableVersion()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var store = Slice3Support.Store(fixture, clock);
+
+        // v1 (Ready) finalizada e utilizável.
+        await RunUseCaseAsync(scope, project, env, Slice3Support.ReadyHost(), clock);
+        var v1 = await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None);
+        Assert.Equal(1, v1!.DiscoveryVersion);
+
+        // v2 reservada+publicada; a finalização com conteúdo divergente falha e NÃO substitui a v1.
+        var reservation = await Slice3Support.ReserveAsync(
+            fixture, scope, env, Slice3Support.ArchivePermissionDeniedHost(), clock, project.ConfigurationVersion.Value, project.ConfigurationHash, publish: true);
+        Assert.Equal(2, reservation.DiscoveryVersion);
+        var wrong = new EvDiscoveryEvidenceReference(reservation.EvidenceLogicalPath, reservation.SizeBytes, new Sha256Hash(new string('e', 64)));
+        await Assert.ThrowsAsync<EvDiscoveryPersistenceException>(() => store.FinalizeAsync(
+            scope, reservation, fence: null, _ => Task.FromResult(wrong), CancellationToken.None));
+
+        var still = await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None);
+        Assert.Equal(1, still!.DiscoveryVersion); // v1 permanece corrente (não substituída)
+        Assert.Equal(EvDiscoveryStatus.Ready, still.Status);
     }
 }

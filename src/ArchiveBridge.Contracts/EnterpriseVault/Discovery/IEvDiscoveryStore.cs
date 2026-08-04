@@ -74,16 +74,21 @@ public interface IEvDiscoveryStore
         CancellationToken cancellationToken);
 
     /// <summary>
-    /// Transação 2 (curta): valida a evidência publicada FORA da transação
-    /// (<paramref name="validatePublishedEvidenceAsync"/>, ANTES de abrir a transação/lock), revalida o
-    /// cercamento, confere que a reserva pendente ainda corresponde aos TRÊS hashes e então promove
+    /// Transação 2 (curta): lê a evidência publicada FORA da transação
+    /// (<paramref name="readPublishedEvidenceAsync"/>, ANTES de abrir a transação/lock) e CONFERE que o
+    /// artefato publicado corresponde à reserva — caminho lógico, tamanho em bytes e SHA-256 do conteúdo
+    /// devem bater com <see cref="EvDiscoveryReservation.EvidenceLogicalPath"/>,
+    /// <see cref="EvDiscoveryReservation.SizeBytes"/> e <see cref="EvDiscoveryReservation.ContentSha256"/>.
+    /// Em seguida revalida o cercamento, confere que a reserva pendente ainda corresponde aos TRÊS hashes
+    /// AUTORITATIVOS (configuração/evidência semântica/conteúdo) e promove
     /// <see cref="EvDiscoveryStatus.Pending"/> → estado terminal, marcando a utilizável anterior como
-    /// Superseded somente agora. Idempotente; inconsistência falha fechada, sem commit.
+    /// Superseded somente agora. Idempotente; qualquer divergência falha fechada, sem commit e sem
+    /// substituir a versão anterior.
     /// </summary>
     Task<EvDiscoveryRecord> FinalizeAsync(
         TenantScope scope,
         EvDiscoveryReservation reservation,
         JobFence? fence,
-        Func<CancellationToken, Task> validatePublishedEvidenceAsync,
+        Func<CancellationToken, Task<EvDiscoveryEvidenceReference>> readPublishedEvidenceAsync,
         CancellationToken cancellationToken);
 }

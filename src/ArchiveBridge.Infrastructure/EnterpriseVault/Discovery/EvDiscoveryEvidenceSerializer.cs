@@ -17,11 +17,14 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = false };
 
     /// <inheritdoc />
-    public EvDiscoveryEvidenceBytes Serialize(EvDiscoveryRunResult result)
+    public EvDiscoveryEvidenceBytes Serialize(
+        EvDiscoveryRunResult result, Sha256Hash configurationHash, Sha256Hash semanticEvidenceHash)
     {
         ArgumentNullException.ThrowIfNull(result);
         var document = new EvidenceDocument(
             EvDiscoverySchema.Version,
+            // Impressões digitais AUTORITATIVAS da reserva (completas), registradas explicitamente.
+            new ReservationFingerprintsDocument(configurationHash.Value, semanticEvidenceHash.Value),
             new EnvironmentDocument(
                 result.Environment.EnvironmentId.Value,
                 result.Environment.SiteName,
@@ -61,6 +64,8 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
                 .Select(static finding => new FindingDocument(
                     finding.ResultCode.Value, finding.CapabilityCode?.Value, finding.Reason))
                 .ToArray(),
+            // Hashes INTERNOS do conjunto de capacidades — NÃO são as impressões digitais completas da
+            // reserva (essas ficam em ReservationFingerprints, acima).
             result.CapabilitySet.ConfigurationHash.Value,
             result.CapabilitySet.EvidenceHash.Value);
 
@@ -70,6 +75,7 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
 
     private sealed record EvidenceDocument(
         int SchemaVersion,
+        ReservationFingerprintsDocument ReservationFingerprints,
         EnvironmentDocument Environment,
         string? SelectedAdapter,
         int? AdapterVersion,
@@ -79,8 +85,11 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
         IReadOnlyList<CapabilityDocument> Capabilities,
         SignatureDocument? Signature,
         IReadOnlyList<FindingDocument> Findings,
-        string ConfigurationHash,
-        string EvidenceHash);
+        string CapabilitySetConfigurationHash,
+        string CapabilitySetEvidenceHash);
+
+    /// <summary>Impressões digitais AUTORITATIVAS usadas pela reserva (configuração completa + evidência semântica completa).</summary>
+    private sealed record ReservationFingerprintsDocument(string ConfigurationHash, string SemanticEvidenceHash);
 
     private sealed record EnvironmentDocument(
         Guid EnvironmentId, string SiteName, string DirectoryServer, string ObservedVersion, string ProductVersion, string DiscoverySource);

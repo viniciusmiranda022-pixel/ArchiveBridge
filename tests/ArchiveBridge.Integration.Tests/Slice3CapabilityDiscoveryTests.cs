@@ -1,3 +1,5 @@
+using ArchiveBridge.Application.EnterpriseVault.Discovery;
+using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
 using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 using ArchiveBridge.Integration.Tests.Support;
 using Xunit;
@@ -88,5 +90,61 @@ public sealed class Slice3CapabilityDiscoveryTests
         // Falha do metadado NÃO é permissão negada: a permissão derivada continua disponível.
         Assert.Equal(CapabilityAvailability.Available, Of(observation, EvCapabilityCodes.EvRequiredPermissions));
         Assert.Equal(CapabilityAvailability.Available, Of(observation, EvCapabilityCodes.EvSiteDiscovery));
+    }
+
+    // ---- Falha mecânica nunca resulta em Ready (avaliação completa) --------------------------------------
+
+    private static async Task<EvDiscoveryRunResult> EvaluateAsync(FixtureEvPowerShellHost host)
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var env = Slice3Support.NewEnvironment();
+        var observation = await Slice3Support.Discovery(host, clock).ProbeAsync(env, Policy, CancellationToken.None);
+        var selection = Slice3Support.Adapters().Select(observation, Policy);
+        return EvDiscoveryEvaluator.Evaluate(DiscoveryRunId.New(), observation, selection, Policy, clock.UtcNow, clock.UtcNow);
+    }
+
+    [Fact]
+    public async Task CleanEnvironmentReachesReady() =>
+        Assert.Equal(EvDiscoveryStatus.Ready, (await EvaluateAsync(Slice3Support.ReadyHost())).Status);
+
+    [Fact]
+    public async Task NonZeroExitOnNonRequiredCapabilityForcesFailedNotReady()
+    {
+        var host = Slice3Support.ReadyHost();
+        // EvServerDiscovery NÃO está em RequiredForReady; mesmo assim, ExitCode != 0 é falha MECÂNICA ⇒ Failed.
+        host.SetExecution(EvPowerShellProbeKind.EvServer, new EvProbeExecution(1, string.Empty, "boom", false, false));
+        Assert.Equal(EvDiscoveryStatus.Failed, (await EvaluateAsync(host)).Status);
+    }
+
+    [Fact]
+    public async Task NonEmptyStderrOnNonRequiredCapabilityForcesFailed()
+    {
+        var host = Slice3Support.ReadyHost();
+        host.SetExecution(EvPowerShellProbeKind.EvVaultStore, new EvProbeExecution(0, "{\"count\":1}", "CategoryInfo: erro", false, false));
+        Assert.Equal(EvDiscoveryStatus.Failed, (await EvaluateAsync(host)).Status);
+    }
+
+    [Fact]
+    public async Task TimeoutOnAnyProbeForcesFailed()
+    {
+        var host = Slice3Support.ReadyHost();
+        host.SetExecution(EvPowerShellProbeKind.EvServer, new EvProbeExecution(0, string.Empty, string.Empty, TimedOut: true, false));
+        Assert.Equal(EvDiscoveryStatus.Failed, (await EvaluateAsync(host)).Status);
+    }
+
+    [Fact]
+    public async Task OutputInvalidOnAnyProbeForcesFailed()
+    {
+        var host = Slice3Support.ReadyHost();
+        host.Set(EvPowerShellProbeKind.EvServer, FixtureEvPowerShellHost.SuccessEnvelope("EvServer", "{\"count\":-1}"));
+        Assert.Equal(EvDiscoveryStatus.Failed, (await EvaluateAsync(host)).Status);
+    }
+
+    [Fact]
+    public async Task PermissionDeniedStaysBlockedNotFailed()
+    {
+        var result = await EvaluateAsync(Slice3Support.ArchivePermissionDeniedHost());
+        Assert.Equal(EvDiscoveryStatus.Blocked, result.Status);
+        Assert.Equal(EvDiscoveryResultCodes.PermissionInsufficient, result.ResultCode.Value);
     }
 }

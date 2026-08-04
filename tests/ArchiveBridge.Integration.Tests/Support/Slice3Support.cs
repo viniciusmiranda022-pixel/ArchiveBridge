@@ -64,11 +64,13 @@ internal static class Slice3Support
         var selection = Adapters().Select(observation, policy);
         var result = EvDiscoveryEvaluator.Evaluate(DiscoveryRunId.New(), observation, selection, policy, clock.UtcNow, clock.UtcNow);
         var configuration = EvDiscoveryConfiguration.For(environment.EnvironmentId, policy, projectConfigVersion, projectConfigHash);
-        var bytes = new EvDiscoveryEvidenceSerializer().Serialize(result);
+        var configurationHash = configuration.ComputeHash();
+        var semanticHash = EvDiscoverySemanticFingerprint.Compute(result);
+        var bytes = new EvDiscoveryEvidenceSerializer().Serialize(result, configurationHash, semanticHash);
         var evidence = Evidence(fixture);
         var staging = await evidence.StageAsync(bytes.Bytes, bytes.ContentSha256, CancellationToken.None);
         var reservation = await Store(fixture, clock).ReserveAsync(
-            scope, environment.EnvironmentId, result, configuration.ComputeHash(), EvDiscoverySemanticFingerprint.Compute(result),
+            scope, environment.EnvironmentId, result, configurationHash, semanticHash,
             bytes.ContentSha256, staging.SizeBytes, CorrelationId.New(), fence, CancellationToken.None);
         if (publish)
         {
@@ -91,14 +93,23 @@ internal static class Slice3Support
 internal sealed class FixtureEvPowerShellHost : IEvPowerShellHost
 {
     private readonly Dictionary<EvPowerShellProbeKind, string> _envelopes;
+    private readonly Dictionary<EvPowerShellProbeKind, EvProbeExecution> _executions = new();
 
     public FixtureEvPowerShellHost() => _envelopes = new Dictionary<EvPowerShellProbeKind, string>(DefaultReady());
 
     /// <summary>Substitui o envelope de uma sonda específica.</summary>
     public void Set(EvPowerShellProbeKind kind, string envelopeJson) => _envelopes[kind] = envelopeJson;
 
+    /// <summary>Substitui a execução BRUTA de uma sonda (para simular falha mecânica: exit≠0, stderr, timeout, limite).</summary>
+    public void SetExecution(EvPowerShellProbeKind kind, EvProbeExecution execution) => _executions[kind] = execution;
+
     public Task<EvProbeExecution> RunAsync(EvProbeRequest request, CancellationToken cancellationToken)
     {
+        if (_executions.TryGetValue(request.Kind, out var execution))
+        {
+            return Task.FromResult(execution);
+        }
+
         var json = _envelopes[request.Kind];
         return Task.FromResult(new EvProbeExecution(0, json, string.Empty, false, false));
     }

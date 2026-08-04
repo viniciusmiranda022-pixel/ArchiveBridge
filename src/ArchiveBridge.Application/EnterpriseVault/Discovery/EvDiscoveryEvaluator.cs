@@ -135,11 +135,15 @@ public static class EvDiscoveryEvaluator
         return CapabilityAvailability.Indeterminate;
     }
 
+    // Fatais = a MECÂNICA da sonda falhou (não se pode concluir NADA): Timeout, saída inválida
+    // (`OutputInvalid`) ou falha de execução (`ExecutionFailed` — `ExitCode != 0`, `stderr` não vazio ou
+    // limite de saída excedido), classificados pela CATEGORIA do achado (não pela mensagem) e mesmo numa
+    // capacidade NÃO obrigatória ⇒ `Failed`, nunca `Ready`. `PermissionDenied` é recuperável ⇒ `Blocked`.
     private static EvDiscoveryFinding? FindFatal(IReadOnlyList<EvDiscoveryFinding> findings)
     {
         foreach (var finding in findings)
         {
-            if (FatalCodes.Contains(finding.ResultCode.Value))
+            if (finding.ErrorCategory is EvErrorCategory.Timeout or EvErrorCategory.OutputInvalid or EvErrorCategory.ExecutionFailed)
             {
                 return finding;
             }
@@ -147,14 +151,6 @@ public static class EvDiscoveryEvaluator
 
         return null;
     }
-
-    // Fatais = a MECÂNICA da sonda falhou (não se pode concluir nada). Falta de conectividade/permissão é
-    // recuperável ⇒ Blocked, não Failed.
-    private static readonly HashSet<string> FatalCodes = new(StringComparer.Ordinal)
-    {
-        EvDiscoveryResultCodes.DiscoveryTimeout,
-        EvDiscoveryResultCodes.DiscoveryOutputInvalid,
-    };
 
     private static string ResultCodeForMissing(EvCapabilityCode capability) => capability.Value switch
     {

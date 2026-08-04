@@ -8,13 +8,17 @@ public sealed record ProcessRunResult(int ExitCode, string StandardOutput, strin
 
 /// <summary>
 /// Executa um processo drenando stdout e stderr CONCORRENTEMENTE (sem deadlock), contando BYTES reais
-/// (UTF-8), com limite POR STREAM: ao exceder o limite o processo é morto (árvore inteira) e
-/// <see cref="ProcessRunResult.OutputLimitExceeded"/> é sinalizado; ao estourar o timeout o processo é
-/// morto e <see cref="ProcessRunResult.TimedOut"/> é sinalizado. Nunca aloca a saída completa antes de
-/// checar o limite (buffer limitado ao teto). Portável (independe de Enterprise Vault) e testável.
+/// (UTF-8), com limite POR STREAM. Ao exceder o limite em QUALQUER stream, o processo é morto (árvore
+/// inteira) IMEDIATAMENTE — sem esperar o outro stream terminar — via um <see cref="CancellationTokenSource"/>
+/// compartilhado que também interrompe a leitura do stream irmão. O timeout e o cancelamento do chamador
+/// também matam a árvore. O término do processo é SEMPRE aguardado e um <c>finally</c> garante o encerramento
+/// (nenhum processo órfão). Nunca aloca a saída completa antes de checar o limite (buffer limitado ao teto).
+/// Portável (independe de Enterprise Vault) e testável.
 /// </summary>
 public static class ByteLimitedProcessRunner
 {
+    private static readonly TimeSpan ExitGrace = TimeSpan.FromSeconds(30);
+
     /// <summary>Roda o processo descrito por <paramref name="startInfo"/> com timeout e limite de bytes por stream.</summary>
     public static async Task<ProcessRunResult> RunAsync(
         ProcessStartInfo startInfo, TimeSpan timeout, long maxOutputBytes, CancellationToken cancellationToken)
@@ -30,89 +34,94 @@ public static class ByteLimitedProcessRunner
             throw new InvalidOperationException("Falha ao iniciar o processo de sonda.");
         }
 
+        // timeoutCts: timeout + cancelamento do chamador. killCts: também disparado assim que QUALQUER stream
+        // excede — cancela a leitura de AMBOS os streams para matar já, sem esperar o irmão terminar.
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(timeout);
+        using var killCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token);
 
-        var stdoutTask = DrainAsync(process.StandardOutput.BaseStream, maxOutputBytes, timeoutCts.Token);
-        var stderrTask = DrainAsync(process.StandardError.BaseStream, maxOutputBytes, timeoutCts.Token);
+        var stdoutExceeded = 0;
+        var stderrExceeded = 0;
 
-        var timedOut = false;
-        (byte[] Bytes, bool Exceeded) outResult = ([], false);
-        (byte[] Bytes, bool Exceeded) errResult = ([], false);
+        var outTask = DrainAsync(process.StandardOutput.BaseStream, maxOutputBytes, killCts, () => Interlocked.Exchange(ref stdoutExceeded, 1));
+        var errTask = DrainAsync(process.StandardError.BaseStream, maxOutputBytes, killCts, () => Interlocked.Exchange(ref stderrExceeded, 1));
+
         try
         {
-            outResult = await stdoutTask.ConfigureAwait(false);
-            errResult = await stderrTask.ConfigureAwait(false);
-            if (outResult.Exceeded || errResult.Exceeded)
+            var outBytes = await outTask.ConfigureAwait(false);
+            var errBytes = await errTask.ConfigureAwait(false);
+            var exceeded = stdoutExceeded == 1 || stderrExceeded == 1;
+
+            // Mata a árvore ANTES de aguardar o término quando excedeu o limite, estourou o timeout ou o
+            // chamador cancelou (todos refletidos em timeoutCts). O término é sempre aguardado.
+            if (exceeded || timeoutCts.IsCancellationRequested)
             {
                 Kill(process);
             }
-            else
-            {
-                await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
-            }
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            timedOut = true;
-            Kill(process);
-            outResult = await SafeAwait(stdoutTask).ConfigureAwait(false);
-            errResult = await SafeAwait(stderrTask).ConfigureAwait(false);
-        }
 
-        var exceeded = outResult.Exceeded || errResult.Exceeded;
-        var exitCode = TryExitCode(process);
-        return new ProcessRunResult(
-            exitCode, Encoding.UTF8.GetString(outResult.Bytes), Encoding.UTF8.GetString(errResult.Bytes), timedOut, exceeded);
+            await WaitForExitAsync(process).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested(); // cancelamento do chamador ⇒ propaga (árvore já morta)
+
+            var timedOut = timeoutCts.IsCancellationRequested && !exceeded;
+            return new ProcessRunResult(
+                TryExitCode(process), Encoding.UTF8.GetString(outBytes), Encoding.UTF8.GetString(errBytes), timedOut, exceeded);
+        }
+        finally
+        {
+            Kill(process); // cleanup garantido: nenhum processo órfão
+        }
     }
 
-    private static async Task<(byte[] Bytes, bool Exceeded)> DrainAsync(Stream stream, long maxBytes, CancellationToken cancellationToken)
+    private static async Task<byte[]> DrainAsync(
+        Stream stream, long maxBytes, CancellationTokenSource killCts, Action markExceeded)
     {
         var buffer = new byte[8192];
         using var captured = new MemoryStream();
         long total = 0;
-        while (true)
-        {
-            int read;
-            try
-            {
-                read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception exception) when (exception is OperationCanceledException or IOException or ObjectDisposedException)
-            {
-                break; // timeout, processo morto ou stream fechado
-            }
-
-            if (read == 0)
-            {
-                break;
-            }
-
-            total += read;
-            var room = maxBytes - captured.Length;
-            if (room > 0)
-            {
-                captured.Write(buffer, 0, (int)Math.Min(read, room));
-            }
-
-            if (total > maxBytes)
-            {
-                return (captured.ToArray(), true); // excedeu o limite — sinaliza para o chamador matar o processo
-            }
-        }
-
-        return (captured.ToArray(), false);
-    }
-
-    private static async Task<(byte[] Bytes, bool Exceeded)> SafeAwait(Task<(byte[] Bytes, bool Exceeded)> task)
-    {
         try
         {
-            return await task.ConfigureAwait(false);
+            while (true)
+            {
+                var read = await stream.ReadAsync(buffer, killCts.Token).ConfigureAwait(false);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                total += read;
+                var room = maxBytes - captured.Length;
+                if (room > 0)
+                {
+                    captured.Write(buffer, 0, (int)Math.Min(read, room));
+                }
+
+                if (total > maxBytes)
+                {
+                    markExceeded();
+                    // Mata JÁ: cancela a leitura do stream irmão (sinaliza o kill) sem esperá-lo terminar.
+                    await killCts.CancelAsync().ConfigureAwait(false);
+                    break;
+                }
+            }
         }
         catch (Exception exception) when (exception is OperationCanceledException or IOException or ObjectDisposedException)
         {
-            return ([], false);
+            // timeout, kill por limite/cancelamento ou stream fechado: devolve o que capturou até aqui.
+        }
+
+        return captured.ToArray();
+    }
+
+    private static async Task WaitForExitAsync(Process process)
+    {
+        using var graceCts = new CancellationTokenSource(ExitGrace);
+        try
+        {
+            await process.WaitForExitAsync(graceCts.Token).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or InvalidOperationException)
+        {
+            // O processo já saiu, é inacessível, ou não terminou dentro da carência — o finally reforça o kill.
         }
     }
 

@@ -348,29 +348,116 @@ public sealed class Slice3ByteLimitedProcessRunnerTests
     }
 
     [Fact]
+    public async Task StdoutInfiniteWithEmptyStderrIsKilledOnExceedWithoutDeadlock()
+    {
+        if (!Posix)
+        {
+            return;
+        }
+
+        // stdout infinito, stderr VAZIO: exceder o stdout mata JÁ (cancela a leitura do stderr vazio) — sem deadlock.
+        var result = await ByteLimitedProcessRunner.RunAsync(Sh("yes"), TimeSpan.FromSeconds(30), maxOutputBytes: 200, CancellationToken.None);
+        Assert.True(result.OutputLimitExceeded);
+        Assert.False(result.TimedOut); // encerrado pelo LIMITE, não pelo timeout
+    }
+
+    [Fact]
+    public async Task StderrInfiniteWithEmptyStdoutIsKilledOnExceedWithoutDeadlock()
+    {
+        if (!Posix)
+        {
+            return;
+        }
+
+        // stderr infinito, stdout VAZIO: simétrico ao caso acima — exceder o stderr mata JÁ.
+        var result = await ByteLimitedProcessRunner.RunAsync(Sh("yes 1>&2"), TimeSpan.FromSeconds(30), maxOutputBytes: 200, CancellationToken.None);
+        Assert.True(result.OutputLimitExceeded);
+        Assert.False(result.TimedOut);
+    }
+
+    [Fact]
+    public async Task OnlyOneStreamExceedingIsEnoughToKill()
+    {
+        if (!Posix)
+        {
+            return;
+        }
+
+        // Apenas UM stream (stdout) excede; o outro fica vazio. Mesmo assim mata e sinaliza o excesso.
+        using var file = TempContent(Encoding.UTF8.GetBytes(new string('x', 4000)));
+        var result = await ByteLimitedProcessRunner.RunAsync(Cat(file.Path), TimeSpan.FromSeconds(30), maxOutputBytes: 50, CancellationToken.None);
+        Assert.True(result.OutputLimitExceeded);
+        Assert.False(result.TimedOut);
+    }
+
+    [Fact]
     public async Task InfiniteOutputOnBothStreamsIsKilledWithoutDeadlock()
     {
         if (!Posix)
         {
             return;
         }
+
         // Produz saída infinita em stdout E stderr: a drenagem concorrente detecta o excesso e mata a árvore.
-        var startInfo = Sh("yes & yes 1>&2 & wait");
-        var result = await ByteLimitedProcessRunner.RunAsync(startInfo, TimeSpan.FromSeconds(30), maxOutputBytes: 200, CancellationToken.None);
+        var result = await ByteLimitedProcessRunner.RunAsync(Sh("yes & yes 1>&2 & wait"), TimeSpan.FromSeconds(30), maxOutputBytes: 200, CancellationToken.None);
         Assert.True(result.OutputLimitExceeded);
         Assert.False(result.TimedOut); // encerrado pelo LIMITE, não pelo timeout (sem deadlock)
     }
 
     [Fact]
-    public async Task TimeoutKillsTheProcess()
+    public async Task TimeoutKillsTheProcessTree()
     {
         if (!Posix)
         {
             return;
         }
+
         var result = await ByteLimitedProcessRunner.RunAsync(Sh("sleep 30"), TimeSpan.FromMilliseconds(300), maxOutputBytes: 1024, CancellationToken.None);
         Assert.True(result.TimedOut);
         Assert.False(result.OutputLimitExceeded);
+    }
+
+    [Fact]
+    public async Task CallerCancellationKillsTheProcessAndPropagates()
+    {
+        if (!Posix)
+        {
+            return;
+        }
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        // O cancelamento do chamador mata a árvore e PROPAGA o cancelamento (timeout amplo para provar que é o cancel).
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            ByteLimitedProcessRunner.RunAsync(Sh("sleep 30"), TimeSpan.FromSeconds(60), maxOutputBytes: 1024, cts.Token));
+    }
+
+    [Fact]
+    public async Task ChildProcessDoesNotSurviveAfterTimeout()
+    {
+        if (!Posix)
+        {
+            return;
+        }
+
+        var marker = Path.Combine(Path.GetTempPath(), "ab_marker_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            // A árvore (sh + sleep) escreveria o marcador após 2s; o timeout de 300ms a mata antes disso.
+            var startInfo = Sh("sleep 2 && printf done > \"$AB_MARKER\"");
+            startInfo.Environment["AB_MARKER"] = marker;
+            var result = await ByteLimitedProcessRunner.RunAsync(startInfo, TimeSpan.FromMilliseconds(300), maxOutputBytes: 1024, CancellationToken.None);
+            Assert.True(result.TimedOut);
+
+            await Task.Delay(TimeSpan.FromSeconds(3), CancellationToken.None); // além do sleep 2 do filho
+            Assert.False(File.Exists(marker), "o processo filho sobreviveu ao kill e escreveu o marcador (órfão)");
+        }
+        finally
+        {
+            if (File.Exists(marker))
+            {
+                File.Delete(marker);
+            }
+        }
     }
 
     private static ProcessStartInfo Sh(string command)

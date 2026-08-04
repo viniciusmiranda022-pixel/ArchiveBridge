@@ -173,7 +173,10 @@ vault stores/archives, e presença dos módulos/snap-ins do EV no host de execu�
 > **Pendente de laboratório:** o conjunto EXATO de permissões mínimas e os nomes precisos dos
 > módulos/snap-ins/parâmetros do `Export-EVArchive` por versão do EV dependem de prova em laboratório
 > com produto Veritas real. Estão marcados como pendentes e **não** são declarados como suportados sem
-> essa evidência.
+> essa evidência. A lista completa de pendências e seu status
+> (`IMPLEMENTED_WITH_FIXTURES` / `LAB_VALIDATION_PENDING`) está em
+> [`ev-lab-validation-backlog.md`](./ev-lab-validation-backlog.md) — essas pendências **não** bloqueiam
+> a slice: a estratégia aprovada é implementar por contratos/fixtures e homologar contra EV real depois.
 
 ## 10. Procedimento de laboratório
 

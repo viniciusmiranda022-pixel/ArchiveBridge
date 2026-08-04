@@ -59,7 +59,7 @@ public sealed class DiscoverEvCapabilitiesUseCase(
         var configuration = EvDiscoveryConfiguration.For(environment.EnvironmentId, policy, expectedProjectConfigurationVersion, expectedConfigurationHash);
         var configurationHash = configuration.ComputeHash();
         var semanticEvidenceHash = EvDiscoverySemanticFingerprint.Compute(result);
-        var evidenceBytes = _serializer.Serialize(result);
+        var evidenceBytes = _serializer.Serialize(result, configurationHash, semanticEvidenceHash);
 
         var staging = await _evidence
             .StageAsync(evidenceBytes.Bytes, evidenceBytes.ContentSha256, cancellationToken).ConfigureAwait(false);
@@ -79,8 +79,10 @@ public sealed class DiscoverEvCapabilitiesUseCase(
                 fence,
                 async token =>
                 {
-                    _ = await _evidence.GetAsync(descriptor, token).ConfigureAwait(false)
+                    var content = await _evidence.GetAsync(descriptor, token).ConfigureAwait(false)
                         ?? throw new EvDiscoveryValidationException("Evidência publicada ausente/inválida na finalização (fail-closed).");
+                    // Referência publicada AUTORITATIVA (caminho lógico + tamanho + SHA-256), conferida pela store contra a reserva.
+                    return new EvDiscoveryEvidenceReference(descriptor.LogicalPath, content.Bytes.Length, content.ContentSha256);
                 },
                 cancellationToken).ConfigureAwait(false);
 
