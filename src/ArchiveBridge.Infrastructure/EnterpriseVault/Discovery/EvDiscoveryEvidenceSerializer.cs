@@ -6,11 +6,15 @@ using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 namespace ArchiveBridge.Infrastructure.EnterpriseVault.Discovery;
 
 /// <summary>
-/// Serializa a evidência de descoberta em JSON CANÔNICO e determinístico: apenas o conteúdo semântico
-/// (identidade do ambiente, adapter, capacidades ordenadas, assinatura, achados, hashes) — SEM
-/// <c>run_id</c> nem timestamps voláteis, que ficam nos metadados SQL. O mesmo resultado semântico produz
-/// bytes byte-a-byte idênticos, viabilizando republicação idempotente e reconciliação; alterar um único
-/// campo de capacidade muda os bytes e o hash.
+/// Serializa a evidência de descoberta em JSON CANÔNICO e determinístico: apenas o conteúdo semântico —
+/// identidade do ambiente, capacidades ordenadas, assinatura, a SELEÇÃO completa (desfecho, candidatos,
+/// selecionado) e CADA avaliação de adapter por inteiro (compatibilidade, precedência, perfil, maturidade,
+/// requisitos, capacidades declaradas e achados, todos ordenados), os achados com <see cref="EvErrorCategory"/>
+/// e as impressões digitais AUTORITATIVAS da reserva — SEM <c>run_id</c> nem timestamps voláteis (que ficam
+/// nos metadados SQL). Um auditor consegue determinar POR QUE um adapter foi selecionado a partir só deste
+/// artefato, sem depender das tabelas SQL. O mesmo resultado semântico produz bytes byte-a-byte idênticos
+/// (ordenação ordinal explícita), viabilizando republicação idempotente e reconciliação; alterar um único
+/// campo muda os bytes e o hash.
 /// </summary>
 public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializer
 {
@@ -34,21 +38,14 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
                 result.Environment.DiscoverySource),
             result.CapabilitySet.AdapterId?.Value,
             result.CapabilitySet.AdapterVersion,
+            result.Selection.Outcome.ToString(),
             result.Selection.Candidates
                 .Select(static candidate => candidate.Value)
                 .OrderBy(static value => value, StringComparer.Ordinal)
                 .ToArray(),
             result.Status.ToString(),
             result.ResultCode.Value,
-            result.CapabilitySet.Capabilities
-                .OrderBy(static capability => capability.CapabilityCode.Value, StringComparer.Ordinal)
-                .Select(static capability => new CapabilityDocument(
-                    capability.CapabilityCode.Value,
-                    capability.CapabilityVersion,
-                    capability.Availability.ToString(),
-                    capability.EvidenceReference,
-                    capability.BlockingReason))
-                .ToArray(),
+            OrderCapabilities(result.CapabilitySet.Capabilities),
             result.Signature is { } signature
                 ? new SignatureDocument(
                     signature.CommandName,
@@ -60,10 +57,13 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
                     signature.ParameterSets,
                     signature.SignatureHash.Value)
                 : null,
-            result.BlockingFindings
-                .Select(static finding => new FindingDocument(
-                    finding.ResultCode.Value, finding.CapabilityCode?.Value, finding.Reason))
+            // Avaliações de adapter COMPLETAS (ordenadas por AdapterId) — o que sustenta a seleção.
+            result.Selection.Evaluations
+                .OrderBy(static e => e.AdapterId.Value, StringComparer.Ordinal)
+                .Select(ToEvaluationDocument)
                 .ToArray(),
+            OrderFindings(result.Selection.Findings),
+            OrderFindings(result.BlockingFindings),
             // Hashes INTERNOS do conjunto de capacidades — NÃO são as impressões digitais completas da
             // reserva (essas ficam em ReservationFingerprints, acima).
             result.CapabilitySet.ConfigurationHash.Value,
@@ -73,17 +73,58 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
         return new EvDiscoveryEvidenceBytes(bytes, DeterministicHash.ComputeBytes(bytes));
     }
 
+    private static EvaluationDocument ToEvaluationDocument(EvAdapterEvaluation evaluation) =>
+        new(
+            evaluation.AdapterId.Value,
+            evaluation.AdapterVersion,
+            evaluation.Compatibility.ToString(),
+            evaluation.Precedence,
+            evaluation.ProfileId,
+            evaluation.Maturity is { } maturity
+                ? new MaturityDocument(
+                    maturity.RuntimeObserved, maturity.OfficialDocumentation, maturity.AutomatedFixtureValidated, maturity.LaboratoryValidated)
+                : null,
+            evaluation.Requirements
+                .OrderBy(static r => r.CapabilityCode.Value, StringComparer.Ordinal)
+                .ThenBy(static r => r.Description, StringComparer.Ordinal)
+                .Select(static r => new RequirementDocument(r.CapabilityCode.Value, r.Description))
+                .ToArray(),
+            OrderCapabilities(evaluation.Capabilities),
+            OrderFindings(evaluation.Findings));
+
+    private static CapabilityDocument[] OrderCapabilities(IEnumerable<EvCapability> capabilities) =>
+        capabilities
+            .OrderBy(static c => c.CapabilityCode.Value, StringComparer.Ordinal)
+            .ThenBy(static c => c.CapabilityVersion)
+            .ThenBy(static c => c.Availability.ToString(), StringComparer.Ordinal)
+            .Select(static c => new CapabilityDocument(
+                c.CapabilityCode.Value, c.CapabilityVersion, c.Availability.ToString(), c.EvidenceReference, c.BlockingReason))
+            .ToArray();
+
+    private static FindingDocument[] OrderFindings(IEnumerable<EvDiscoveryFinding> findings) =>
+        findings
+            .OrderBy(static f => f.ResultCode.Value, StringComparer.Ordinal)
+            .ThenBy(static f => f.CapabilityCode?.Value ?? string.Empty, StringComparer.Ordinal)
+            .ThenBy(static f => f.Reason, StringComparer.Ordinal)
+            .ThenBy(static f => f.ErrorCategory.ToString(), StringComparer.Ordinal)
+            .Select(static f => new FindingDocument(
+                f.ResultCode.Value, f.CapabilityCode?.Value, f.Reason, f.ErrorCategory.ToString()))
+            .ToArray();
+
     private sealed record EvidenceDocument(
         int SchemaVersion,
         ReservationFingerprintsDocument ReservationFingerprints,
         EnvironmentDocument Environment,
         string? SelectedAdapter,
         int? AdapterVersion,
+        string SelectionOutcome,
         IReadOnlyList<string> AdapterCandidates,
         string Status,
         string ResultCode,
         IReadOnlyList<CapabilityDocument> Capabilities,
         SignatureDocument? Signature,
+        IReadOnlyList<EvaluationDocument> AdapterEvaluations,
+        IReadOnlyList<FindingDocument> SelectionFindings,
         IReadOnlyList<FindingDocument> Findings,
         string CapabilitySetConfigurationHash,
         string CapabilitySetEvidenceHash);
@@ -101,5 +142,23 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
         string CommandName, string ModuleSource, string ObservedVersion, string CommandType,
         IReadOnlyList<string> Parameters, IReadOnlyList<string> MandatoryParameters, IReadOnlyList<string> ParameterSets, string SignatureHash);
 
-    private sealed record FindingDocument(string ResultCode, string? CapabilityCode, string Reason);
+    /// <summary>Avaliação de adapter COMPLETA registrada na evidência (sustenta a seleção sem depender do SQL).</summary>
+    private sealed record EvaluationDocument(
+        string AdapterId,
+        int AdapterVersion,
+        string Compatibility,
+        int Precedence,
+        string? ProfileId,
+        MaturityDocument? Maturity,
+        IReadOnlyList<RequirementDocument> Requirements,
+        IReadOnlyList<CapabilityDocument> DeclaredCapabilities,
+        IReadOnlyList<FindingDocument> Findings);
+
+    /// <summary>Maturidade registrada SEPARADAMENTE; <c>LaboratoryValidated</c> nunca é true sem laboratório.</summary>
+    private sealed record MaturityDocument(
+        bool RuntimeObserved, bool OfficialDocumentation, bool AutomatedFixtureValidated, bool LaboratoryValidated);
+
+    private sealed record RequirementDocument(string CapabilityCode, string Description);
+
+    private sealed record FindingDocument(string ResultCode, string? CapabilityCode, string Reason, string ErrorCategory);
 }

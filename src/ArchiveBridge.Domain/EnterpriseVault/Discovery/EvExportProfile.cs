@@ -27,10 +27,14 @@ public static class EvExportParameters
 
 /// <summary>
 /// Maturidade de um perfil de assinatura, registrada SEPARADAMENTE e sem confundir níveis: se a forma foi
-/// observada em runtime, se corresponde à documentação oficial e se foi validada em laboratório com o
-/// produto real. <b>Nunca</b> se declara <see cref="LaboratoryValidated"/> sem prova de laboratório.
+/// observada em runtime (<see cref="RuntimeObserved"/>), se corresponde à documentação oficial
+/// (<see cref="OfficialDocumentation"/>), se foi validada por FIXTURES automatizados/mocks controlados
+/// (<see cref="AutomatedFixtureValidated"/>) e se foi homologada em LABORATÓRIO com o produto Veritas real
+/// (<see cref="LaboratoryValidated"/>). <b>Nunca</b> se declara <see cref="LaboratoryValidated"/> sem prova
+/// de laboratório; a validação por fixtures NÃO é laboratório.
 /// </summary>
-public sealed record EvExportMaturity(bool RuntimeObserved, bool OfficialDocumentation, bool LaboratoryValidated);
+public sealed record EvExportMaturity(
+    bool RuntimeObserved, bool OfficialDocumentation, bool AutomatedFixtureValidated, bool LaboratoryValidated);
 
 /// <summary>
 /// Perfil DOCUMENTADO da assinatura do <c>Export-EVArchive</c>. Descreve os parâmetros identificadores e
@@ -52,7 +56,8 @@ public sealed record EvExportProfile(
     /// <summary>
     /// Perfil oficial documentado (EV 15.1): identifica-se por <c>ArchiveId</c> + <c>OutputDirectory</c> +
     /// <c>Format</c>; documenta ainda <c>SearchString</c>, <c>MaxThreads</c>, <c>Retry</c> e
-    /// <c>MaxPSTSizeMB</c>. Maturidade: documentação oficial, sem homologação em laboratório.
+    /// <c>MaxPSTSizeMB</c>. Maturidade: documentação oficial + validação por FIXTURES automatizados,
+    /// **sem** homologação em laboratório (`LaboratoryValidated = false`).
     /// </summary>
     public static EvExportProfile Documented151 { get; } = new(
         Documented151Id,
@@ -61,5 +66,6 @@ public sealed record EvExportProfile(
             EvExportParameters.ArchiveId, EvExportParameters.OutputDirectory, EvExportParameters.SearchString,
             EvExportParameters.Format, EvExportParameters.MaxThreads, EvExportParameters.Retry, EvExportParameters.MaxPstSizeMb,
         ],
-        new EvExportMaturity(RuntimeObserved: false, OfficialDocumentation: true, LaboratoryValidated: false));
+        new EvExportMaturity(
+            RuntimeObserved: false, OfficialDocumentation: true, AutomatedFixtureValidated: true, LaboratoryValidated: false));
 }

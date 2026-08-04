@@ -1,3 +1,4 @@
+using System.Text.Json;
 using ArchiveBridge.Application.EnterpriseVault.Discovery;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
@@ -281,6 +282,30 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
 
         await Assert.ThrowsAsync<EvDiscoveryEvidenceException>(() =>
             Slice3Support.Evidence(fixture).GetAsync(descriptor, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PublishedEvidenceRecordsAuthoritativeFingerprintsMatchingSqlReservation()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        await RunUseCaseAsync(scope, project, env, Slice3Support.ReadyHost(), clock);
+
+        var record = await Slice3Support.Store(fixture, clock).GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None);
+        Assert.NotNull(record);
+
+        var finalDir = Path.Combine(fixture.ArtifactRoot, scope.Tenant.Value.ToString("N"), scope.Project.Value.ToString("N"),
+            env.EnvironmentId.Value.ToString("N"), "v1");
+        var json = await File.ReadAllBytesAsync(Path.Combine(finalDir, "evidence.json"), CancellationToken.None);
+        using var doc = JsonDocument.Parse(json);
+        var fingerprints = doc.RootElement.GetProperty("ReservationFingerprints");
+
+        // As impressões autoritativas registradas no artefato batem com a reserva persistida no SQL.
+        Assert.Equal(record!.ConfigurationHash.Value, fingerprints.GetProperty("ConfigurationHash").GetString());
+        Assert.Equal(record.SemanticEvidenceHash.Value, fingerprints.GetProperty("SemanticEvidenceHash").GetString());
+        // Avaliação de adapter completa presente no artefato — auditoria da seleção sem depender do SQL.
+        Assert.NotEmpty(doc.RootElement.GetProperty("AdapterEvaluations").EnumerateArray());
     }
 
     // ---- Evidência publicada vs. reserva: a finalização confere caminho/tamanho/conteúdo + hashes autoritativos ----

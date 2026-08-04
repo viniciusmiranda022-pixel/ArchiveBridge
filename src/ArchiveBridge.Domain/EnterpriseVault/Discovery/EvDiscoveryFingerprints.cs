@@ -57,15 +57,18 @@ public sealed record EvDiscoveryConfiguration(
 }
 
 /// <summary>
-/// Impressão digital SEMÂNTICA COMPLETA de uma execução de descoberta: identidade integral do ambiente,
-/// versão observada/produto/fonte, todas as capacidades, a assinatura normalizada e seu hash, as
-/// avaliações de adapter (compatibilidade/precedência/perfil), o adapter selecionado, os achados, o
-/// código de resultado, o status e a versão de esquema. Não depende apenas da disponibilidade das
-/// capacidades — qualquer diferença semântica muda o hash.
+/// Impressão digital SEMÂNTICA COMPLETA de uma execução de descoberta. Inclui, de forma canônica e com
+/// ordenação ORDINAL EXPLÍCITA (o mesmo conteúdo semântico produz o mesmo hash independentemente da ordem
+/// das coleções): identidade integral do ambiente; todas as capacidades; a assinatura normalizada e seu
+/// hash; a SELEÇÃO completa (desfecho, candidatos ordenados, adapter selecionado, achados da seleção); e
+/// CADA avaliação de adapter por inteiro — compatibilidade, precedência, perfil, MATURIDADE
+/// (runtime/documentação/fixtures/laboratório), requisitos ordenados, capacidades declaradas ordenadas e
+/// achados ordenados; além do status, do código de resultado, da versão de esquema e de cada achado com
+/// sua <see cref="EvErrorCategory"/>. Qualquer diferença semântica muda o hash.
 /// </summary>
 public static class EvDiscoverySemanticFingerprint
 {
-    /// <summary>Computa o hash semântico completo da execução.</summary>
+    /// <summary>Computa o hash semântico completo da execução (canônico, ordenação ordinal explícita).</summary>
     public static Sha256Hash Compute(EvDiscoveryRunResult result)
     {
         ArgumentNullException.ThrowIfNull(result);
@@ -84,20 +87,32 @@ public static class EvDiscoverySemanticFingerprint
             "adapterVer", (result.CapabilitySet.AdapterVersion ?? 0).ToString(CultureInfo.InvariantCulture),
         };
 
-        foreach (var capability in result.CapabilitySet.Capabilities.OrderBy(static c => c.CapabilityCode.Value, StringComparer.Ordinal))
+        foreach (var capability in OrderCapabilities(result.CapabilitySet.Capabilities))
         {
-            parts.Add("cap");
-            parts.Add(capability.CapabilityCode.Value);
-            parts.Add(capability.CapabilityVersion.ToString(CultureInfo.InvariantCulture));
-            parts.Add(capability.Availability.ToString());
-            parts.Add(capability.EvidenceReference);
-            parts.Add(capability.BlockingReason ?? string.Empty);
+            AppendCapability(parts, "cap", capability);
         }
 
         parts.Add("sig");
         parts.Add(result.Signature?.SignatureHash.Value ?? "<none>");
         parts.Add(result.Signature is { } signature ? string.Join(",", signature.Parameters) : string.Empty);
 
+        // Seleção: desfecho + adapter selecionado + candidatos ORDENADOS + achados da seleção ORDENADOS.
+        parts.Add("selOutcome");
+        parts.Add(result.Selection.Outcome.ToString());
+        parts.Add("selected");
+        parts.Add(result.Selection.Selected?.AdapterId.Value ?? "<none>");
+        foreach (var candidate in result.Selection.Candidates.Select(static c => c.Value).OrderBy(static v => v, StringComparer.Ordinal))
+        {
+            parts.Add("cand");
+            parts.Add(candidate);
+        }
+
+        foreach (var finding in OrderFindings(result.Selection.Findings))
+        {
+            AppendFinding(parts, "selFind", finding);
+        }
+
+        // Avaliações de adapter COMPLETAS (ordenadas por AdapterId).
         foreach (var evaluation in result.Selection.Evaluations.OrderBy(static e => e.AdapterId.Value, StringComparer.Ordinal))
         {
             parts.Add("adp");
@@ -106,16 +121,72 @@ public static class EvDiscoverySemanticFingerprint
             parts.Add(evaluation.Compatibility.ToString());
             parts.Add(evaluation.Precedence.ToString(CultureInfo.InvariantCulture));
             parts.Add(evaluation.ProfileId ?? string.Empty);
+
+            parts.Add("mat");
+            parts.Add(Bit(evaluation.Maturity?.RuntimeObserved));
+            parts.Add(Bit(evaluation.Maturity?.OfficialDocumentation));
+            parts.Add(Bit(evaluation.Maturity?.AutomatedFixtureValidated));
+            parts.Add(Bit(evaluation.Maturity?.LaboratoryValidated));
+
+            foreach (var requirement in evaluation.Requirements
+                .OrderBy(static r => r.CapabilityCode.Value, StringComparer.Ordinal)
+                .ThenBy(static r => r.Description, StringComparer.Ordinal))
+            {
+                parts.Add("req");
+                parts.Add(requirement.CapabilityCode.Value);
+                parts.Add(requirement.Description);
+            }
+
+            foreach (var capability in OrderCapabilities(evaluation.Capabilities))
+            {
+                AppendCapability(parts, "adpCap", capability);
+            }
+
+            foreach (var finding in OrderFindings(evaluation.Findings))
+            {
+                AppendFinding(parts, "adpFind", finding);
+            }
         }
 
-        foreach (var finding in result.BlockingFindings)
+        foreach (var finding in OrderFindings(result.BlockingFindings))
         {
-            parts.Add("find");
-            parts.Add(finding.ResultCode.Value);
-            parts.Add(finding.CapabilityCode?.Value ?? string.Empty);
-            parts.Add(finding.Reason);
+            AppendFinding(parts, "find", finding);
         }
 
         return DeterministicHash.Compute(parts);
+    }
+
+    private static string Bit(bool? value) => value == true ? "1" : "0";
+
+    private static IEnumerable<EvCapability> OrderCapabilities(IEnumerable<EvCapability> capabilities) =>
+        capabilities
+            .OrderBy(static c => c.CapabilityCode.Value, StringComparer.Ordinal)
+            .ThenBy(static c => c.CapabilityVersion)
+            .ThenBy(static c => c.Availability.ToString(), StringComparer.Ordinal);
+
+    private static IEnumerable<EvDiscoveryFinding> OrderFindings(IEnumerable<EvDiscoveryFinding> findings) =>
+        findings
+            .OrderBy(static f => f.ResultCode.Value, StringComparer.Ordinal)
+            .ThenBy(static f => f.CapabilityCode?.Value ?? string.Empty, StringComparer.Ordinal)
+            .ThenBy(static f => f.Reason, StringComparer.Ordinal)
+            .ThenBy(static f => f.ErrorCategory.ToString(), StringComparer.Ordinal);
+
+    private static void AppendCapability(List<string> parts, string tag, EvCapability capability)
+    {
+        parts.Add(tag);
+        parts.Add(capability.CapabilityCode.Value);
+        parts.Add(capability.CapabilityVersion.ToString(CultureInfo.InvariantCulture));
+        parts.Add(capability.Availability.ToString());
+        parts.Add(capability.EvidenceReference);
+        parts.Add(capability.BlockingReason ?? string.Empty);
+    }
+
+    private static void AppendFinding(List<string> parts, string tag, EvDiscoveryFinding finding)
+    {
+        parts.Add(tag);
+        parts.Add(finding.ResultCode.Value);
+        parts.Add(finding.CapabilityCode?.Value ?? string.Empty);
+        parts.Add(finding.Reason);
+        parts.Add(finding.ErrorCategory.ToString());
     }
 }
