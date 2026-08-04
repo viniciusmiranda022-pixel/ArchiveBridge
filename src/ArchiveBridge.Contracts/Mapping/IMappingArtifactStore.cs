@@ -1,3 +1,4 @@
+using System.Globalization;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.Mapping;
@@ -6,7 +7,17 @@ using ArchiveBridge.Domain.Waves;
 namespace ArchiveBridge.Contracts.Mapping;
 
 /// <summary>Identifica de forma versionada o artefato de uma geração (tenant/projeto/onda/versão).</summary>
-public sealed record MappingArtifactDescriptor(TenantScope Scope, WaveId Wave, MappingVersion Version);
+public sealed record MappingArtifactDescriptor(TenantScope Scope, WaveId Wave, MappingVersion Version)
+{
+    /// <summary>
+    /// Caminho lógico DETERMINÍSTICO do artefato (relativo à raiz), derivado apenas do escopo/onda/versão.
+    /// Fonte única de verdade compartilhada pelo armazenamento de artefatos (destino físico) e pela
+    /// reserva no SQL (caminho esperado gravado na versão) — sem duplicar o formato em dois lugares.
+    /// </summary>
+    public string LogicalPath => string.Create(
+        CultureInfo.InvariantCulture,
+        $"{Scope.Tenant.Value:N}/{Scope.Project.Value:N}/{Wave.Value:N}/v{Version.Value}");
+}
 
 /// <summary>
 /// Handle de um artefato ENCENADO (fase 1): os bytes já foram escritos e sincronizados em um diretório

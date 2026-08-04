@@ -17,11 +17,20 @@ public readonly record struct MappingVersion(int Value)
 /// <summary>Estado de usabilidade de uma versão de mapping (evidência preservada, nunca apagada).</summary>
 public enum MappingVersionStatus
 {
-    /// <summary>Versão corrente utilizável.</summary>
+    /// <summary>Versão corrente utilizável (publicada e finalizada).</summary>
     Usable,
 
     /// <summary>Substituída por uma versão posterior; preservada como evidência e não utilizável.</summary>
     Superseded,
+
+    /// <summary>
+    /// Versão RESERVADA cujo artefato ainda não foi finalizado (fase 2 do protocolo recuperável): o
+    /// número de versão e a evidência já foram gravados numa transação curta, mas a publicação do
+    /// artefato imutável (fora do SQL) e a promoção a <see cref="Usable"/> ainda não ocorreram. Não é
+    /// utilizável e não conta no índice único de versão utilizável — uma queda entre a reserva e a
+    /// finalização é reconciliável pela impressão digital, sem gerar versão indevida.
+    /// </summary>
+    PendingArtifact,
 }
 
 /// <summary>Resultado sintético da validação registrado na evidência.</summary>

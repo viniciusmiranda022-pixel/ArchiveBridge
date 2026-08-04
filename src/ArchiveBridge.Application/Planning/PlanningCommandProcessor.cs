@@ -64,7 +64,7 @@ public sealed class PlanningCommandProcessor(
 
     private readonly IPlanningCommandInbox _queue = queue;
     private readonly IJobStore _jobs = jobs;
-    private readonly IJobLeaseManager _leases = leases;
+    private readonly PlanningHeartbeat _heartbeat = new(leases);
     private readonly IProjectStore _projects = projects;
     private readonly IWaveStore _waves = waves;
     private readonly ValidateProjectUseCase _validateProject = validateProject;
@@ -93,16 +93,20 @@ public sealed class PlanningCommandProcessor(
         {
             await GuardContextAsync(command, cancellationToken).ConfigureAwait(false);
 
-            // Heartbeat: renova o lease antes de executar (mantém a operação válida ao longo do tempo).
-            // Um heartbeat perdido (época/dono defasado ou lease já vencido) cancela a execução — nenhum
-            // efeito é gravado. Operações mais longas repetiriam este batimento durante o trabalho.
-            var beat = await _leases.RenewAsync(lease, cancellationToken).ConfigureAwait(false);
-            if (beat is not (JobCommandOutcome.Applied or JobCommandOutcome.IdempotentReplay))
+            // Heartbeat PERIÓDICO real: renova o lease repetidamente (intervalo = lease/3) DURANTE toda a
+            // execução da operação, mantendo válida uma operação mais longa que o lease. Um batimento
+            // perdido (época/dono defasado, lease vencido ou exceção transitória) cancela a operação —
+            // nenhum efeito novo é iniciado — e resulta em Fenced (a conclusão NÃO é reivindicada). O
+            // laço para assim que a operação termina e é aguardado (sem Task de batimento órfã).
+            var beat = await _heartbeat.RunWhileAsync(
+                lease,
+                HeartbeatInterval(leaseDuration),
+                token => DispatchAsync(command, fence, token),
+                cancellationToken).ConfigureAwait(false);
+            if (beat.Lost)
             {
-                return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, PlanningCommandOutcome.Fenced, beat);
+                return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, PlanningCommandOutcome.Fenced, beat.LastOutcome);
             }
-
-            await DispatchAsync(command, fence, cancellationToken).ConfigureAwait(false);
         }
         catch (FencedOutException)
         {
@@ -126,6 +130,11 @@ public sealed class PlanningCommandProcessor(
         var completed = await _jobs.CompleteAsync(lease, cancellationToken).ConfigureAwait(false);
         return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, OutcomeFor(completed, PlanningCommandOutcome.Completed), completed);
     }
+
+    // Intervalo do batimento: menor que o lease (lease/3), com piso positivo para nunca virar um laço
+    // de espera ocupada. Renovar a lease/3 dá margem para ≥2 renovações antes de qualquer expiração.
+    private static TimeSpan HeartbeatInterval(TimeSpan leaseDuration) =>
+        leaseDuration > TimeSpan.Zero ? leaseDuration / 3.0 : TimeSpan.FromMilliseconds(1);
 
     // B4: só reporta a transição (Completed/Failed/Retried) quando o comando de Job foi de fato aplicado
     // (ou replay idempotente válido). FencedOut/NotFound ⇒ Fenced — nunca uma transição "aplicada".

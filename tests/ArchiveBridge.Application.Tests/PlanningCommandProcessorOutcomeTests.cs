@@ -185,7 +185,11 @@ public sealed class PlanningCommandProcessorOutcomeTests
 
         public Task<MappingCsvVersion?> GetUsableAsync(TenantScope scope, WaveId waveId, CancellationToken cancellationToken) => throw new NotSupportedException();
 
-        public Task<MappingCsvVersion> SaveAsync(TenantScope scope, MappingGenerationResult result, JobFence? fence, Func<MappingVersion, CancellationToken, Task<MappingArtifactReference>> publishArtifactAsync, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<MappingReservation?> GetPendingByFingerprintAsync(TenantScope scope, WaveId waveId, MappingGenerationFingerprint fingerprint, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<MappingReservation> ReserveAsync(TenantScope scope, MappingGenerationResult result, long expectedSizeBytes, JobFence? fence, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<MappingCsvVersion> FinalizeAsync(TenantScope scope, MappingReservation reservation, JobFence? fence, Func<CancellationToken, Task> validatePublishedArtifactAsync, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 
     private sealed class UnusedArtifactStore : IMappingArtifactStore

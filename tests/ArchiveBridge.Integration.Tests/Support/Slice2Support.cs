@@ -37,18 +37,25 @@ internal static class Slice2Support
 
     public static FileSystemMappingArtifactStore ArtifactStore(SqlServerFixture fixture) => new(fixture.ArtifactRoot);
 
-    /// <summary>Persiste uma geração de mapping encenando e publicando o artefato imutável (como o caso de uso faz).</summary>
+    /// <summary>
+    /// Persiste uma geração de mapping pelo protocolo recuperável em duas transações (como o caso de uso
+    /// faz): encena → reserva (tx1) → publica (fora do SQL) → finaliza (tx2, validando o bundle antes).
+    /// </summary>
     public static async Task<MappingCsvVersion> SaveMapping(
         SqlServerFixture fixture, TenantScope scope, MappingGenerationResult result, CancellationToken cancellationToken)
     {
         var artifacts = ArtifactStore(fixture);
+        var mappings = MappingStore(fixture);
         var staging = await artifacts.StageAsync(result.Document.GetBytes(), result.Document.ContentSha256, cancellationToken);
-        return await MappingStore(fixture).SaveAsync(
+        var reservation = await mappings.ReserveAsync(scope, result, staging.SizeBytes, fence: null, cancellationToken);
+        var descriptor = new MappingArtifactDescriptor(scope, result.Version.Wave, reservation.Version);
+        await artifacts.PublishAsync(staging, descriptor, cancellationToken);
+        return await mappings.FinalizeAsync(
             scope,
-            result,
+            reservation,
             fence: null,
-            (version, token) => artifacts.PublishAsync(
-                staging, new MappingArtifactDescriptor(scope, result.Version.Wave, version), token),
+            async token => _ = await artifacts.GetAsync(descriptor, token)
+                ?? throw new MappingGenerationException("Artefato publicado ausente na finalização (fail-closed)."),
             cancellationToken);
     }
 

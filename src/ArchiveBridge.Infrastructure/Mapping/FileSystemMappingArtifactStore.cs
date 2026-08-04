@@ -66,14 +66,17 @@ public sealed class FileSystemMappingArtifactStore : IMappingArtifactStore
     {
         ArgumentNullException.ThrowIfNull(staging);
         ArgumentNullException.ThrowIfNull(descriptor);
-        var logicalPath = LogicalPathFor(descriptor);
+        var logicalPath = descriptor.LogicalPath;
         var finalDir = VersionDir(descriptor);
         var reference = new MappingArtifactReference(logicalPath, staging.SizeBytes, staging.ContentSha256);
 
         if (Directory.Exists(finalDir))
         {
-            // Já publicado: aceita só se idêntico (idempotente); divergente é recusado (imutável).
-            await EnsureExistingMatchesAsync(finalDir, staging.ContentSha256, cancellationToken).ConfigureAwait(false);
+            // Já publicado: republicação idempotente EXIGE que o bundle COMPLETO (csv + sha256 + manifesto,
+            // hashes, campos do manifesto vs. escopo/versão, ausência de arquivos inesperados, contenção)
+            // corresponda ao descritor e ao conteúdo encenado. Divergência ou bundle incompleto ⇒ recusa
+            // (imutável, fail-closed) — não descarta o staging válido nem sobrescreve.
+            await EnsureExistingBundleMatchesAsync(descriptor, staging.ContentSha256, cancellationToken).ConfigureAwait(false);
             await DiscardAsync(staging, cancellationToken).ConfigureAwait(false);
             return reference;
         }
@@ -91,8 +94,8 @@ public sealed class FileSystemMappingArtifactStore : IMappingArtifactStore
         }
         catch (IOException) when (Directory.Exists(finalDir))
         {
-            // Corrida de publicação da mesma versão: aceita se idêntico, senão recusa. Descarta o staging.
-            await EnsureExistingMatchesAsync(finalDir, staging.ContentSha256, cancellationToken).ConfigureAwait(false);
+            // Corrida de publicação da mesma versão: valida o bundle COMPLETO e recusa divergência. Descarta o staging.
+            await EnsureExistingBundleMatchesAsync(descriptor, staging.ContentSha256, cancellationToken).ConfigureAwait(false);
             await DiscardAsync(staging, cancellationToken).ConfigureAwait(false);
         }
 
@@ -109,6 +112,45 @@ public sealed class FileSystemMappingArtifactStore : IMappingArtifactStore
             return null;
         }
 
+        return await ValidateBundleAsync(finalDir, descriptor, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public Task DiscardAsync(MappingArtifactStaging staging, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(staging);
+
+        // Guarda de destruição: SÓ se descarta um diretório ESTRITAMENTE sob <root>/.staging. Um caminho
+        // arbitrário, a própria raiz de staging ou um symlink/reparse são recusados ANTES de qualquer
+        // Directory.Delete — nunca se apaga fora da área de encenação autorizada (fail-closed).
+        var stagingRoot = ArtifactPathContainment.EnsureContained(_root, Path.Combine(_root, StagingFolder));
+        var target = ArtifactPathContainment.EnsureContained(stagingRoot, staging.StagingPath);
+        if (string.Equals(target, stagingRoot, StringComparison.Ordinal))
+        {
+            throw new ArgumentException("Descarte recusado: o caminho é a própria raiz de staging, não um staging individual.", nameof(staging));
+        }
+
+        try
+        {
+            if (Directory.Exists(target))
+            {
+                Directory.Delete(target, recursive: true);
+            }
+        }
+        catch (IOException)
+        {
+            // Best-effort: não mascara o erro original de uma falha de publicação.
+        }
+
+        return Task.CompletedTask;
+    }
+
+    // Validação do CONJUNTO completo de um bundle publicado (fonte única para leitura e para a
+    // revalidação de republicação). Exige os três arquivos (e SÓ eles), o hash do CSV, o conteúdo do
+    // sidecar sha256 e o manifesto vs. tenant/projeto/onda/versão/caminho/tamanho/ContentSha256.
+    private static async Task<MappingArtifactContent> ValidateBundleAsync(
+        string finalDir, MappingArtifactDescriptor descriptor, CancellationToken cancellationToken)
+    {
         var csvPath = Path.Combine(finalDir, CsvFileName);
         var shaPath = Path.Combine(finalDir, ShaFileName);
         var manifestPath = Path.Combine(finalDir, ManifestFileName);
@@ -116,6 +158,8 @@ public sealed class FileSystemMappingArtifactStore : IMappingArtifactStore
         {
             throw new MappingGenerationException("Conjunto de artefato incompleto (arquivos ausentes); recusado (fail-closed).");
         }
+
+        EnsureNoUnexpectedEntries(finalDir);
 
         var bytes = await File.ReadAllBytesAsync(csvPath, cancellationToken).ConfigureAwait(false);
         var actualHash = DeterministicHash.ComputeBytes(bytes);
@@ -134,23 +178,21 @@ public sealed class FileSystemMappingArtifactStore : IMappingArtifactStore
         return new MappingArtifactContent(bytes, actualHash);
     }
 
-    /// <inheritdoc />
-    public Task DiscardAsync(MappingArtifactStaging staging, CancellationToken cancellationToken)
+    // O bundle publicado deve conter EXATAMENTE os três arquivos esperados — nenhum arquivo/subdiretório
+    // inesperado (defesa contra material injetado no diretório da versão).
+    private static void EnsureNoUnexpectedEntries(string finalDir)
     {
-        ArgumentNullException.ThrowIfNull(staging);
-        try
+        foreach (var entry in Directory.EnumerateFileSystemEntries(finalDir))
         {
-            if (Directory.Exists(staging.StagingPath))
+            var name = Path.GetFileName(entry);
+            var expected = string.Equals(name, CsvFileName, StringComparison.Ordinal)
+                || string.Equals(name, ShaFileName, StringComparison.Ordinal)
+                || string.Equals(name, ManifestFileName, StringComparison.Ordinal);
+            if (!expected || Directory.Exists(entry))
             {
-                Directory.Delete(staging.StagingPath, recursive: true);
+                throw new MappingGenerationException("Bundle contém entrada inesperada na pasta da versão; recusado (fail-closed).");
             }
         }
-        catch (IOException)
-        {
-            // Best-effort: não mascara o erro original de uma falha de publicação.
-        }
-
-        return Task.CompletedTask;
     }
 
     private static void ValidateManifest(
@@ -160,7 +202,7 @@ public sealed class FileSystemMappingArtifactStore : IMappingArtifactStore
             && manifest.Project == descriptor.Scope.Project.Value
             && manifest.Wave == descriptor.Wave.Value
             && manifest.Version == descriptor.Version.Value
-            && string.Equals(manifest.LogicalPath, LogicalPathFor(descriptor), StringComparison.Ordinal)
+            && string.Equals(manifest.LogicalPath, descriptor.LogicalPath, StringComparison.Ordinal)
             && string.Equals(manifest.ContentSha256, actualHash.Value, StringComparison.Ordinal)
             && manifest.SizeBytes == sizeBytes;
         if (!ok)
@@ -169,27 +211,20 @@ public sealed class FileSystemMappingArtifactStore : IMappingArtifactStore
         }
     }
 
-    private static async Task EnsureExistingMatchesAsync(string finalDir, Sha256Hash expected, CancellationToken cancellationToken)
+    // Revalidação de republicação: valida o bundle COMPLETO já publicado (não só o hash do CSV) contra o
+    // descritor e confere que o conteúdo é IDÊNTICO ao encenado. Bundle incompleto/divergente ⇒ recusa
+    // (imutável, fail-closed) — não sobrescreve nem descarta o staging válido.
+    private async Task EnsureExistingBundleMatchesAsync(
+        MappingArtifactDescriptor descriptor, Sha256Hash expected, CancellationToken cancellationToken)
     {
-        var csvPath = Path.Combine(finalDir, CsvFileName);
-        if (!File.Exists(csvPath))
-        {
-            throw new MappingGenerationException("Versão publicada sem CSV; conjunto inconsistente (fail-closed).");
-        }
-
-        var existing = await File.ReadAllBytesAsync(csvPath, cancellationToken).ConfigureAwait(false);
-        var existingHash = DeterministicHash.ComputeBytes(existing);
-        if (!string.Equals(existingHash.Value, expected.Value, StringComparison.Ordinal))
+        var finalDir = VersionDir(descriptor);
+        var content = await ValidateBundleAsync(finalDir, descriptor, cancellationToken).ConfigureAwait(false);
+        if (!string.Equals(content.ContentSha256.Value, expected.Value, StringComparison.Ordinal))
         {
             throw new MappingGenerationException(
                 "Já existe artefato divergente para esta versão de mapping; sobrescrita recusada (imutável).");
         }
     }
-
-    private static string LogicalPathFor(MappingArtifactDescriptor descriptor) =>
-        string.Create(
-            CultureInfo.InvariantCulture,
-            $"{descriptor.Scope.Tenant.Value:N}/{descriptor.Scope.Project.Value:N}/{descriptor.Wave.Value:N}/v{descriptor.Version.Value}");
 
     private string VersionDir(MappingArtifactDescriptor descriptor)
     {
