@@ -134,26 +134,81 @@ public sealed class Slice3EvidenceArtifactTests
         Assert.False(presentMaturity.GetProperty("AutomatedFixtureValidated").GetBoolean());
     }
 
+    // ---- Duplicidade recusada FAIL-CLOSED pelo serializer (alinhada às constraints SQL) ------------------
+
     [Fact]
-    public void CanonicalBytesIndependentOfDuplicateAdapterIdOrder()
+    public void SerializerRejectsDuplicateAdapterIdFailClosed() =>
+        Assert.Throws<EvDiscoveryInvariantException>(() => Serialize([Eval("adapter-a", precedence: 10), Eval("adapter-a", precedence: 20)]));
+
+    [Fact]
+    public void SerializerRejectsDuplicateCapabilityCodeWithinEvaluationFailClosed() =>
+        Assert.Throws<EvDiscoveryInvariantException>(() => Serialize([Eval(capabilities:
+            [Cap(EvCapabilityCodes.EvExportPstSupported), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable)])]));
+
+    // ---- Ausência versus valor no artefato: cada distinção muda o ContentSha256 --------------------------
+
+    private static EvCapabilitySet CapabilitySetOf(EvAdapterId? adapterId, int? adapterVersion) =>
+        EvCapabilitySet.Create(Env, adapterId, adapterVersion, EvDiscoverySchema.Version, [Cap()], EvDiscoveryStatus.Ready);
+
+    private static EvDiscoveryEvidenceBytes SerializeRaw(
+        EvCapabilitySet capabilitySet, EvAdapterEvaluation[] evaluations, EvAdapterEvaluation? selected, EvExportSignature? signature = null)
     {
-        var first = Eval("adapter-a", precedence: 10);
-        var second = Eval("adapter-a", precedence: 20);
-        var forward = Serialize([first, second]);
-        var reversed = Serialize([second, first]);
-        Assert.True(forward.Bytes.Span.SequenceEqual(reversed.Bytes.Span));
-        Assert.Equal(forward.ContentSha256.Value, reversed.ContentSha256.Value);
+        var identity = new EvEnvironmentIdentity(Env, "site", "dir", "15.1", "15.1", "PowerShell", Now);
+        var selection = new EvAdapterSelection(
+            AdapterSelectionOutcome.Supported, selected, [.. evaluations.Select(static e => e.AdapterId)], evaluations, []);
+        var result = new EvDiscoveryRunResult(
+            DiscoveryRunId.New(), identity, capabilitySet, selection, signature, [], EvDiscoveryStatus.Ready,
+            new EvDiscoveryResultCode(EvDiscoveryResultCodes.DiscoveryCompleted), Now, Now);
+        return Serializer.Serialize(result, ConfigHash, EvDiscoverySemanticFingerprint.Compute(result));
     }
 
     [Fact]
-    public void CanonicalBytesIndependentOfDuplicateCapabilityOrder()
+    public void ContentShaDistinguishesProfileIdNullFromEmpty() =>
+        Assert.NotEqual(Sha([Eval(profileId: null)]), Sha([Eval(profileId: "")]));
+
+    [Fact]
+    public void ContentShaDistinguishesBlockingReasonNullFromEmpty()
     {
-        var forward = Serialize([Eval(capabilities:
-            [Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Available), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable)])]);
-        var reversed = Serialize([Eval(capabilities:
-            [Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Available)])]);
-        Assert.True(forward.Bytes.Span.SequenceEqual(reversed.Bytes.Span));
+        var nullReason = new EvCapability(new EvCapabilityCode(EvCapabilityCodes.EvExportPstSupported), 1, CapabilityAvailability.Unavailable, "ref", null, Now);
+        var emptyReason = new EvCapability(new EvCapabilityCode(EvCapabilityCodes.EvExportPstSupported), 1, CapabilityAvailability.Unavailable, "ref", string.Empty, Now);
+        Assert.NotEqual(Sha([Eval(capabilities: [nullReason])]), Sha([Eval(capabilities: [emptyReason])]));
     }
+
+    [Fact]
+    public void ContentShaDistinguishesFindingCapabilityCodeAbsentFromPresent() =>
+        Assert.NotEqual(
+            Sha([Eval(findings: [Finding(capabilityCode: null)])]),
+            Sha([Eval(findings: [Finding(capabilityCode: EvCapabilityCodes.EvExportPstSupported)])]));
+
+    [Fact]
+    public void ContentShaDistinguishesCapabilitySetAdapterVersionNullFromZero()
+    {
+        var nullVersion = SerializeRaw(CapabilitySetOf(new EvAdapterId("adapter-a"), null), [Eval()], Eval());
+        var zeroVersion = SerializeRaw(CapabilitySetOf(new EvAdapterId("adapter-a"), 0), [Eval()], Eval());
+        Assert.NotEqual(nullVersion.ContentSha256.Value, zeroVersion.ContentSha256.Value);
+    }
+
+    [Fact]
+    public void ContentShaDistinguishesSelectedNullFromNoneAdapter()
+    {
+        var noneEval = Eval("<none>");
+        var notSelected = SerializeRaw(CapabilitySetOf(new EvAdapterId("adapter-a"), 1), [noneEval], selected: null);
+        var selectedNone = SerializeRaw(CapabilitySetOf(new EvAdapterId("adapter-a"), 1), [noneEval], selected: noneEval);
+        Assert.NotEqual(notSelected.ContentSha256.Value, selectedNone.ContentSha256.Value);
+    }
+
+    [Fact]
+    public void ContentShaDistinguishesSignatureAbsentFromPresent()
+    {
+        var signature = EvExportSignature.Create("Export-EVArchive", "Mod", "15.1", "Cmdlet", ["ArchiveId"], ["ArchiveId"], ["Default"], Now);
+        var absent = SerializeRaw(CapabilitySetOf(new EvAdapterId("adapter-a"), 1), [Eval()], Eval(), signature: null);
+        var present = SerializeRaw(CapabilitySetOf(new EvAdapterId("adapter-a"), 1), [Eval()], Eval(), signature: signature);
+        Assert.NotEqual(absent.ContentSha256.Value, present.ContentSha256.Value);
+    }
+
+    [Fact]
+    public void ContentShaEncodesUnitSeparatorInTextField() =>
+        Assert.NotEqual(Sha([Eval(profileId: "a\u001fb")]), Sha([Eval(profileId: "ab")]));
 
     [Fact]
     public void EvidenceJsonRecordsCompleteEvaluationsMaturityAndAuthoritativeFingerprints()

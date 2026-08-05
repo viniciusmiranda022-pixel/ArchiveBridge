@@ -151,13 +151,25 @@ verifica a pendente equivalente pelos três hashes e a insere (ou a reutiliza) �
 colisão concorrente é reconciliada relendo a pendente. A finalização revalida os três hashes antes de
 promover.
 
-**Canonicalização (estratégia única e explícita).** O `EvDiscoverySemanticFingerprint` e o serializer de
-evidência compartilham uma **única** canonicalização (`EvDiscoveryCanonical`): **ordenação TOTAL por TODOS
-os campos semânticos**, nunca por chave parcial. Duas avaliações de mesmo `AdapterId` com conteúdo diferente,
-ou capacidades de mesmo código com conteúdo diferente, ficam em ordem determinística; inverter qualquer
-coleção **nunca** altera o hash nem os bytes canônicos, sem depender da ordem de entrada. A **maturidade**
-distingue AUSENTE (nula) de todas-as-flags-falsas por um **marcador de presença** — `null` nunca é
-convertido em `false` silenciosamente (no `evidence.json`, `Maturity` é `null` versus um objeto presente).
+**Invariantes de unicidade (alinhadas ao SQL).** `AdapterId` é ÚNICO por execução (constraint
+`UQ_eveval_adapter`) e `CapabilityCode` é ÚNICO por conjunto — no capability set (`UQ_evcap_code`) e nas
+capacidades declaradas de cada avaliação. `EvDiscoveryInvariants.Validate` recusa duplicidades **fail-closed**
+com exceção estruturada (`EvDiscoveryInvariantException`, sem depender da mensagem do SQL), e é aplicada em
+TODOS os caminhos (`EvCapabilitySet.Create`, `AdapterSelectionPolicy`, o fingerprint, o serializer e a store
+ANTES de abrir a transação) — uma duplicidade jamais chega ao `INSERT` (nunca vira `SqlException`
+2601/2627) e a versão anterior permanece intacta; mesmo um record público construído diretamente é recusado
+pelo hash/serializer/persistência.
+
+**Canonicalização (codificação tipada, sem sentinela).** O `EvDiscoverySemanticFingerprint` é o SHA-256
+calculado DIRETAMENTE sobre a codificação canônica de `EvDiscoveryCanonical`: cada campo carrega **tipo**
+explícito e **tag**; cada string é **length-prefixed** (comprimento UTF-8 + bytes UTF-8); listas gravam a
+**quantidade**; inteiros/enums vão em binário; anuláveis têm **marcador de presença**. Não há separador nem
+string sentinela — qualquer valor (inclusive contendo `U+001F`) é representado sem ambiguidade. **Não
+existem sentinelas de ausência:** `null` ≠ `""` ≠ `0` ≠ `"<none>"` são estados DISTINTOS (AdapterId/
+AdapterVersion do capability set, adapter selecionado, `ProfileId`, `BlockingReason`, `CapabilityCode` de
+achado, assinatura e maturidade). Como `AdapterId`/`CapabilityCode` são únicos, a ordenação é ordinal por
+essas chaves; o serializer usa a MESMA ordenação, e inverter coleções válidas nunca altera hash nem bytes.
+O `evidence.json` e o `SemanticEvidenceHash` representam exatamente as mesmas distinções semânticas.
 
 A evidência detalhada é um **artefato imutável** (`evidence.json` + `evidence.sha256` + `manifest.json`)
 publicado por rename atômico de diretório, versionado por ambiente. O mesmo padrão da Slice 2:

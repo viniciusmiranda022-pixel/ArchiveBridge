@@ -57,116 +57,17 @@ public sealed record EvDiscoveryConfiguration(
 }
 
 /// <summary>
-/// Impressão digital SEMÂNTICA COMPLETA de uma execução de descoberta. Inclui, de forma canônica e com
-/// ordenação ORDINAL EXPLÍCITA (o mesmo conteúdo semântico produz o mesmo hash independentemente da ordem
-/// das coleções): identidade integral do ambiente; todas as capacidades; a assinatura normalizada e seu
-/// hash; a SELEÇÃO completa (desfecho, candidatos ordenados, adapter selecionado, achados da seleção); e
-/// CADA avaliação de adapter por inteiro — compatibilidade, precedência, perfil, MATURIDADE
-/// (runtime/documentação/fixtures/laboratório), requisitos ordenados, capacidades declaradas ordenadas e
-/// achados ordenados; além do status, do código de resultado, da versão de esquema e de cada achado com
-/// sua <see cref="EvErrorCategory"/>. Qualquer diferença semântica muda o hash.
+/// Impressão digital SEMÂNTICA COMPLETA de uma execução de descoberta. É o SHA-256 calculado DIRETAMENTE
+/// sobre a codificação canônica TIPADA e length-prefixed de <see cref="EvDiscoveryCanonical"/> — sem
+/// separadores nem sentinelas, com marcador de presença em todos os anuláveis (<c>null</c> ≠ <c>""</c> ≠
+/// <c>0</c> ≠ <c>"&lt;none&gt;"</c>). Cobre identidade integral do ambiente, capacidades, assinatura, a
+/// seleção completa e cada avaliação de adapter por inteiro (maturidade, requisitos, capacidades declaradas
+/// e achados), com <see cref="EvErrorCategory"/> em cada achado. As invariantes de unicidade são validadas
+/// (fail-closed) antes do cálculo. Qualquer diferença semântica muda o hash.
 /// </summary>
 public static class EvDiscoverySemanticFingerprint
 {
-    /// <summary>Computa o hash semântico completo da execução (canônico, ordenação ordinal explícita).</summary>
-    public static Sha256Hash Compute(EvDiscoveryRunResult result)
-    {
-        ArgumentNullException.ThrowIfNull(result);
-        var parts = new List<string>
-        {
-            "schema", result.CapabilitySet.DiscoverySchemaVersion.ToString(CultureInfo.InvariantCulture),
-            "status", result.Status.ToString(),
-            "resultCode", result.ResultCode.Value,
-            "env", result.Environment.EnvironmentId.Value.ToString("N"),
-            "site", result.Environment.SiteName,
-            "server", result.Environment.DirectoryServer,
-            "observed", result.Environment.ObservedVersion,
-            "product", result.Environment.ProductVersion,
-            "source", result.Environment.DiscoverySource,
-            "adapter", result.CapabilitySet.AdapterId?.Value ?? "<none>",
-            "adapterVer", (result.CapabilitySet.AdapterVersion ?? 0).ToString(CultureInfo.InvariantCulture),
-        };
-
-        foreach (var capability in EvDiscoveryCanonical.OrderCapabilities(result.CapabilitySet.Capabilities))
-        {
-            AppendCapability(parts, "cap", capability);
-        }
-
-        parts.Add("sig");
-        parts.Add(result.Signature?.SignatureHash.Value ?? "<none>");
-        parts.Add(result.Signature is { } signature ? string.Join(",", signature.Parameters) : string.Empty);
-
-        // Seleção: desfecho + adapter selecionado + candidatos e achados em ORDEM CANÔNICA TOTAL.
-        parts.Add("selOutcome");
-        parts.Add(result.Selection.Outcome.ToString());
-        parts.Add("selected");
-        parts.Add(result.Selection.Selected?.AdapterId.Value ?? "<none>");
-        foreach (var candidate in EvDiscoveryCanonical.OrderCandidates(result.Selection.Candidates))
-        {
-            parts.Add("cand");
-            parts.Add(candidate);
-        }
-
-        foreach (var finding in EvDiscoveryCanonical.OrderFindings(result.Selection.Findings))
-        {
-            AppendFinding(parts, "selFind", finding);
-        }
-
-        // Avaliações de adapter COMPLETAS em ORDEM CANÔNICA TOTAL (por todos os campos, não só AdapterId).
-        foreach (var evaluation in EvDiscoveryCanonical.OrderEvaluations(result.Selection.Evaluations))
-        {
-            parts.Add("adp");
-            parts.Add(evaluation.AdapterId.Value);
-            parts.Add(evaluation.AdapterVersion.ToString(CultureInfo.InvariantCulture));
-            parts.Add(evaluation.Compatibility.ToString());
-            parts.Add(evaluation.Precedence.ToString(CultureInfo.InvariantCulture));
-            parts.Add(evaluation.ProfileId ?? string.Empty);
-
-            // Maturidade com marcador de PRESENÇA (ausente ≠ todas-as-flags-falsas; null nunca vira false).
-            parts.AddRange(EvDiscoveryCanonical.MaturityTokens(evaluation.Maturity));
-
-            foreach (var requirement in EvDiscoveryCanonical.OrderRequirements(evaluation.Requirements))
-            {
-                parts.Add("req");
-                parts.Add(requirement.CapabilityCode.Value);
-                parts.Add(requirement.Description);
-            }
-
-            foreach (var capability in EvDiscoveryCanonical.OrderCapabilities(evaluation.Capabilities))
-            {
-                AppendCapability(parts, "adpCap", capability);
-            }
-
-            foreach (var finding in EvDiscoveryCanonical.OrderFindings(evaluation.Findings))
-            {
-                AppendFinding(parts, "adpFind", finding);
-            }
-        }
-
-        foreach (var finding in EvDiscoveryCanonical.OrderFindings(result.BlockingFindings))
-        {
-            AppendFinding(parts, "find", finding);
-        }
-
-        return DeterministicHash.Compute(parts);
-    }
-
-    private static void AppendCapability(List<string> parts, string tag, EvCapability capability)
-    {
-        parts.Add(tag);
-        parts.Add(capability.CapabilityCode.Value);
-        parts.Add(capability.CapabilityVersion.ToString(CultureInfo.InvariantCulture));
-        parts.Add(capability.Availability.ToString());
-        parts.Add(capability.EvidenceReference);
-        parts.Add(capability.BlockingReason ?? string.Empty);
-    }
-
-    private static void AppendFinding(List<string> parts, string tag, EvDiscoveryFinding finding)
-    {
-        parts.Add(tag);
-        parts.Add(finding.ResultCode.Value);
-        parts.Add(finding.CapabilityCode?.Value ?? string.Empty);
-        parts.Add(finding.Reason);
-        parts.Add(finding.ErrorCategory.ToString());
-    }
+    /// <summary>Computa o hash semântico completo sobre os bytes canônicos (fail-closed nas invariantes).</summary>
+    public static Sha256Hash Compute(EvDiscoveryRunResult result) =>
+        DeterministicHash.ComputeBytes(EvDiscoveryCanonical.Encode(result));
 }

@@ -134,6 +134,9 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
         CorrelationId correlation, JobFence? fence, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(result);
+        // Invariantes de unicidade ANTES de abrir qualquer transação: uma duplicidade jamais chega ao INSERT
+        // (nunca vira SqlException 2601/2627); a versão anterior permanece intacta (fail-closed).
+        EvDiscoveryInvariants.Validate(result);
         for (var attempt = 0; attempt < 5; attempt++)
         {
             try

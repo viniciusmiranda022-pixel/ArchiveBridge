@@ -33,6 +33,8 @@ public sealed record EvCapabilitySet(
         EvDiscoveryStatus status)
     {
         ArgumentNullException.ThrowIfNull(capabilities);
+        // Invariante de unicidade (alinhada a UQ_evcap_code): recusa códigos repetidos, fail-closed.
+        EvDiscoveryInvariants.EnsureUniqueCapabilities(capabilities, "conjunto de capacidades");
         var ordered = capabilities
             .OrderBy(static capability => capability.CapabilityCode.Value, StringComparer.Ordinal)
             .ToArray();

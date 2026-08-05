@@ -284,6 +284,45 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
             Slice3Support.Evidence(fixture).GetAsync(descriptor, CancellationToken.None));
     }
 
+    private static EvDiscoveryRunResult DuplicateAdapterResult(EvEnvironmentDescriptor env)
+    {
+        var identity = new EvEnvironmentIdentity(env.EnvironmentId, env.SiteName, env.DirectoryServer, "15.1", "15.1", "PowerShell", Slice2Support.Now);
+        var cap = new EvCapability(new EvCapabilityCode(EvCapabilityCodes.EvExportCmdletAvailable), 1, CapabilityAvailability.Available, "ref", null, Slice2Support.Now);
+        var capabilitySet = EvCapabilitySet.Create(env.EnvironmentId, new EvAdapterId("dup"), 1, EvDiscoverySchema.Version, [cap], EvDiscoveryStatus.Ready);
+        // Duas avaliações com o MESMO AdapterId (record construído direto) — inválido por invariante.
+        var evalA = new EvAdapterEvaluation(new EvAdapterId("dup"), 1, AdapterCompatibility.Supported, [cap], [], [], 10, "P", null);
+        var evalB = new EvAdapterEvaluation(new EvAdapterId("dup"), 1, AdapterCompatibility.Supported, [cap], [], [], 20, "P", null);
+        var selection = new EvAdapterSelection(AdapterSelectionOutcome.Supported, evalA, [evalA.AdapterId, evalB.AdapterId], [evalA, evalB], []);
+        return new EvDiscoveryRunResult(
+            DiscoveryRunId.New(), identity, capabilitySet, selection, null, [], EvDiscoveryStatus.Ready,
+            new EvDiscoveryResultCode(EvDiscoveryResultCodes.DiscoveryCompleted), Slice2Support.Now, Slice2Support.Now);
+    }
+
+    [Fact]
+    public async Task ReserveRejectsDuplicateAdapterIdBeforeInsertKeepingPreviousVersion()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var store = Slice3Support.Store(fixture, clock);
+
+        // v1 válida e utilizável.
+        await RunUseCaseAsync(scope, project, env, Slice3Support.ReadyHost(), clock);
+        Assert.Equal(1, await store.GetMaxVersionAsync(scope, env.EnvironmentId, CancellationToken.None));
+
+        // A reserva de um resultado com AdapterId duplicado é recusada ANTES do INSERT (invariante de domínio,
+        // não SqlException 2601/2627) — nenhuma versão parcial é persistida.
+        var invalid = DuplicateAdapterResult(env);
+        var dummy = new Sha256Hash(new string('0', 64));
+        await Assert.ThrowsAsync<EvDiscoveryInvariantException>(() => store.ReserveAsync(
+            scope, env.EnvironmentId, invalid, dummy, dummy, dummy, 1, CorrelationId.New(), fence: null, CancellationToken.None));
+
+        Assert.Equal(1, await store.GetMaxVersionAsync(scope, env.EnvironmentId, CancellationToken.None)); // sem v2 parcial
+        var usable = await store.GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None);
+        Assert.Equal(1, usable!.DiscoveryVersion); // v1 permanece utilizável
+        Assert.Equal(EvDiscoveryStatus.Ready, usable.Status);
+    }
+
     [Fact]
     public async Task PersistedMaturityMatchesEvaluationIncludingAutomatedFixtureValidated()
     {

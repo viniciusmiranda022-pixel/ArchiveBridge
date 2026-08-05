@@ -166,24 +166,136 @@ public sealed class Slice3SemanticFingerprintTests
         Assert.NotEqual(absent.Value, allFalse.Value); // null nunca é convertido em false silenciosamente
     }
 
-    // ---- Ordenação canônica TOTAL: chaves parciais duplicadas com conteúdo diferente ---------------------
+    // ---- Invariantes de UNICIDADE (fail-closed) — alinhadas a UQ_eveval_adapter / UQ_evcap_code ----------
+
+    private static EvEnvironmentIdentity Identity() => new(Env, "site", "dir", "15.1", "15.1", "PowerShell", Now);
+
+    private static EvDiscoveryRunResult BuildRaw(
+        EvCapabilitySet capabilitySet, EvAdapterEvaluation[] evaluations, EvAdapterEvaluation? selected,
+        AdapterSelectionOutcome outcome = AdapterSelectionOutcome.Supported, EvExportSignature? signature = null)
+    {
+        var selection = new EvAdapterSelection(outcome, selected, [.. evaluations.Select(static e => e.AdapterId)], evaluations, []);
+        return new EvDiscoveryRunResult(
+            DiscoveryRunId.New(), Identity(), capabilitySet, selection, signature, [], EvDiscoveryStatus.Ready,
+            new EvDiscoveryResultCode(EvDiscoveryResultCodes.DiscoveryCompleted), Now, Now);
+    }
+
+    // Constrói o capability set diretamente pelo record (sem a fábrica) para provar que o HASH também recusa.
+    private static EvCapabilitySet RawCapabilitySet(EvAdapterId? adapterId, int? adapterVersion, EvCapability[] capabilities) =>
+        new(Env, adapterId, adapterVersion, EvDiscoverySchema.Version, capabilities,
+            new Sha256Hash(new string('0', 64)), new Sha256Hash(new string('0', 64)), EvDiscoveryStatus.Ready);
+
+    private static string FingerprintOf(EvDiscoveryRunResult result) => EvDiscoverySemanticFingerprint.Compute(result).Value;
 
     [Fact]
-    public void DuplicateAdapterIdIsTotallyOrderedRegardlessOfInputOrder()
+    public void DuplicateAdapterIdIsRejectedFailClosed()
     {
-        // Mesmo AdapterId, conteúdo diferente (precedência): a ordem TOTAL torna o hash independente da entrada.
-        var first = Eval("adapter-a", precedence: 10);
-        var second = Eval("adapter-a", precedence: 20);
-        Assert.Equal(Hash([first, second]).Value, Hash([second, first]).Value);
+        // Duas avaliações com o MESMO AdapterId — construídas direto no record (a seleção normal recusaria antes).
+        var result = BuildRaw(
+            RawCapabilitySet(new EvAdapterId("adapter-a"), 1, [Cap()]),
+            [Eval("adapter-a", precedence: 10), Eval("adapter-a", precedence: 20)],
+            selected: null,
+            outcome: AdapterSelectionOutcome.Ambiguous);
+        var ex = Assert.Throws<EvDiscoveryInvariantException>(() => FingerprintOf(result));
+        Assert.Equal(EvDiscoveryInvariants.DuplicateAdapterId, ex.Code);
     }
 
     [Fact]
-    public void DuplicateCapabilityCodeWithDifferentContentIsTotallyOrdered()
+    public void DuplicateCapabilityCodeInCapabilitySetIsRejectedFailClosed()
     {
-        var forward = Eval(capabilities:
-            [Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Available), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable)]);
-        var reversed = Eval(capabilities:
-            [Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Available)]);
-        Assert.Equal(Hash([forward]).Value, Hash([reversed]).Value);
+        var duplicated = new[] { Cap(EvCapabilityCodes.EvExportPstSupported), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable) };
+        // A fábrica recusa...
+        Assert.Throws<EvDiscoveryInvariantException>(() => EvCapabilitySet.Create(Env, new EvAdapterId("adapter-a"), 1, EvDiscoverySchema.Version, duplicated, EvDiscoveryStatus.Ready));
+        // ...e o HASH também recusa um record construído diretamente (bypass da fábrica).
+        var result = BuildRaw(RawCapabilitySet(new EvAdapterId("adapter-a"), 1, duplicated), [Eval()], Eval());
+        var ex = Assert.Throws<EvDiscoveryInvariantException>(() => FingerprintOf(result));
+        Assert.Equal(EvDiscoveryInvariants.DuplicateCapabilityCode, ex.Code);
+    }
+
+    [Fact]
+    public void DuplicateCapabilityCodeWithinEvaluationIsRejectedFailClosed()
+    {
+        var evaluation = Eval(capabilities:
+            [Cap(EvCapabilityCodes.EvExportPstSupported), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable)]);
+        var result = BuildRaw(RawCapabilitySet(new EvAdapterId("adapter-a"), 1, [Cap()]), [evaluation], evaluation);
+        Assert.Throws<EvDiscoveryInvariantException>(() => FingerprintOf(result));
+    }
+
+    // ---- Ausência versus valor: null ≠ "" ≠ 0 ≠ "<none>" (presença explícita) ----------------------------
+
+    [Fact]
+    public void FingerprintDistinguishesProfileIdNullFromEmpty() =>
+        Assert.NotEqual(Hash([Eval(profileId: null)]).Value, Hash([Eval(profileId: "")]).Value);
+
+    [Fact]
+    public void FingerprintDistinguishesBlockingReasonNullFromEmpty()
+    {
+        var nullReason = new EvCapability(new EvCapabilityCode(EvCapabilityCodes.EvExportPstSupported), 1, CapabilityAvailability.Unavailable, "ref", null, Now);
+        var emptyReason = new EvCapability(new EvCapabilityCode(EvCapabilityCodes.EvExportPstSupported), 1, CapabilityAvailability.Unavailable, "ref", string.Empty, Now);
+        Assert.NotEqual(Hash([Eval(capabilities: [nullReason])]).Value, Hash([Eval(capabilities: [emptyReason])]).Value);
+    }
+
+    [Fact]
+    public void FingerprintDistinguishesCapabilitySetAdapterVersionNullFromZero()
+    {
+        var nullVersion = BuildRaw(RawCapabilitySet(new EvAdapterId("adapter-a"), null, [Cap()]), [Eval()], Eval());
+        var zeroVersion = BuildRaw(RawCapabilitySet(new EvAdapterId("adapter-a"), 0, [Cap()]), [Eval()], Eval());
+        Assert.NotEqual(FingerprintOf(nullVersion), FingerprintOf(zeroVersion));
+    }
+
+    [Fact]
+    public void FingerprintDistinguishesCapabilitySetAdapterIdNullFromNoneLiteral()
+    {
+        var nullId = BuildRaw(RawCapabilitySet(null, 1, [Cap()]), [Eval()], Eval());
+        var noneId = BuildRaw(RawCapabilitySet(new EvAdapterId("<none>"), 1, [Cap()]), [Eval()], Eval());
+        Assert.NotEqual(FingerprintOf(nullId), FingerprintOf(noneId));
+    }
+
+    [Fact]
+    public void FingerprintDistinguishesSelectedNullFromNoneAdapter()
+    {
+        var noneEval = Eval("<none>");
+        var notSelected = BuildRaw(RawCapabilitySet(new EvAdapterId("adapter-a"), 1, [Cap()]), [noneEval], selected: null);
+        var selectedNone = BuildRaw(RawCapabilitySet(new EvAdapterId("adapter-a"), 1, [Cap()]), [noneEval], selected: noneEval);
+        Assert.NotEqual(FingerprintOf(notSelected), FingerprintOf(selectedNone));
+    }
+
+    [Fact]
+    public void FingerprintDistinguishesFindingCapabilityCodeAbsentFromPresent() =>
+        Assert.NotEqual(
+            Hash([Eval(findings: [Finding(capabilityCode: null)])]).Value,
+            Hash([Eval(findings: [Finding(capabilityCode: EvCapabilityCodes.EvExportPstSupported)])]).Value);
+
+    [Fact]
+    public void FingerprintDistinguishesSignatureAbsentFromPresent()
+    {
+        var signature = EvExportSignature.Create("Export-EVArchive", "Mod", "15.1", "Cmdlet", ["ArchiveId"], ["ArchiveId"], ["Default"], Now);
+        Assert.NotEqual(Hash([Eval()], signature: null).Value, Hash([Eval()], signature: signature).Value);
+    }
+
+    // ---- Codificação: U+001F em campo textual é unívoco (sem colisão de separador) ------------------------
+
+    [Fact]
+    public void FingerprintEncodesUnitSeparatorInTextWithoutAmbiguity() =>
+        Assert.NotEqual(Hash([Eval(profileId: "a\u001fb")]).Value, Hash([Eval(profileId: "ab")]).Value);
+
+    [Fact]
+    public void CanonicalEncodingDistinguishesTheHistoricalCollisionPair()
+    {
+        // Par que colidia na chave concatenada por U+001F: agora as codificações canônicas são DIFERENTES.
+        var evalA = Eval("A\u001f1", version: 2, compatibility: AdapterCompatibility.Supported, precedence: 10, profileId: "P");
+        var evalB = Eval("A", version: 1, compatibility: AdapterCompatibility.Unsupported, precedence: 0, profileId: "10\u001fP");
+
+        var encodedA = EvDiscoveryCanonical.Encode(BuildRaw(RawCapabilitySet(new EvAdapterId("adapter-a"), 1, [Cap()]), [evalA], selected: null, outcome: AdapterSelectionOutcome.Unsupported));
+        var encodedB = EvDiscoveryCanonical.Encode(BuildRaw(RawCapabilitySet(new EvAdapterId("adapter-a"), 1, [Cap()]), [evalB], selected: null, outcome: AdapterSelectionOutcome.Unsupported));
+        Assert.False(encodedA.AsSpan().SequenceEqual(encodedB)); // representações canônicas distintas
+    }
+
+    [Fact]
+    public void CanonicalEncodingIsByteIdenticalForIdenticalContent()
+    {
+        var first = EvDiscoveryCanonical.Encode(BuildRaw(RawCapabilitySet(new EvAdapterId("adapter-a"), 1, [Cap()]), [Eval()], Eval()));
+        var second = EvDiscoveryCanonical.Encode(BuildRaw(RawCapabilitySet(new EvAdapterId("adapter-a"), 1, [Cap()]), [Eval()], Eval()));
+        Assert.True(first.AsSpan().SequenceEqual(second));
     }
 }

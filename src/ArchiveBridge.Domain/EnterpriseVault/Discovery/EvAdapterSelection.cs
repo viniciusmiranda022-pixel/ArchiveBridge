@@ -48,6 +48,8 @@ public static class AdapterSelectionPolicy
     public static EvAdapterSelection Select(IReadOnlyList<EvAdapterEvaluation> evaluations)
     {
         ArgumentNullException.ThrowIfNull(evaluations);
+        // Invariante de unicidade (alinhada a UQ_eveval_adapter): no máximo uma avaliação por AdapterId, fail-closed.
+        EvDiscoveryInvariants.EnsureUniqueEvaluations(evaluations);
         var candidates = evaluations
             .Select(static evaluation => evaluation.AdapterId)
             .ToArray();

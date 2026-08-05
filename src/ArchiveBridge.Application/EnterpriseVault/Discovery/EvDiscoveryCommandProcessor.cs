@@ -167,5 +167,6 @@ public sealed class EvDiscoveryCommandProcessor(
             or StaleEvDiscoveryContextException
             or EvDiscoveryEvidenceException
             or EvDiscoveryPersistenceException
+            or EvDiscoveryInvariantException
             or ArgumentException;
 }

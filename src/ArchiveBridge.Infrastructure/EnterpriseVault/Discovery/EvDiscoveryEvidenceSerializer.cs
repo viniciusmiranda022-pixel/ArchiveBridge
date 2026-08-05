@@ -25,6 +25,8 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
         EvDiscoveryRunResult result, Sha256Hash configurationHash, Sha256Hash semanticEvidenceHash)
     {
         ArgumentNullException.ThrowIfNull(result);
+        // Recusa objetos inválidos (duplicidade de AdapterId/CapabilityCode) mesmo construídos diretamente.
+        EvDiscoveryInvariants.Validate(result);
         var document = new EvidenceDocument(
             EvDiscoverySchema.Version,
             // Impressões digitais AUTORITATIVAS da reserva (completas), registradas explicitamente.
