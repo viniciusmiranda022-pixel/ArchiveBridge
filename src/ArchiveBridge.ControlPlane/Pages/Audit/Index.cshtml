@@ -1,0 +1,38 @@
+@page
+@inject IPortalSignInAudit SignInAudit
+@{
+    ViewData["Title"] = "Auditoria";
+    var events = await SignInAudit.RecentAsync(100, HttpContext.RequestAborted);
+}
+<h1>Trilha de auditoria</h1>
+<p class="lead">
+    Tentativas de autenticação no portal (sucesso e falha). A trilha de transições de cada job está na
+    página de detalhe do job. Nenhum segredo é registrado.
+</p>
+
+@if (events.Count == 0)
+{
+    <p class="empty">Nenhum evento de autenticação registrado.</p>
+}
+else
+{
+    <div class="tablewrap">
+        <table>
+            <thead>
+                <tr><th>Quando (UTC)</th><th>Usuário</th><th>Resultado</th><th>Motivo</th><th>Origem</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var e in events)
+                {
+                    <tr>
+                        <td class="mono">@e.OccurredAtUtc.ToString("u")</td>
+                        <td>@e.Username</td>
+                        <td>@(e.Succeeded ? Html.Raw("<span class=\"pill ok\">sucesso</span>") : Html.Raw("<span class=\"pill bad\">falha</span>"))</td>
+                        <td>@e.Reason</td>
+                        <td class="mono">@(e.RemoteAddress ?? "—")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}

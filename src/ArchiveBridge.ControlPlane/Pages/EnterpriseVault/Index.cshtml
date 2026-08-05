@@ -1,0 +1,68 @@
+@page
+@inject IControlPlaneQueries Queries
+@inject IPortalScopeAccessor ScopeAccessor
+@functions {
+    static string PillClass(string? resultStatus) => resultStatus switch
+    {
+        "Ready" => "pill ok",
+        "Blocked" => "pill bad",
+        "Unsupported" => "pill warn",
+        "Failed" => "pill bad",
+        _ => "pill",
+    };
+}
+@{
+    ViewData["Title"] = "Enterprise Vault";
+    var scope = ScopeAccessor.Resolve(User);
+    var environments = await Queries.ListEvEnvironmentsAsync(scope, HttpContext.RequestAborted);
+}
+<h1>Enterprise Vault — descoberta de capacidades</h1>
+<p class="lead">
+    Resultado <span class="pill ok">Ready</span> / <span class="pill bad">Blocked</span> /
+    <span class="pill warn">Unsupported</span> por ambiente, sempre sustentado por evidência. Descoberta é
+    <strong>READ-ONLY</strong>: nenhuma exportação é executada.
+</p>
+
+<div class="notice">
+    <strong>Disparo de descoberta indisponível nesta rodada.</strong> O portal exibe os resultados já
+    registrados; enfileirar uma nova descoberta é uma ação de escrita que entra em rodada seguinte.
+</div>
+
+@if (environments.Count == 0)
+{
+    <p class="empty">Nenhum ambiente Enterprise Vault neste tenant.</p>
+}
+else
+{
+    <div class="tablewrap">
+        <table>
+            <thead>
+                <tr><th>Site</th><th>Directory Server</th><th>Resultado</th><th>Versão desc.</th><th>Adapter</th><th>Versão observada</th><th>Evidência (SHA-256)</th><th>Tamanho</th><th>Concluída (UTC)</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var e in environments)
+                {
+                    <tr>
+                        <td>@e.SiteName</td>
+                        <td class="mono">@e.DirectoryServer</td>
+                        @if (e.LatestDiscovery is { } disc)
+                        {
+                            <td><span class="@PillClass(disc.ResultStatus)">@disc.ResultStatus</span></td>
+                            <td>v@disc.DiscoveryVersion</td>
+                            <td>@(disc.SelectedAdapter ?? "—")@(disc.AdapterVersion is { } av ? $" (v{av})" : "")</td>
+                            <td class="mono">@disc.ObservedVersion</td>
+                            <td class="mono">@disc.EvidenceHash[..Math.Min(16, disc.EvidenceHash.Length)]…</td>
+                            <td>@disc.EvidenceSizeBytes.ToString("N0") B</td>
+                            <td class="mono">@disc.CompletedAtUtc.ToString("u")</td>
+                        }
+                        else
+                        {
+                            <td><span class="pill">sem descoberta</span></td>
+                            <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+                        }
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}
