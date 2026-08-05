@@ -152,4 +152,38 @@ public sealed class Slice3SemanticFingerprintTests
         Assert.Equal(
             Hash([Eval()], candidates: [new EvAdapterId("adapter-a"), new EvAdapterId("adapter-b")]).Value,
             Hash([Eval()], candidates: [new EvAdapterId("adapter-b"), new EvAdapterId("adapter-a")]).Value);
+
+    // ---- Maturidade ausente ≠ todas-as-flags-falsas ------------------------------------------------------
+
+    private static EvAdapterEvaluation EvalWithMaturity(EvExportMaturity? maturity) =>
+        new(new EvAdapterId("adapter-a"), 1, AdapterCompatibility.Supported, [Cap()], [Req()], [], 20, "PROFILE", maturity);
+
+    [Fact]
+    public void FingerprintDistinguishesAbsentMaturityFromAllFalse()
+    {
+        var absent = Hash([EvalWithMaturity(null)]);
+        var allFalse = Hash([EvalWithMaturity(new EvExportMaturity(false, false, false, false))]);
+        Assert.NotEqual(absent.Value, allFalse.Value); // null nunca é convertido em false silenciosamente
+    }
+
+    // ---- Ordenação canônica TOTAL: chaves parciais duplicadas com conteúdo diferente ---------------------
+
+    [Fact]
+    public void DuplicateAdapterIdIsTotallyOrderedRegardlessOfInputOrder()
+    {
+        // Mesmo AdapterId, conteúdo diferente (precedência): a ordem TOTAL torna o hash independente da entrada.
+        var first = Eval("adapter-a", precedence: 10);
+        var second = Eval("adapter-a", precedence: 20);
+        Assert.Equal(Hash([first, second]).Value, Hash([second, first]).Value);
+    }
+
+    [Fact]
+    public void DuplicateCapabilityCodeWithDifferentContentIsTotallyOrdered()
+    {
+        var forward = Eval(capabilities:
+            [Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Available), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable)]);
+        var reversed = Eval(capabilities:
+            [Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Available)]);
+        Assert.Equal(Hash([forward]).Value, Hash([reversed]).Value);
+    }
 }

@@ -87,7 +87,7 @@ public static class EvDiscoverySemanticFingerprint
             "adapterVer", (result.CapabilitySet.AdapterVersion ?? 0).ToString(CultureInfo.InvariantCulture),
         };
 
-        foreach (var capability in OrderCapabilities(result.CapabilitySet.Capabilities))
+        foreach (var capability in EvDiscoveryCanonical.OrderCapabilities(result.CapabilitySet.Capabilities))
         {
             AppendCapability(parts, "cap", capability);
         }
@@ -96,24 +96,24 @@ public static class EvDiscoverySemanticFingerprint
         parts.Add(result.Signature?.SignatureHash.Value ?? "<none>");
         parts.Add(result.Signature is { } signature ? string.Join(",", signature.Parameters) : string.Empty);
 
-        // Seleção: desfecho + adapter selecionado + candidatos ORDENADOS + achados da seleção ORDENADOS.
+        // Seleção: desfecho + adapter selecionado + candidatos e achados em ORDEM CANÔNICA TOTAL.
         parts.Add("selOutcome");
         parts.Add(result.Selection.Outcome.ToString());
         parts.Add("selected");
         parts.Add(result.Selection.Selected?.AdapterId.Value ?? "<none>");
-        foreach (var candidate in result.Selection.Candidates.Select(static c => c.Value).OrderBy(static v => v, StringComparer.Ordinal))
+        foreach (var candidate in EvDiscoveryCanonical.OrderCandidates(result.Selection.Candidates))
         {
             parts.Add("cand");
             parts.Add(candidate);
         }
 
-        foreach (var finding in OrderFindings(result.Selection.Findings))
+        foreach (var finding in EvDiscoveryCanonical.OrderFindings(result.Selection.Findings))
         {
             AppendFinding(parts, "selFind", finding);
         }
 
-        // Avaliações de adapter COMPLETAS (ordenadas por AdapterId).
-        foreach (var evaluation in result.Selection.Evaluations.OrderBy(static e => e.AdapterId.Value, StringComparer.Ordinal))
+        // Avaliações de adapter COMPLETAS em ORDEM CANÔNICA TOTAL (por todos os campos, não só AdapterId).
+        foreach (var evaluation in EvDiscoveryCanonical.OrderEvaluations(result.Selection.Evaluations))
         {
             parts.Add("adp");
             parts.Add(evaluation.AdapterId.Value);
@@ -122,54 +122,34 @@ public static class EvDiscoverySemanticFingerprint
             parts.Add(evaluation.Precedence.ToString(CultureInfo.InvariantCulture));
             parts.Add(evaluation.ProfileId ?? string.Empty);
 
-            parts.Add("mat");
-            parts.Add(Bit(evaluation.Maturity?.RuntimeObserved));
-            parts.Add(Bit(evaluation.Maturity?.OfficialDocumentation));
-            parts.Add(Bit(evaluation.Maturity?.AutomatedFixtureValidated));
-            parts.Add(Bit(evaluation.Maturity?.LaboratoryValidated));
+            // Maturidade com marcador de PRESENÇA (ausente ≠ todas-as-flags-falsas; null nunca vira false).
+            parts.AddRange(EvDiscoveryCanonical.MaturityTokens(evaluation.Maturity));
 
-            foreach (var requirement in evaluation.Requirements
-                .OrderBy(static r => r.CapabilityCode.Value, StringComparer.Ordinal)
-                .ThenBy(static r => r.Description, StringComparer.Ordinal))
+            foreach (var requirement in EvDiscoveryCanonical.OrderRequirements(evaluation.Requirements))
             {
                 parts.Add("req");
                 parts.Add(requirement.CapabilityCode.Value);
                 parts.Add(requirement.Description);
             }
 
-            foreach (var capability in OrderCapabilities(evaluation.Capabilities))
+            foreach (var capability in EvDiscoveryCanonical.OrderCapabilities(evaluation.Capabilities))
             {
                 AppendCapability(parts, "adpCap", capability);
             }
 
-            foreach (var finding in OrderFindings(evaluation.Findings))
+            foreach (var finding in EvDiscoveryCanonical.OrderFindings(evaluation.Findings))
             {
                 AppendFinding(parts, "adpFind", finding);
             }
         }
 
-        foreach (var finding in OrderFindings(result.BlockingFindings))
+        foreach (var finding in EvDiscoveryCanonical.OrderFindings(result.BlockingFindings))
         {
             AppendFinding(parts, "find", finding);
         }
 
         return DeterministicHash.Compute(parts);
     }
-
-    private static string Bit(bool? value) => value == true ? "1" : "0";
-
-    private static IEnumerable<EvCapability> OrderCapabilities(IEnumerable<EvCapability> capabilities) =>
-        capabilities
-            .OrderBy(static c => c.CapabilityCode.Value, StringComparer.Ordinal)
-            .ThenBy(static c => c.CapabilityVersion)
-            .ThenBy(static c => c.Availability.ToString(), StringComparer.Ordinal);
-
-    private static IEnumerable<EvDiscoveryFinding> OrderFindings(IEnumerable<EvDiscoveryFinding> findings) =>
-        findings
-            .OrderBy(static f => f.ResultCode.Value, StringComparer.Ordinal)
-            .ThenBy(static f => f.CapabilityCode?.Value ?? string.Empty, StringComparer.Ordinal)
-            .ThenBy(static f => f.Reason, StringComparer.Ordinal)
-            .ThenBy(static f => f.ErrorCategory.ToString(), StringComparer.Ordinal);
 
     private static void AppendCapability(List<string> parts, string tag, EvCapability capability)
     {

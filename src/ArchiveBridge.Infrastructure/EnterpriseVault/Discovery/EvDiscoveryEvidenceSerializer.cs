@@ -39,10 +39,7 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
             result.CapabilitySet.AdapterId?.Value,
             result.CapabilitySet.AdapterVersion,
             result.Selection.Outcome.ToString(),
-            result.Selection.Candidates
-                .Select(static candidate => candidate.Value)
-                .OrderBy(static value => value, StringComparer.Ordinal)
-                .ToArray(),
+            [.. EvDiscoveryCanonical.OrderCandidates(result.Selection.Candidates)],
             result.Status.ToString(),
             result.ResultCode.Value,
             OrderCapabilities(result.CapabilitySet.Capabilities),
@@ -57,11 +54,8 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
                     signature.ParameterSets,
                     signature.SignatureHash.Value)
                 : null,
-            // Avaliações de adapter COMPLETAS (ordenadas por AdapterId) — o que sustenta a seleção.
-            result.Selection.Evaluations
-                .OrderBy(static e => e.AdapterId.Value, StringComparer.Ordinal)
-                .Select(ToEvaluationDocument)
-                .ToArray(),
+            // Avaliações de adapter COMPLETAS em ORDEM CANÔNICA TOTAL (mesma regra do fingerprint).
+            [.. EvDiscoveryCanonical.OrderEvaluations(result.Selection.Evaluations).Select(ToEvaluationDocument)],
             OrderFindings(result.Selection.Findings),
             OrderFindings(result.BlockingFindings),
             // Hashes INTERNOS do conjunto de capacidades — NÃO são as impressões digitais completas da
@@ -84,32 +78,21 @@ public sealed class EvDiscoveryEvidenceSerializer : IEvDiscoveryEvidenceSerializ
                 ? new MaturityDocument(
                     maturity.RuntimeObserved, maturity.OfficialDocumentation, maturity.AutomatedFixtureValidated, maturity.LaboratoryValidated)
                 : null,
-            evaluation.Requirements
-                .OrderBy(static r => r.CapabilityCode.Value, StringComparer.Ordinal)
-                .ThenBy(static r => r.Description, StringComparer.Ordinal)
-                .Select(static r => new RequirementDocument(r.CapabilityCode.Value, r.Description))
-                .ToArray(),
+            [.. EvDiscoveryCanonical.OrderRequirements(evaluation.Requirements)
+                .Select(static r => new RequirementDocument(r.CapabilityCode.Value, r.Description))],
             OrderCapabilities(evaluation.Capabilities),
             OrderFindings(evaluation.Findings));
 
+    // Delegam à canonicalização ÚNICA do domínio (ordem TOTAL) — mesma regra do EvDiscoverySemanticFingerprint.
     private static CapabilityDocument[] OrderCapabilities(IEnumerable<EvCapability> capabilities) =>
-        capabilities
-            .OrderBy(static c => c.CapabilityCode.Value, StringComparer.Ordinal)
-            .ThenBy(static c => c.CapabilityVersion)
-            .ThenBy(static c => c.Availability.ToString(), StringComparer.Ordinal)
+        [.. EvDiscoveryCanonical.OrderCapabilities(capabilities)
             .Select(static c => new CapabilityDocument(
-                c.CapabilityCode.Value, c.CapabilityVersion, c.Availability.ToString(), c.EvidenceReference, c.BlockingReason))
-            .ToArray();
+                c.CapabilityCode.Value, c.CapabilityVersion, c.Availability.ToString(), c.EvidenceReference, c.BlockingReason))];
 
     private static FindingDocument[] OrderFindings(IEnumerable<EvDiscoveryFinding> findings) =>
-        findings
-            .OrderBy(static f => f.ResultCode.Value, StringComparer.Ordinal)
-            .ThenBy(static f => f.CapabilityCode?.Value ?? string.Empty, StringComparer.Ordinal)
-            .ThenBy(static f => f.Reason, StringComparer.Ordinal)
-            .ThenBy(static f => f.ErrorCategory.ToString(), StringComparer.Ordinal)
+        [.. EvDiscoveryCanonical.OrderFindings(findings)
             .Select(static f => new FindingDocument(
-                f.ResultCode.Value, f.CapabilityCode?.Value, f.Reason, f.ErrorCategory.ToString()))
-            .ToArray();
+                f.ResultCode.Value, f.CapabilityCode?.Value, f.Reason, f.ErrorCategory.ToString()))];
 
     private sealed record EvidenceDocument(
         int SchemaVersion,

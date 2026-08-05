@@ -114,6 +114,47 @@ public sealed class Slice3EvidenceArtifactTests
         Assert.True(forward.Bytes.Span.SequenceEqual(reversed.Bytes.Span)); // bytes byte-a-byte idênticos
     }
 
+    private static EvAdapterEvaluation EvalWithMaturity(EvExportMaturity? maturity) =>
+        new(new EvAdapterId("adapter-a"), 1, AdapterCompatibility.Supported, [Cap()], [Req()], [], 20, "PROFILE", maturity);
+
+    [Fact]
+    public void ContentShaDistinguishesAbsentMaturityFromAllFalse()
+    {
+        var absent = Serialize([EvalWithMaturity(null)]);
+        var allFalse = Serialize([EvalWithMaturity(new EvExportMaturity(false, false, false, false))]);
+        Assert.NotEqual(absent.ContentSha256.Value, allFalse.ContentSha256.Value);
+
+        // O evidence.json registra CLARAMENTE null versus objeto presente.
+        using var absentDoc = JsonDocument.Parse(absent.Bytes);
+        using var allFalseDoc = JsonDocument.Parse(allFalse.Bytes);
+        var absentMaturity = absentDoc.RootElement.GetProperty("AdapterEvaluations")[0].GetProperty("Maturity");
+        var presentMaturity = allFalseDoc.RootElement.GetProperty("AdapterEvaluations")[0].GetProperty("Maturity");
+        Assert.Equal(JsonValueKind.Null, absentMaturity.ValueKind);
+        Assert.Equal(JsonValueKind.Object, presentMaturity.ValueKind);
+        Assert.False(presentMaturity.GetProperty("AutomatedFixtureValidated").GetBoolean());
+    }
+
+    [Fact]
+    public void CanonicalBytesIndependentOfDuplicateAdapterIdOrder()
+    {
+        var first = Eval("adapter-a", precedence: 10);
+        var second = Eval("adapter-a", precedence: 20);
+        var forward = Serialize([first, second]);
+        var reversed = Serialize([second, first]);
+        Assert.True(forward.Bytes.Span.SequenceEqual(reversed.Bytes.Span));
+        Assert.Equal(forward.ContentSha256.Value, reversed.ContentSha256.Value);
+    }
+
+    [Fact]
+    public void CanonicalBytesIndependentOfDuplicateCapabilityOrder()
+    {
+        var forward = Serialize([Eval(capabilities:
+            [Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Available), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable)])]);
+        var reversed = Serialize([Eval(capabilities:
+            [Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Unavailable), Cap(EvCapabilityCodes.EvExportPstSupported, CapabilityAvailability.Available)])]);
+        Assert.True(forward.Bytes.Span.SequenceEqual(reversed.Bytes.Span));
+    }
+
     [Fact]
     public void EvidenceJsonRecordsCompleteEvaluationsMaturityAndAuthoritativeFingerprints()
     {

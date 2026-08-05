@@ -131,13 +131,14 @@ Nunca armazena senha/token/credencial/conteúdo de mensagem/PST; nunca concatena
 
 SQL guarda **apenas metadados**: `ev_environments`, `ev_discovery_commands`, `ev_discovery_runs`
 (âncora de versão + ciclo de vida + **três hashes** + adapter + caminho lógico + timestamps),
-`ev_capabilities`, `ev_adapter_evaluations` (agora com `profile_id` + maturidade `runtime_observed` /
-`official_documentation` / `laboratory_validated`), `ev_discovery_findings` (append-only, com
-`error_category`), e as projeções `ev_capability_sets` / `ev_discovery_evidence`. Migrations **aditivas e
-protegidas por hash** `0011` (base) e `0012` (esta revisão: coluna `content_sha256`, índice único filtrado
-de reserva pendente por impressão digital, colunas de perfil/maturidade e `error_category`); RLS por
-tenant; FKs compostas `(…, tenant_id, project_id)`; `rowversion`. O único `UPDATE` permitido à aplicação
-em `ev_discovery_runs` é da coluna `status`.
+`ev_capabilities`, `ev_adapter_evaluations` (com `profile_id` + maturidade `runtime_observed` /
+`official_documentation` / `automated_fixture_validated` / `laboratory_validated`), `ev_discovery_findings`
+(append-only, com `error_category`), e as projeções `ev_capability_sets` / `ev_discovery_evidence`.
+Migrations **aditivas e protegidas por hash** `0011` (base), `0012` (coluna `content_sha256`, índice único
+filtrado de reserva pendente por impressão digital, colunas de perfil/maturidade e `error_category`) e
+`0013` (coluna `automated_fixture_validated` — validação por fixtures automatizados, distinta de
+laboratório); RLS por tenant; FKs compostas `(…, tenant_id, project_id)`; `rowversion`. O único `UPDATE`
+permitido à aplicação em `ev_discovery_runs` é da coluna `status`.
 
 Uma reserva é identificada pelos **três hashes**: `configuration_hash` (configuração completa — ambiente,
 versão/hash de config do projeto, versão da política, capacidades exigidas ordenadas, limites, versões de
@@ -149,6 +150,14 @@ verifica a pendente equivalente pelos três hashes e a insere (ou a reutiliza) �
 `UX_evd_pending_fingerprint` (status Pending) impede duas versões Pending para a mesma evidência, e uma
 colisão concorrente é reconciliada relendo a pendente. A finalização revalida os três hashes antes de
 promover.
+
+**Canonicalização (estratégia única e explícita).** O `EvDiscoverySemanticFingerprint` e o serializer de
+evidência compartilham uma **única** canonicalização (`EvDiscoveryCanonical`): **ordenação TOTAL por TODOS
+os campos semânticos**, nunca por chave parcial. Duas avaliações de mesmo `AdapterId` com conteúdo diferente,
+ou capacidades de mesmo código com conteúdo diferente, ficam em ordem determinística; inverter qualquer
+coleção **nunca** altera o hash nem os bytes canônicos, sem depender da ordem de entrada. A **maturidade**
+distingue AUSENTE (nula) de todas-as-flags-falsas por um **marcador de presença** — `null` nunca é
+convertido em `false` silenciosamente (no `evidence.json`, `Maturity` é `null` versus um objeto presente).
 
 A evidência detalhada é um **artefato imutável** (`evidence.json` + `evidence.sha256` + `manifest.json`)
 publicado por rename atômico de diretório, versionado por ambiente. O mesmo padrão da Slice 2:

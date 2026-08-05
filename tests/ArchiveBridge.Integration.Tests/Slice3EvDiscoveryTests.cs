@@ -285,6 +285,46 @@ public sealed class Slice3EvDiscoveryTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task PersistedMaturityMatchesEvaluationIncludingAutomatedFixtureValidated()
+    {
+        var clock = new MutableClock(Slice2Support.Now);
+        var (scope, project) = await SeedProjectAsync();
+        var env = Slice3Support.NewEnvironment();
+        var host = Slice3Support.ReadyHost();
+
+        // Maturidade ESPERADA = a do adapter selecionado na avaliação (assinatura reconhecida em runtime).
+        var observation = await Slice3Support.Discovery(host, clock).ProbeAsync(env, Policy, CancellationToken.None);
+        var selection = Slice3Support.Adapters().Select(observation, Policy);
+        var expected = selection.Selected!.Maturity!;
+        Assert.True(expected.OfficialDocumentation);
+        Assert.True(expected.AutomatedFixtureValidated);
+        Assert.False(expected.LaboratoryValidated); // nunca homologado sem laboratório
+
+        await RunUseCaseAsync(scope, project, env, host, clock);
+        var record = await Slice3Support.Store(fixture, clock).GetUsableAsync(scope, env.EnvironmentId, CancellationToken.None);
+        Assert.NotNull(record);
+
+        await using var connection = await fixture.Factory.OpenForTenantAsync(scope, CancellationToken.None);
+        await using var command = new Microsoft.Data.SqlClient.SqlCommand(
+            "SELECT runtime_observed, official_documentation, automated_fixture_validated, laboratory_validated " +
+            "FROM dbo.ev_adapter_evaluations WHERE environment_id = @env AND project_id = @project " +
+            "AND discovery_version = @v AND adapter_id = @adapter;",
+            connection.Connection);
+        command.Parameters.AddWithValue("@env", env.EnvironmentId.Value);
+        command.Parameters.AddWithValue("@project", scope.Project.Value);
+        command.Parameters.AddWithValue("@v", record!.DiscoveryVersion);
+        command.Parameters.AddWithValue("@adapter", selection.Selected!.AdapterId.Value);
+
+        await using var reader = await command.ExecuteReaderAsync(CancellationToken.None);
+        Assert.True(await reader.ReadAsync(CancellationToken.None));
+        // Os QUATRO campos de maturidade persistidos correspondem ao objeto usado na avaliação.
+        Assert.Equal(expected.RuntimeObserved, reader.GetBoolean(0));
+        Assert.Equal(expected.OfficialDocumentation, reader.GetBoolean(1));
+        Assert.Equal(expected.AutomatedFixtureValidated, reader.GetBoolean(2));
+        Assert.Equal(expected.LaboratoryValidated, reader.GetBoolean(3));
+    }
+
+    [Fact]
     public async Task PublishedEvidenceRecordsAuthoritativeFingerprintsMatchingSqlReservation()
     {
         var clock = new MutableClock(Slice2Support.Now);

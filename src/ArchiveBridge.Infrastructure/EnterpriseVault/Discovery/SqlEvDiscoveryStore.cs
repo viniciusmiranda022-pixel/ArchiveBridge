@@ -88,9 +88,9 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
         """
         INSERT INTO dbo.ev_adapter_evaluations
             (environment_id, discovery_version, tenant_id, project_id, adapter_id, adapter_version, compatibility, precedence,
-             profile_id, runtime_observed, official_documentation, laboratory_validated)
+             profile_id, runtime_observed, official_documentation, automated_fixture_validated, laboratory_validated)
         VALUES (@environment, @version, @tenant, @project, @adapterId, @adapterVersion, @compatibility, @precedence,
-                @profileId, @runtimeObserved, @officialDoc, @labValidated);
+                @profileId, @runtimeObserved, @officialDoc, @automatedFixture, @labValidated);
         """;
 
     private const string InsertFindingSql =
@@ -388,6 +388,7 @@ public sealed class SqlEvDiscoveryStore(TenantConnectionFactory connectionFactor
             command.Parameters.Add(new SqlParameter("@profileId", SqlDbType.NVarChar, 200) { Value = (object?)evaluation.ProfileId ?? DBNull.Value });
             command.Parameters.Add(new SqlParameter("@runtimeObserved", SqlDbType.Bit) { Value = (object?)evaluation.Maturity?.RuntimeObserved ?? DBNull.Value });
             command.Parameters.Add(new SqlParameter("@officialDoc", SqlDbType.Bit) { Value = (object?)evaluation.Maturity?.OfficialDocumentation ?? DBNull.Value });
+            command.Parameters.Add(new SqlParameter("@automatedFixture", SqlDbType.Bit) { Value = (object?)evaluation.Maturity?.AutomatedFixtureValidated ?? DBNull.Value });
             command.Parameters.Add(new SqlParameter("@labValidated", SqlDbType.Bit) { Value = (object?)evaluation.Maturity?.LaboratoryValidated ?? DBNull.Value });
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
