@@ -210,6 +210,73 @@ public sealed class Slice3EvidenceArtifactTests
     public void ContentShaEncodesUnitSeparatorInTextField() =>
         Assert.NotEqual(Sha([Eval(profileId: "a\u001fb")]), Sha([Eval(profileId: "ab")]));
 
+    // ---- Signature.ObservedVersion: conteúdo FACTUAL, no hash semântico E no evidence.json (6ª revisão) ----
+
+    // Mesma FORMA (SignatureHash idêntico — não depende da versão textual); só ObservedVersion/DiscoveredAtUtc variam.
+    private static EvExportSignature SignatureWith(string observedVersion, DateTimeOffset discoveredAt) =>
+        EvExportSignature.Create(
+            "Export-EVArchive", "Symantec.EnterpriseVault.PowerShell", observedVersion, "Cmdlet",
+            ["ArchiveId", "OutputDirectory"], ["ArchiveId"], ["Default"], discoveredAt);
+
+    private static EvDiscoveryRunResult ResultWithSignature(EvExportSignature signature)
+    {
+        var identity = new EvEnvironmentIdentity(Env, "site", "dir", "15.1", "15.1", "PowerShell", Now);
+        var evaluation = Eval();
+        var selection = new EvAdapterSelection(
+            AdapterSelectionOutcome.Supported, evaluation, [evaluation.AdapterId], [evaluation], []);
+        return new EvDiscoveryRunResult(
+            DiscoveryRunId.New(), identity, CapabilitySetOf(new EvAdapterId("adapter-a"), 1), selection, signature, [],
+            EvDiscoveryStatus.Ready, new EvDiscoveryResultCode(EvDiscoveryResultCodes.DiscoveryCompleted), Now, Now);
+    }
+
+    [Fact]
+    public void SignatureObservedVersionIsIsolatedInHashArtifactAndContentSha()
+    {
+        var sigA = SignatureWith("15.1", Now);
+        var sigB = SignatureWith("15.2", Now);
+        // A forma (SignatureHash) é IDÊNTICA — só ObservedVersion difere, isolando o campo sob teste.
+        Assert.Equal(sigA.SignatureHash.Value, sigB.SignatureHash.Value);
+
+        var resultA = ResultWithSignature(sigA);
+        var resultB = ResultWithSignature(sigB);
+        var hashA = EvDiscoverySemanticFingerprint.Compute(resultA);
+        var hashB = EvDiscoverySemanticFingerprint.Compute(resultB);
+        var artifactA = Serializer.Serialize(resultA, ConfigHash, hashA);
+        var artifactB = Serializer.Serialize(resultB, ConfigHash, hashB);
+
+        // 1. SemanticEvidenceHash difere. 2. evidence.json (bytes) difere. 3. ContentSha256 difere.
+        Assert.NotEqual(hashA.Value, hashB.Value);
+        Assert.False(artifactA.Bytes.Span.SequenceEqual(artifactB.Bytes.Span));
+        Assert.NotEqual(artifactA.ContentSha256.Value, artifactB.ContentSha256.Value);
+
+        // 4 e 5. O JSON registra o valor factual correto em cada caso.
+        using var docA = JsonDocument.Parse(artifactA.Bytes);
+        using var docB = JsonDocument.Parse(artifactB.Bytes);
+        Assert.Equal("15.1", docA.RootElement.GetProperty("Signature").GetProperty("ObservedVersion").GetString());
+        Assert.Equal("15.2", docB.RootElement.GetProperty("Signature").GetProperty("ObservedVersion").GetString());
+
+        // 7. DiscoveredAtUtc permanece FORA do artefato e do hash semântico (campo volátil).
+        Assert.False(docA.RootElement.GetProperty("Signature").TryGetProperty("DiscoveredAtUtc", out _));
+        var laterResult = ResultWithSignature(SignatureWith("15.1", Now.AddHours(3)));
+        Assert.Equal(hashA.Value, EvDiscoverySemanticFingerprint.Compute(laterResult).Value);
+        Assert.Equal(
+            artifactA.ContentSha256.Value,
+            Serializer.Serialize(laterResult, ConfigHash, hashA).ContentSha256.Value);
+    }
+
+    [Fact]
+    public void CanonicalBytesIgnoreValidCollectionOrderWithSignaturePresent()
+    {
+        // 6. Inverter coleções válidas e únicas continua NÃO alterando os bytes (com assinatura presente).
+        var signature = SignatureWith("15.1", Now);
+        var evalA = Eval("adapter-a", precedence: 10, compatibility: AdapterCompatibility.Blocked);
+        var evalB = Eval("adapter-b", precedence: 20);
+        var forward = SerializeRaw(CapabilitySetOf(new EvAdapterId("adapter-a"), 1), [evalA, evalB], evalB, signature);
+        var reversed = SerializeRaw(CapabilitySetOf(new EvAdapterId("adapter-a"), 1), [evalB, evalA], evalB, signature);
+        Assert.True(forward.Bytes.Span.SequenceEqual(reversed.Bytes.Span));
+        Assert.Equal(forward.ContentSha256.Value, reversed.ContentSha256.Value);
+    }
+
     [Fact]
     public void EvidenceJsonRecordsCompleteEvaluationsMaturityAndAuthoritativeFingerprints()
     {

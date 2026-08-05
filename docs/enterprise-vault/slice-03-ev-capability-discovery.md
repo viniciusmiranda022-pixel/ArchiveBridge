@@ -169,7 +169,11 @@ existem sentinelas de ausência:** `null` ≠ `""` ≠ `0` ≠ `"<none>"` são e
 AdapterVersion do capability set, adapter selecionado, `ProfileId`, `BlockingReason`, `CapabilityCode` de
 achado, assinatura e maturidade). Como `AdapterId`/`CapabilityCode` são únicos, a ordenação é ordinal por
 essas chaves; o serializer usa a MESMA ordenação, e inverter coleções válidas nunca altera hash nem bytes.
-O `evidence.json` e o `SemanticEvidenceHash` representam exatamente as mesmas distinções semânticas.
+O `evidence.json` e o `SemanticEvidenceHash` representam exatamente as mesmas distinções semânticas: **todo
+campo factual da assinatura entra no hash em posição fixa** — inclusive `ObservedVersion`, que é registrado
+no `evidence.json` (duas assinaturas iguais em tudo, exceto `ObservedVersion`, produzem hash, `evidence.json`
+e `ContentSha256` diferentes). Fica de fora do hash e do artefato apenas o que é genuinamente **volátil**,
+como `DiscoveredAtUtc` (que reside nos metadados SQL, não na evidência canônica).
 
 A evidência detalhada é um **artefato imutável** (`evidence.json` + `evidence.sha256` + `manifest.json`)
 publicado por rename atômico de diretório, versionado por ambiente. O mesmo padrão da Slice 2:

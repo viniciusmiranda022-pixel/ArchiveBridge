@@ -175,6 +175,11 @@ public static class EvDiscoveryCanonical
         writer.Str(signature.CommandName);
         writer.Field("signatureModuleSource");
         writer.Str(signature.ModuleSource);
+        // ObservedVersion é conteúdo FACTUAL da evidência (persistido no evidence.json), não campo volátil:
+        // entra no hash em POSIÇÃO FIXA (após ModuleSource, antes de CommandType — mesma ordem do
+        // SignatureDocument do serializer) sob a FormatVersion vigente. Só DiscoveredAtUtc fica de fora.
+        writer.Field("signatureObservedVersion");
+        writer.Str(signature.ObservedVersion);
         writer.Field("signatureCommandType");
         writer.Str(signature.CommandType);
         WriteStringList(writer, "signatureParameters", signature.Parameters);

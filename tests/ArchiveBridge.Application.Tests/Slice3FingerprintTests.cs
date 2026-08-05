@@ -83,6 +83,11 @@ public sealed class Slice3FingerprintTests
         "Export-EVArchive", "Symantec.EnterpriseVault.PowerShell", "15.1", "Cmdlet",
         parameters, ["ArchiveId", "OutputDirectory"], ["Default"], Now);
 
+    // Mesma FORMA (SignatureHash idêntico, pois não depende da versão textual); só ObservedVersion difere.
+    private static EvExportSignature SignatureVer(string observedVersion) => EvExportSignature.Create(
+        "Export-EVArchive", "Symantec.EnterpriseVault.PowerShell", observedVersion, "Cmdlet",
+        OfficialParameters, ["ArchiveId", "OutputDirectory"], ["Default"], Now);
+
     private static readonly string[] OfficialParameters =
         ["ArchiveId", "OutputDirectory", "SearchString", "Format", "MaxThreads", "Retry", "MaxPSTSizeMB"];
 
@@ -138,6 +143,22 @@ public sealed class Slice3FingerprintTests
     {
         var baseline = SemanticHash(Observe("15.1", Signature(OfficialParameters), permissions: true));
         var other = SemanticHash(Observe("15.2", Signature(OfficialParameters), permissions: true));
+        Assert.NotEqual(baseline.Value, other.Value);
+    }
+
+    [Fact]
+    public void SemanticFingerprintChangesWithSignatureObservedVersionAloneWithEnvironmentFixed()
+    {
+        // Ambiente IDÊNTICO (ObservedVersion/ProductVersion "15.1") e a MESMA forma de assinatura
+        // (SignatureHash igual): a ÚNICA diferença é Signature.ObservedVersion. Prova que o campo entra
+        // no hash semântico — ao contrário de SemanticFingerprintChangesWithObservedVersion, que varia o
+        // ambiente e mantém a assinatura fixa em 15.1.
+        var sig151 = SignatureVer("15.1");
+        var sig152 = SignatureVer("15.2");
+        Assert.Equal(sig151.SignatureHash.Value, sig152.SignatureHash.Value); // forma idêntica; só a versão textual difere
+
+        var baseline = SemanticHash(Observe("15.1", sig151, permissions: true));
+        var other = SemanticHash(Observe("15.1", sig152, permissions: true));
         Assert.NotEqual(baseline.Value, other.Value);
     }
 
