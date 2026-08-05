@@ -1,0 +1,38 @@
+@page
+@inject IControlPlaneQueries Queries
+@inject IPortalScopeAccessor ScopeAccessor
+@{
+    ViewData["Title"] = "Projetos";
+    var scope = ScopeAccessor.Resolve(User);
+    var projects = await Queries.ListProjectsAsync(scope, HttpContext.RequestAborted);
+}
+<h1>Projetos de migração</h1>
+<p class="lead">Metadados de governança do tenant — sem segredo, sem conteúdo.</p>
+
+@if (projects.Count == 0)
+{
+    <p class="empty">Nenhum projeto neste tenant.</p>
+}
+else
+{
+    <div class="tablewrap">
+        <table>
+            <thead>
+                <tr><th>Nome</th><th>Responsável</th><th>Tenant de destino</th><th>Config.</th><th>Status</th><th>Atualizado (UTC)</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var p in projects)
+                {
+                    <tr>
+                        <td>@p.Name</td>
+                        <td>@p.Owner</td>
+                        <td class="mono">@p.TargetTenant</td>
+                        <td>v@p.ConfigurationVersion</td>
+                        <td><span class="pill">@p.Status</span></td>
+                        <td class="mono">@p.UpdatedAtUtc.ToString("u")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}

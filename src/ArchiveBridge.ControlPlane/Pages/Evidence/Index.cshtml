@@ -1,0 +1,51 @@
+@page
+@inject IControlPlaneQueries Queries
+@inject IPortalScopeAccessor ScopeAccessor
+@{
+    ViewData["Title"] = "Evidências";
+    var scope = ScopeAccessor.Resolve(User);
+    var environments = await Queries.ListEvEnvironmentsAsync(scope, HttpContext.RequestAborted);
+    var withEvidence = environments.Where(e => e.LatestDiscovery is not null).ToList();
+}
+<h1>Evidências de descoberta</h1>
+<p class="lead">
+    Metadados do artefato imutável de evidência (<span class="mono">evidence.json</span>): hashes autoritativos,
+    caminho lógico e tamanho. O read-model nunca expõe a evidência bruta.
+</p>
+
+<div class="notice">
+    <strong>Download pelo portal na próxima rodada.</strong> O artefato imutável
+    (<span class="mono">evidence.json + evidence.sha256 + manifest.json</span>) reside no armazenamento
+    on-premises no caminho lógico indicado abaixo. O streaming autenticado pelo portal entra na rodada
+    seguinte; até lá, o <span class="mono">SHA-256</span> aqui publicado permite conferir a integridade.
+</div>
+
+@if (withEvidence.Count == 0)
+{
+    <p class="empty">Nenhuma evidência de descoberta registrada neste tenant.</p>
+}
+else
+{
+    <div class="tablewrap">
+        <table>
+            <thead>
+                <tr><th>Site</th><th>Versão</th><th>Resultado</th><th>Config. hash</th><th>Evidência (SHA-256)</th><th>Caminho lógico</th><th>Tamanho</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var e in withEvidence)
+                {
+                    var disc = e.LatestDiscovery!;
+                    <tr>
+                        <td>@e.SiteName</td>
+                        <td>v@disc.DiscoveryVersion</td>
+                        <td>@disc.ResultStatus</td>
+                        <td class="mono">@disc.ConfigurationHash[..Math.Min(16, disc.ConfigurationHash.Length)]…</td>
+                        <td class="mono">@disc.EvidenceHash</td>
+                        <td class="mono">@disc.EvidencePath</td>
+                        <td>@disc.EvidenceSizeBytes.ToString("N0") B</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}

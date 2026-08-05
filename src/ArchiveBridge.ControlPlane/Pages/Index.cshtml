@@ -1,0 +1,34 @@
+@page
+@inject IControlPlaneQueries Queries
+@inject IPortalScopeAccessor ScopeAccessor
+@{
+    ViewData["Title"] = "Painel";
+    var scope = ScopeAccessor.Resolve(User);
+    var d = await Queries.GetDashboardAsync(scope, HttpContext.RequestAborted);
+}
+<h1>Painel operacional</h1>
+<p class="lead">Visão consolidada do tenant (somente leitura). Todos os números respeitam o isolamento por tenant.</p>
+
+<h2>Migração</h2>
+<div class="cards">
+    <div class="card"><div class="n">@d.Projects</div><div class="l">Projetos</div></div>
+    <div class="card"><div class="n">@d.Waves</div><div class="l">Ondas</div></div>
+    <div class="card"><div class="n">@d.Jobs</div><div class="l">Jobs</div></div>
+    <div class="card"><div class="n">@d.JobsPending</div><div class="l">Jobs pendentes</div></div>
+    <div class="card"><div class="n">@d.JobsProcessing</div><div class="l">Jobs em execução</div></div>
+    <div class="card"><div class="n">@d.JobsFailed</div><div class="l">Jobs com falha</div></div>
+</div>
+
+<h2>Enterprise Vault — descoberta de capacidades (READ-ONLY)</h2>
+<div class="cards">
+    <div class="card"><div class="n">@d.EvEnvironments</div><div class="l">Ambientes</div></div>
+    <div class="card"><div class="n">@d.EvReady</div><div class="l">Ready</div></div>
+    <div class="card"><div class="n">@d.EvBlocked</div><div class="l">Blocked</div></div>
+    <div class="card"><div class="n">@d.EvUnsupported</div><div class="l">Unsupported</div></div>
+</div>
+
+<div class="notice">
+    <strong>Exportação indisponível.</strong> A execução de exportação do Enterprise Vault
+    (<span class="mono">Export-EVArchive</span>, PST, staging) chega no <strong>Slice 4B</strong>.
+    Esta fatia observa a plataforma; não dispara execução.
+</div>

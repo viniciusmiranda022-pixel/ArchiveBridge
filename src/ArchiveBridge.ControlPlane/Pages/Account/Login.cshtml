@@ -1,0 +1,26 @@
+@page
+@model ArchiveBridge.ControlPlane.Pages.Account.LoginModel
+@{
+    ViewData["Title"] = "Entrar";
+}
+<div class="login-shell">
+    <div class="login-card">
+        <h1>ArchiveBridge</h1>
+        <p class="lead">Portal Operacional — acesso restrito.</p>
+        <form method="post">
+            <div class="field">
+                <label for="Username">Usuário</label>
+                <input id="Username" asp-for="Username" autocomplete="username" autofocus />
+            </div>
+            <div class="field">
+                <label for="Password">Senha</label>
+                <input id="Password" asp-for="Password" type="password" autocomplete="current-password" />
+            </div>
+            <button type="submit" class="btn primary">Entrar</button>
+            @if (!string.IsNullOrEmpty(Model.Error))
+            {
+                <p class="error">@Model.Error</p>
+            }
+        </form>
+    </div>
+</div>

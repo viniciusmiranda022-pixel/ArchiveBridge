@@ -1,0 +1,39 @@
+@page
+@inject IControlPlaneQueries Queries
+@inject IPortalScopeAccessor ScopeAccessor
+@{
+    ViewData["Title"] = "Ondas";
+    var scope = ScopeAccessor.Resolve(User);
+    var waves = await Queries.ListWavesAsync(scope, 200, HttpContext.RequestAborted);
+}
+<h1>Ondas de migração</h1>
+<p class="lead">Capacidade planejada e situação de aprovação/congelamento (somente leitura).</p>
+
+@if (waves.Count == 0)
+{
+    <p class="empty">Nenhuma onda neste tenant.</p>
+}
+else
+{
+    <div class="tablewrap">
+        <table>
+            <thead>
+                <tr><th>Nome</th><th>Versão</th><th>Status</th><th>Itens planejados</th><th>Bytes planejados</th><th>Aprovada por</th><th>Criada (UTC)</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var w in waves)
+                {
+                    <tr>
+                        <td>@w.Name</td>
+                        <td>v@w.WaveVersion</td>
+                        <td><span class="pill">@w.Status</span></td>
+                        <td>@w.PlannedItems.ToString("N0")</td>
+                        <td>@w.PlannedBytes.ToString("N0")</td>
+                        <td>@(w.ApprovedBy ?? "—")</td>
+                        <td class="mono">@w.CreatedAtUtc.ToString("u")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}
