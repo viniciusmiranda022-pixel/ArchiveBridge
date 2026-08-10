@@ -6,8 +6,10 @@
 // nenhuma capacidade do Slice 4B (exportação, PST, Purview, Graph, AzCopy) é executada nem simulada.
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;
+using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
 using ArchiveBridge.ControlPlane.Composition;
 using ArchiveBridge.Infrastructure.ControlPlane;
+using ArchiveBridge.Infrastructure.EnterpriseVault.Discovery;
 using ArchiveBridge.Infrastructure.Persistence;
 using ArchiveBridge.Infrastructure.Time;
 using Microsoft.AspNetCore.Authentication.Cookies;
@@ -26,12 +28,18 @@ var maintenanceConnection = builder.Configuration.GetConnectionString("Maintenan
     ?? throw new InvalidOperationException("ConnectionStrings:Maintenance é obrigatória.");
 var connectionFactory = new TenantConnectionFactory(applicationConnection, maintenanceConnection);
 
+var evidenceRoot = Path.IsPathRooted(options.EvidenceRoot)
+    ? options.EvidenceRoot
+    : Path.Combine(builder.Environment.ContentRootPath, options.EvidenceRoot);
+
 builder.Services.AddSingleton(connectionFactory);
 builder.Services.AddSingleton<IClock, SystemClock>();
 builder.Services.AddSingleton<IPasswordHasher, Pbkdf2PasswordHasher>();
 builder.Services.AddSingleton<IPortalScopeAccessor, PortalScopeAccessor>();
+builder.Services.AddSingleton<IEvDiscoveryEvidenceStore>(new FileSystemEvDiscoveryEvidenceStore(evidenceRoot));
 builder.Services.AddScoped<IPortalUserStore>(_ => new SqlPortalUserStore(applicationConnection));
 builder.Services.AddScoped<IPortalSignInAudit>(_ => new SqlPortalSignInAudit(applicationConnection));
+builder.Services.AddScoped<IPortalOperationalAudit>(_ => new SqlPortalOperationalAudit(connectionFactory));
 builder.Services.AddScoped<IControlPlaneQueries>(_ => new SqlControlPlaneQueries(connectionFactory));
 
 builder.Services
