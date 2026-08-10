@@ -17,6 +17,12 @@ public sealed class ControlPlaneOptions
     /// </summary>
     public bool RunMigrationsAtStartup { get; set; }
 
+    /// <summary>
+    /// Raiz on-premises dos bundles imutáveis de evidência do Slice 3. Caminho relativo é resolvido sob o
+    /// ContentRoot do host; caminho absoluto é aceito para volume/UNC dedicado na implantação.
+    /// </summary>
+    public string EvidenceRoot { get; set; } = "data/evidence";
+
     /// <summary>Provisiona um administrador inicial se o portal estiver vazio (primeiro start on-premises).</summary>
     public BootstrapAdminOptions BootstrapAdmin { get; set; } = new();
 }
