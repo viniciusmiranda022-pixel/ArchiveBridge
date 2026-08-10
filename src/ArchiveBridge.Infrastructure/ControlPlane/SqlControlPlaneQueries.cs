@@ -83,19 +83,30 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         """
         SELECT e.environment_id, e.site_name, e.directory_server,
                r.discovery_version, r.status, r.result_status, r.result_code, r.selected_adapter, r.adapter_version,
-               r.observed_version, r.configuration_hash, r.evidence_hash, r.evidence_path, r.evidence_size_bytes,
-               r.completed_at_utc
+               r.observed_version, r.configuration_hash, r.evidence_hash, r.content_sha256,
+               r.evidence_path, r.evidence_size_bytes, r.completed_at_utc
         FROM dbo.ev_environments e
         OUTER APPLY (
             SELECT TOP 1 d.discovery_version, d.status, d.result_status, d.result_code, d.selected_adapter,
                          d.adapter_version, d.observed_version, d.configuration_hash, d.evidence_hash,
-                         d.evidence_path, d.evidence_size_bytes, d.completed_at_utc
+                         d.content_sha256, d.evidence_path, d.evidence_size_bytes, d.completed_at_utc
             FROM dbo.ev_discovery_runs d
             WHERE d.environment_id = e.environment_id AND d.project_id = @project AND d.status <> 6
             ORDER BY d.discovery_version DESC
         ) r
         WHERE e.project_id = @project
         ORDER BY e.site_name ASC;
+        """;
+
+    private const string EvidenceSql =
+        """
+        SELECT TOP 1 environment_id, discovery_version, content_sha256, evidence_path, evidence_size_bytes
+        FROM dbo.ev_discovery_runs
+        WHERE environment_id = @environment
+          AND discovery_version = @version
+          AND project_id = @project
+          AND status NOT IN (0, 1)
+        ORDER BY discovery_version DESC;
         """;
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
@@ -238,9 +249,10 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
                     reader.GetString(9),
                     reader.GetString(10).TrimEnd(),
                     reader.GetString(11).TrimEnd(),
-                    reader.GetString(12),
-                    reader.GetInt64(13),
-                    SqlJobMapping.ReadUtc(reader.GetDateTime(14)));
+                    reader.GetString(12).TrimEnd(),
+                    reader.GetString(13),
+                    reader.GetInt64(14),
+                    SqlJobMapping.ReadUtc(reader.GetDateTime(15)));
             }
 
             environments.Add(new EvEnvironmentSummary(
@@ -248,6 +260,37 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         }
 
         return environments;
+    }
+
+    /// <inheritdoc />
+    public async Task<EvEvidenceDownloadMetadata?> GetEvEvidenceAsync(
+        TenantScope scope,
+        Guid environmentId,
+        int discoveryVersion,
+        CancellationToken cancellationToken)
+    {
+        if (environmentId == Guid.Empty || discoveryVersion <= 0)
+        {
+            return null;
+        }
+
+        await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var command = new SqlCommand(EvidenceSql, tenant.Connection);
+        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = environmentId });
+        command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = discoveryVersion });
+        AddProject(command, scope);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        return new EvEvidenceDownloadMetadata(
+            reader.GetGuid(0),
+            reader.GetInt32(1),
+            reader.GetString(2).TrimEnd(),
+            reader.GetString(3),
+            reader.GetInt64(4));
     }
 
     private static void AddProject(SqlCommand command, TenantScope scope) =>
