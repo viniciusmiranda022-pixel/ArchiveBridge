@@ -48,18 +48,27 @@ CREATE TABLE dbo.portal_user_roles
 );
 
 -- Auditoria de autenticação: registra SUCESSO e FALHA. Append-only (apenas SELECT/INSERT para a app).
+-- Escopo multitenant: tenant_id/project_id/user_id identificam o alvo quando conhecido (uma falha com
+-- usuário INEXISTENTE não pode ser atribuída a um tenant, por isso são NULL nesse caso). A LEITURA da
+-- trilha filtra por tenant_id — como estas tabelas de identidade não estão sob a RLS por tenant, o filtro
+-- explícito é o que impede vazamento cross-tenant. correlation_id acompanha cada tentativa.
 CREATE TABLE dbo.portal_sign_in_events
 (
     event_id        BIGINT IDENTITY (1, 1) NOT NULL,
+    tenant_id       UNIQUEIDENTIFIER NULL,
+    project_id      UNIQUEIDENTIFIER NULL,
+    user_id         UNIQUEIDENTIFIER NULL,
     username        NVARCHAR(200) NOT NULL,
     succeeded       BIT           NOT NULL,
     reason          NVARCHAR(100) NOT NULL,
     remote_address  NVARCHAR(100) NULL,
+    correlation_id  UNIQUEIDENTIFIER NOT NULL,
     occurred_at_utc DATETIME2(3)  NOT NULL,
     CONSTRAINT PK_portal_sign_in_events PRIMARY KEY (event_id)
 );
 
-CREATE INDEX IX_portal_sign_in_events_time ON dbo.portal_sign_in_events (occurred_at_utc DESC);
+CREATE INDEX IX_portal_sign_in_events_tenant_time
+    ON dbo.portal_sign_in_events (tenant_id, occurred_at_utc DESC);
 
 -- Privilégios da identidade da aplicação (ab_app_role). O login lê usuários/papéis; a administração
 -- insere usuários e vínculos; a auditoria insere/lê tentativas. Sem UPDATE/DELETE (identidade imutável

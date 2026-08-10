@@ -1,6 +1,7 @@
 using System.Data;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Domain.IdentityAndAccess;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Infrastructure.ControlPlane;
 using ArchiveBridge.Integration.Tests.Support;
@@ -88,18 +89,32 @@ public sealed class Slice4aControlPlaneStoreTests(SqlServerFixture fixture)
     }
 
     [Fact]
-    public async Task SignInAuditRecordsSuccessAndFailureInOrder()
+    public async Task SignInAuditIsScopedByTenantAndOrderedRecentFirst()
     {
         var audit = new SqlPortalSignInAudit(_fixture.ConnectionString);
+        var tenantA = new TenantId(Guid.NewGuid());
+        var tenantB = new TenantId(Guid.NewGuid());
         var marker = "audit_" + Guid.NewGuid().ToString("N");
-        await audit.RecordAsync(new PortalSignInEvent(marker, false, "invalid-credentials", "10.0.0.1", DateTimeOffset.UtcNow), CancellationToken.None);
-        await audit.RecordAsync(new PortalSignInEvent(marker, true, "ok", "10.0.0.1", DateTimeOffset.UtcNow.AddSeconds(1)), CancellationToken.None);
+        var now = DateTimeOffset.UtcNow;
 
-        var recent = await audit.RecentAsync(100, CancellationToken.None);
-        var mine = recent.Where(e => e.Username == marker).ToList();
-        Assert.Equal(2, mine.Count);
-        Assert.True(mine[0].Succeeded); // mais recente primeiro
-        Assert.False(mine[1].Succeeded);
+        // Tenant A: uma falha e um sucesso.
+        await audit.RecordAsync(new PortalSignInEvent(tenantA.Value, Guid.NewGuid(), Guid.NewGuid(), marker, false, "invalid-credentials", "10.0.0.1", Guid.NewGuid(), now), CancellationToken.None);
+        await audit.RecordAsync(new PortalSignInEvent(tenantA.Value, Guid.NewGuid(), Guid.NewGuid(), marker, true, "ok", "10.0.0.1", Guid.NewGuid(), now.AddSeconds(1)), CancellationToken.None);
+        // Tenant B: um evento que NUNCA pode aparecer na trilha de A.
+        await audit.RecordAsync(new PortalSignInEvent(tenantB.Value, Guid.NewGuid(), Guid.NewGuid(), marker, true, "ok", "10.0.0.2", Guid.NewGuid(), now.AddSeconds(2)), CancellationToken.None);
+        // Falha de usuário inexistente (sem tenant) — não pertence a nenhuma trilha por tenant.
+        await audit.RecordAsync(new PortalSignInEvent(null, null, null, marker, false, "invalid-credentials", "10.0.0.3", Guid.NewGuid(), now.AddSeconds(3)), CancellationToken.None);
+
+        var trailA = await audit.RecentAsync(tenantA, 100, CancellationToken.None);
+        var mineA = trailA.Where(e => e.Username == marker).ToList();
+        Assert.Equal(2, mineA.Count); // apenas os 2 eventos do tenant A
+        Assert.All(mineA, e => Assert.Equal(tenantA.Value, e.TenantId));
+        Assert.True(mineA[0].Succeeded); // mais recente primeiro
+        Assert.False(mineA[1].Succeeded);
+
+        // O evento de B (e o sem-tenant) não vaza para a trilha de A; a trilha de B só vê o de B.
+        var trailB = await audit.RecentAsync(tenantB, 100, CancellationToken.None);
+        Assert.Single(trailB, e => e.Username == marker);
     }
 
     [Fact]
@@ -125,6 +140,44 @@ public sealed class Slice4aControlPlaneStoreTests(SqlServerFixture fixture)
 
         var dashB = await queries.GetDashboardAsync(tenantB, CancellationToken.None);
         Assert.Equal(0, dashB.JobsFailed); // jobs de A não contam para B
+    }
+
+    [Fact]
+    public async Task ReadModelIsolatesByProjectWithinSameTenant()
+    {
+        var queries = new SqlControlPlaneQueries(_fixture.Factory);
+        var tenant = new TenantId(Guid.NewGuid());
+        var scope1 = new TenantScope(tenant, new ProjectId(Guid.NewGuid()));
+        var scope2 = new TenantScope(tenant, new ProjectId(Guid.NewGuid()));
+        var job2Id = Guid.NewGuid();
+
+        await SeedBaseProjectAsync(scope1);
+        await SeedProjectAsync(scope1, "Projeto 1");
+        await SeedJobAsync(scope1, workload: 0, state: 0);
+
+        await SeedBaseProjectAsync(scope2);
+        await SeedProjectAsync(scope2, "Projeto 2");
+        await SeedJobWithIdAsync(scope2, job2Id, workload: 0, state: 4); // Failed, projeto 2
+        await SeedJobTransitionAsync(scope2, job2Id, toState: 4);
+
+        // Projetos: o escopo do projeto 1 vê apenas o seu projeto, mesmo dentro do mesmo tenant.
+        var projects1 = await queries.ListProjectsAsync(scope1, CancellationToken.None);
+        Assert.Contains(projects1, p => p.Name == "Projeto 1");
+        Assert.DoesNotContain(projects1, p => p.Name == "Projeto 2");
+
+        // Jobs: o job do projeto 2 não aparece para o projeto 1.
+        var jobs1 = await queries.ListJobsAsync(scope1, 100, CancellationToken.None);
+        Assert.DoesNotContain(jobs1, j => j.JobId == job2Id);
+
+        // Dashboard escopado ao projeto 1: 1 projeto, 0 falhas (a falha é do projeto 2).
+        var dash1 = await queries.GetDashboardAsync(scope1, CancellationToken.None);
+        Assert.Equal(1, dash1.Projects);
+        Assert.Equal(0, dash1.JobsFailed);
+
+        // IDOR entre projetos: transições do job do projeto 2 sob o escopo do projeto 1 → vazio.
+        Assert.Empty(await queries.ListJobTransitionsAsync(scope1, job2Id, CancellationToken.None));
+        // Sanidade: sob o próprio escopo, as transições existem.
+        Assert.NotEmpty(await queries.ListJobTransitionsAsync(scope2, job2Id, CancellationToken.None));
     }
 
     [Fact]
@@ -170,17 +223,34 @@ public sealed class Slice4aControlPlaneStoreTests(SqlServerFixture fixture)
             command.Parameters.Add(new SqlParameter("@hash", SqlDbType.Char, 64) { Value = new string('a', 64) });
         });
 
-    private Task SeedJobAsync(TenantScope scope, byte workload, byte state) => ExecAsync(scope,
+    private Task SeedJobAsync(TenantScope scope, byte workload, byte state) =>
+        SeedJobWithIdAsync(scope, Guid.NewGuid(), workload, state);
+
+    private Task SeedJobWithIdAsync(TenantScope scope, Guid jobId, byte workload, byte state) => ExecAsync(scope,
         """
         INSERT INTO dbo.jobs (job_id, tenant_id, project_id, workload, state)
         VALUES (@id, @tenant, @project, @workload, @state);
         """,
         command =>
         {
-            command.Parameters.Add(new SqlParameter("@id", SqlDbType.UniqueIdentifier) { Value = Guid.NewGuid() });
+            command.Parameters.Add(new SqlParameter("@id", SqlDbType.UniqueIdentifier) { Value = jobId });
             command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
             command.Parameters.Add(new SqlParameter("@workload", SqlDbType.TinyInt) { Value = workload });
             command.Parameters.Add(new SqlParameter("@state", SqlDbType.TinyInt) { Value = state });
+        });
+
+    private Task SeedJobTransitionAsync(TenantScope scope, Guid jobId, byte toState) => ExecAsync(scope,
+        """
+        INSERT INTO dbo.job_state_transitions
+            (job_id, tenant_id, project_id, to_state, reason_code, lease_epoch, correlation_id)
+        VALUES (@job, @tenant, @project, @toState, 0, 0, @correlation);
+        """,
+        command =>
+        {
+            command.Parameters.Add(new SqlParameter("@job", SqlDbType.UniqueIdentifier) { Value = jobId });
+            command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+            command.Parameters.Add(new SqlParameter("@toState", SqlDbType.TinyInt) { Value = toState });
+            command.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = Guid.NewGuid() });
         });
 
     private Task SeedEvEnvironmentAsync(TenantScope scope, Guid environmentId, string site, string dir) => ExecAsync(scope,

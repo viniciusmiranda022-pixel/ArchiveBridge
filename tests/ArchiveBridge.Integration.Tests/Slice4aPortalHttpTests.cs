@@ -27,6 +27,8 @@ public sealed class Slice4aPortalHttpTests : IDisposable
         _fixture = fixture;
         _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
+            // Development: sem redirect HTTPS/HSTS de produção, para exercitar o pipeline sobre HTTP de teste.
+            builder.UseSetting("environment", "Development");
             builder.UseSetting("ConnectionStrings:Application", fixture.ConnectionString);
             builder.UseSetting("ConnectionStrings:Maintenance", fixture.MaintenanceConnectionString);
             builder.UseSetting("ControlPlane:RunMigrationsAtStartup", "false");
@@ -109,6 +111,42 @@ public sealed class Slice4aPortalHttpTests : IDisposable
         using var admin = await client.GetAsync(new Uri("/Admin/Index", UriKind.Relative));
         Assert.Equal(HttpStatusCode.OK, admin.StatusCode);
         Assert.Contains("Administração do portal", await admin.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ViewerIsDeniedAuditTrail()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var username = "viewer_" + Guid.NewGuid().ToString("N");
+        await new SqlPortalUserStore(_fixture.ConnectionString).CreateAsync(
+            new PortalUserRegistration(username, "Viewer", scope.Tenant, scope.Project, Hasher.Hash("V1ewer!pw"),
+                [PortalRoles.Viewer]),
+            CancellationToken.None);
+
+        using var client = _factory.CreateClient();
+        await LoginAsync(client, username, "V1ewer!pw");
+
+        using var audit = await client.GetAsync(new Uri("/Audit/Index", UriKind.Relative));
+        Assert.Equal(HttpStatusCode.OK, audit.StatusCode); // seguiu o redirect para /Account/Denied
+        Assert.Contains("Acesso negado", await audit.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AuditorCanReadAuditTrail()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var username = "auditread_" + Guid.NewGuid().ToString("N");
+        await new SqlPortalUserStore(_fixture.ConnectionString).CreateAsync(
+            new PortalUserRegistration(username, "Auditor", scope.Tenant, scope.Project, Hasher.Hash("Aud1t!pw"),
+                [PortalRoles.Auditor]),
+            CancellationToken.None);
+
+        using var client = _factory.CreateClient();
+        await LoginAsync(client, username, "Aud1t!pw");
+
+        using var audit = await client.GetAsync(new Uri("/Audit/Index", UriKind.Relative));
+        Assert.Equal(HttpStatusCode.OK, audit.StatusCode);
+        Assert.Contains("Trilha de auditoria", await audit.Content.ReadAsStringAsync(), StringComparison.Ordinal);
     }
 
     [Fact]

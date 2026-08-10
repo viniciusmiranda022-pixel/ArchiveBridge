@@ -1,13 +1,16 @@
 @page
 @inject IPortalSignInAudit SignInAudit
+@inject IPortalScopeAccessor ScopeAccessor
 @{
     ViewData["Title"] = "Auditoria";
-    var events = await SignInAudit.RecentAsync(100, HttpContext.RequestAborted);
+    var scope = ScopeAccessor.Resolve(User);
+    var events = await SignInAudit.RecentAsync(scope.Tenant, 100, HttpContext.RequestAborted);
 }
 <h1>Trilha de auditoria</h1>
 <p class="lead">
-    Tentativas de autenticação no portal (sucesso e falha). A trilha de transições de cada job está na
-    página de detalhe do job. Nenhum segredo é registrado.
+    Tentativas de autenticação no portal <strong>deste tenant</strong> (sucesso e falha). Restrita aos papéis
+    Auditor e Administrator. A trilha de transições de cada job está na página de detalhe do job. Nenhum
+    segredo é registrado.
 </p>
 
 @if (events.Count == 0)

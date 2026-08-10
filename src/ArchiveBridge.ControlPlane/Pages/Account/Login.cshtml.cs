@@ -2,6 +2,7 @@ using System.Security.Claims;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.ControlPlane.Composition;
+using ArchiveBridge.Infrastructure.ControlPlane;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Mvc;
@@ -12,8 +13,9 @@ namespace ArchiveBridge.ControlPlane.Pages.Account;
 /// <summary>
 /// Autenticação por formulário do portal. Verifica as credenciais contra o store (hash PBKDF2, comparação
 /// em tempo constante), recusa usuários desabilitados (fail-closed) e AUDITA toda tentativa — sucesso e
-/// falha — sem nunca registrar a senha. Em sucesso, emite o cookie com as claims de identidade e escopo
-/// (tenant/projeto) e os papéis (RBAC). Mensagem de erro genérica: não revela se o login existe.
+/// falha — com escopo (tenant/projeto/usuário quando conhecido) e correlação, sem nunca registrar a senha.
+/// Quando o usuário não existe, verifica um hash dummy para não revelar por TEMPO a inexistência do login
+/// (a mensagem já é genérica). Em sucesso, emite o cookie com as claims de identidade, escopo e papéis.
 /// </summary>
 public sealed class LoginModel(
     IPortalUserStore users,
@@ -21,6 +23,11 @@ public sealed class LoginModel(
     IPortalSignInAudit audit,
     IClock clock) : PageModel
 {
+    // Hash dummy no MESMO formato/custo do de produção: verificar contra ele custa uma derivação PBKDF2,
+    // equalizando o tempo da resposta quando o usuário não existe versus quando existe com senha errada.
+    private static readonly PortalPasswordHash DummyHash =
+        new Pbkdf2PasswordHasher().Hash("timing-equalization-placeholder");
+
     private readonly IPortalUserStore _users = users;
     private readonly IPasswordHasher _hasher = hasher;
     private readonly IPortalSignInAudit _audit = audit;
@@ -45,20 +52,28 @@ public sealed class LoginModel(
     /// <summary>Processa a tentativa de autenticação.</summary>
     public async Task<IActionResult> OnPostAsync(string? returnUrl, CancellationToken cancellationToken)
     {
+        var correlationId = Guid.NewGuid();
+
         if (string.IsNullOrWhiteSpace(Username) || string.IsNullOrEmpty(Password))
         {
-            return await FailAsync("empty-credentials", cancellationToken).ConfigureAwait(false);
+            return await FailAsync(null, "empty-credentials", correlationId, cancellationToken).ConfigureAwait(false);
         }
 
         var user = await _users.FindByUsernameAsync(Username, cancellationToken).ConfigureAwait(false);
-        if (user is null || !_hasher.Verify(Password, user.Password))
+        if (user is null)
         {
-            return await FailAsync("invalid-credentials", cancellationToken).ConfigureAwait(false);
+            _hasher.Verify(Password, DummyHash); // equaliza o custo; não revela inexistência por tempo
+            return await FailAsync(null, "invalid-credentials", correlationId, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (!_hasher.Verify(Password, user.Password))
+        {
+            return await FailAsync(user, "invalid-credentials", correlationId, cancellationToken).ConfigureAwait(false);
         }
 
         if (!user.Enabled)
         {
-            return await FailAsync("disabled", cancellationToken).ConfigureAwait(false);
+            return await FailAsync(user, "disabled", correlationId, cancellationToken).ConfigureAwait(false);
         }
 
         var claims = new List<Claim>
@@ -75,17 +90,22 @@ public sealed class LoginModel(
             CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity)).ConfigureAwait(false);
 
         await _audit.RecordAsync(
-            new PortalSignInEvent(user.Username, true, "ok", RemoteAddress(), _clock.UtcNow), cancellationToken)
-            .ConfigureAwait(false);
+            new PortalSignInEvent(
+                user.Tenant.Value, user.Project.Value, user.UserId, user.Username, true, "ok",
+                RemoteAddress(), correlationId, _clock.UtcNow),
+            cancellationToken).ConfigureAwait(false);
 
         return LocalRedirect(SafeReturnUrl(returnUrl));
     }
 
-    private async Task<IActionResult> FailAsync(string reason, CancellationToken cancellationToken)
+    private async Task<IActionResult> FailAsync(
+        PortalUserRecord? user, string reason, Guid correlationId, CancellationToken cancellationToken)
     {
         await _audit.RecordAsync(
-            new PortalSignInEvent(Username ?? string.Empty, false, reason, RemoteAddress(), _clock.UtcNow), cancellationToken)
-            .ConfigureAwait(false);
+            new PortalSignInEvent(
+                user?.Tenant.Value, user?.Project.Value, user?.UserId, Username ?? string.Empty, false, reason,
+                RemoteAddress(), correlationId, _clock.UtcNow),
+            cancellationToken).ConfigureAwait(false);
         Error = "Credenciais inválidas.";
         return Page();
     }

@@ -46,8 +46,10 @@ builder.Services
         cookie.Cookie.Name = "ArchiveBridge.Portal";
         cookie.Cookie.HttpOnly = true;
         cookie.Cookie.SameSite = SameSiteMode.Lax;
-        // On-premises pode terminar TLS no IIS; SameAsRequest evita quebrar HTTP interno de homologação.
-        cookie.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+        // Fora de desenvolvimento o cookie exige HTTPS (Always); em dev local, SameAsRequest não quebra HTTP.
+        cookie.Cookie.SecurePolicy = builder.Environment.IsDevelopment()
+            ? CookieSecurePolicy.SameAsRequest
+            : CookieSecurePolicy.Always;
     });
 
 builder.Services.AddAuthorization(authorization =>
@@ -55,6 +57,8 @@ builder.Services.AddAuthorization(authorization =>
     // Fail-closed: toda página exige autenticação, exceto as explicitamente anônimas (login/erro/health).
     authorization.FallbackPolicy = new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build();
     authorization.AddPolicy("Administrator", policy => policy.RequireRole(PortalRoles.Administrator));
+    // A trilha de auditoria é sensível: restrita a quem tem mandato de auditoria/administração.
+    authorization.AddPolicy("AuditReaders", policy => policy.RequireRole(PortalRoles.Auditor, PortalRoles.Administrator));
 });
 
 builder.Services.AddRazorPages(razor =>
@@ -62,11 +66,19 @@ builder.Services.AddRazorPages(razor =>
     razor.Conventions.AllowAnonymousToPage("/Account/Login");
     razor.Conventions.AllowAnonymousToPage("/Account/Denied");
     razor.Conventions.AuthorizeFolder("/Admin", "Administrator");
+    razor.Conventions.AuthorizeFolder("/Audit", "AuditReaders");
 });
 
 var app = builder.Build();
 
 await BootstrapAsync(app, options).ConfigureAwait(false);
+
+// Fora de desenvolvimento, TLS é obrigatório: HSTS + redirecionamento HTTP→HTTPS (fail-closed em produção).
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHsts();
+    app.UseHttpsRedirection();
+}
 
 // Cabeçalhos de segurança + CSP restrita: a página é AUTOCONTIDA (CSS próprio, sem CDN, sem script externo),
 // então 'self' cobre tudo — nenhuma origem externa é permitida.

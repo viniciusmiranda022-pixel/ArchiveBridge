@@ -57,11 +57,20 @@ host.
 - **Escopo efetivo:** o tenant e o projeto do usuário autenticado (claims) são a **única** fonte do escopo
   de dados; o cliente nunca informa tenant como se fosse autorização.
 
-## Isolamento por tenant (RLS)
+## Isolamento por tenant (RLS) **e** por projeto (filtro explícito)
 
 O read-model abre conexões da identidade da aplicação com `SESSION_CONTEXT('tenant_id')` = tenant do
-usuário (mesma `TenantConnectionFactory` da produção). Um tenant **nunca** enxerga projetos, ondas, jobs ou
-ambientes de outro — comprovado por teste de integração contra SQL real.
+usuário (mesma `TenantConnectionFactory` da produção) **e** filtra explicitamente por `project_id = @project`
+em todas as consultas de negócio (projetos, ondas, jobs, transições e Enterprise Vault). O isolamento é,
+portanto, **por tenant (RLS) e por projeto (filtro)** — exatamente como as operações de Job dos Slices 1–3.
+Um usuário vinculado a um projeto **nunca** enxerga outro projeto do mesmo tenant, e pedir as transições de
+um job de outro projeto (IDOR) retorna vazio. Comprovado por testes de integração contra SQL real
+(tenant A × tenant B **e** tenant A/projeto 1 × tenant A/projeto 2).
+
+A **trilha de auditoria de login** não está sob a RLS por tenant (as tabelas de identidade são o mecanismo
+que estabelece o tenant); seu isolamento é feito por **filtro explícito** `tenant_id = @tenant` na leitura,
+e a página `/Audit` é **restrita aos papéis Auditor e Administrator**. Falhas de login com usuário
+inexistente não têm tenant atribuível e não aparecem em nenhuma trilha por tenant.
 
 ## Telas (somente leitura nesta fatia)
 
@@ -73,7 +82,7 @@ ambientes de outro — comprovado por teste de integração contra SQL real.
 | `/Jobs` + `/Jobs/Details` | Fila durável: estado, tentativas, dono, erro; trilha de transições por job. |
 | `/EnterpriseVault` | Descoberta de capacidades: `Ready`/`Blocked`/`Unsupported` por ambiente, com evidência. |
 | `/Evidence` | Metadados do artefato imutável de evidência (hashes, caminho, tamanho). |
-| `/Audit` | Tentativas de autenticação no portal. |
+| `/Audit` | Tentativas de autenticação **do tenant do usuário** (restrito a Auditor/Administrator). |
 | `/Export` | **Indisponível — Slice 4B** (declarado honestamente). |
 | `/Admin` | Restrito a `Administrator`: modelo de papéis e contagem de usuários. |
 
@@ -82,7 +91,21 @@ ambientes de outro — comprovado por teste de integração contra SQL real.
 - **CSP restrita** (`default-src 'self'`), `X-Content-Type-Options`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`. Página **autocontida** (CSS próprio; sem CDN, fonte ou script externo).
 - **Antiforgery** em todos os POST (login/logout).
-- Cookie `HttpOnly`, `SameSite=Lax`, expiração deslizante de 8 h.
+- Cookie `HttpOnly`, `SameSite=Lax`, expiração deslizante de 8 h; `SecurePolicy=Always` fora de
+  desenvolvimento (em dev local, `SameAsRequest`).
+- **HTTPS obrigatório fora de desenvolvimento:** `UseHsts()` + `UseHttpsRedirection()` (fail-closed em
+  produção; desabilitado apenas no ambiente Development).
+- **Equalização de timing no login:** quando o usuário não existe, o fluxo ainda executa uma derivação
+  PBKDF2 contra um hash dummy, para não revelar por tempo a existência do login (a mensagem já é genérica).
+
+> Ainda pendentes de hardening (próximo incremento, ver PR): **rate limiting** de login, gates de
+> **SAST/DAST**, **coverage/mutation** e revisão independente.
+
+## Nota sobre o dashboard
+
+O painel entrega o **read-model inicial** (contagens por projeto/onda/job e resultados EV). O **dashboard
+operacional completo** da especificação (jobs por todos os estados, tentativas/retries agregados,
+aprovações pendentes, eventos recentes) é **parcial** e será completado em incremento seguinte.
 
 ## Persistência
 

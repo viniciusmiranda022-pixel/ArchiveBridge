@@ -14,10 +14,11 @@ namespace ArchiveBridge.Infrastructure.ControlPlane;
 
 /// <summary>
 /// Read-model de LEITURA do plano de controle. Cada consulta abre uma conexão da aplicação com o
-/// <c>SESSION_CONTEXT('tenant_id')</c> do escopo (RLS por tenant) e devolve projeções leves de governança
-/// e observabilidade — nunca segredo, PST ou evidência bruta, e nunca dispara execução. Os nomes de status
-/// vêm dos enums de domínio (o TINYINT persistido é convertido para o nome canônico), garantindo uma única
-/// fonte de verdade para os rótulos exibidos.
+/// <c>SESSION_CONTEXT('tenant_id')</c> do escopo (RLS por tenant) E filtra explicitamente por
+/// <c>project_id = @project</c> — o isolamento é por tenant (RLS) E por projeto (filtro explícito), como
+/// nas operações de Job dos Slices 1–3. Um usuário vinculado a um projeto nunca enxerga outro projeto do
+/// mesmo tenant. Devolve apenas projeções leves de governança/observabilidade — nunca segredo, PST ou
+/// evidência bruta, e nunca dispara execução. Os nomes de status vêm dos enums de domínio (fonte única).
 /// </summary>
 public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFactory) : IControlPlaneQueries
 {
@@ -26,18 +27,19 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         WITH latest_ev AS (
             SELECT e.environment_id,
                    (SELECT TOP 1 d.status FROM dbo.ev_discovery_runs d
-                    WHERE d.environment_id = e.environment_id AND d.status <> 6
+                    WHERE d.environment_id = e.environment_id AND d.project_id = @project AND d.status <> 6
                     ORDER BY d.discovery_version DESC) AS status
             FROM dbo.ev_environments e
+            WHERE e.project_id = @project
         )
         SELECT
-            (SELECT COUNT(*) FROM dbo.migration_projects),
-            (SELECT COUNT(*) FROM dbo.migration_waves),
-            (SELECT COUNT(*) FROM dbo.jobs),
-            (SELECT COUNT(*) FROM dbo.jobs WHERE state = 0),
-            (SELECT COUNT(*) FROM dbo.jobs WHERE state = 1),
-            (SELECT COUNT(*) FROM dbo.jobs WHERE state = 4),
-            (SELECT COUNT(*) FROM dbo.ev_environments),
+            (SELECT COUNT(*) FROM dbo.migration_projects WHERE project_id = @project),
+            (SELECT COUNT(*) FROM dbo.migration_waves WHERE project_id = @project),
+            (SELECT COUNT(*) FROM dbo.jobs WHERE project_id = @project),
+            (SELECT COUNT(*) FROM dbo.jobs WHERE project_id = @project AND state = 0),
+            (SELECT COUNT(*) FROM dbo.jobs WHERE project_id = @project AND state = 1),
+            (SELECT COUNT(*) FROM dbo.jobs WHERE project_id = @project AND state = 4),
+            (SELECT COUNT(*) FROM dbo.ev_environments WHERE project_id = @project),
             (SELECT COUNT(*) FROM latest_ev WHERE status = 2),
             (SELECT COUNT(*) FROM latest_ev WHERE status = 3),
             (SELECT COUNT(*) FROM latest_ev WHERE status = 4);
@@ -47,6 +49,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         """
         SELECT project_id, project_name, project_owner, target_tenant, configuration_version, status, updated_at_utc
         FROM dbo.migration_projects
+        WHERE project_id = @project
         ORDER BY project_name ASC;
         """;
 
@@ -55,6 +58,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         SELECT TOP (@max) wave_id, project_id, name, wave_version, status, planned_bytes, planned_items,
                created_at_utc, approved_at_utc, approved_by
         FROM dbo.migration_waves
+        WHERE project_id = @project
         ORDER BY created_at_utc DESC, wave_id DESC;
         """;
 
@@ -63,6 +67,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         SELECT TOP (@max) job_id, project_id, workload, state, attempt_count, priority, owner_worker,
                last_error_code, updated_at_utc
         FROM dbo.jobs
+        WHERE project_id = @project
         ORDER BY updated_at_utc DESC, job_id DESC;
         """;
 
@@ -70,7 +75,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         """
         SELECT transition_id, from_state, to_state, reason_code, lease_epoch, worker_id, occurred_at_utc
         FROM dbo.job_state_transitions
-        WHERE job_id = @jobId
+        WHERE job_id = @jobId AND project_id = @project
         ORDER BY transition_id ASC;
         """;
 
@@ -86,9 +91,10 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
                          d.adapter_version, d.observed_version, d.configuration_hash, d.evidence_hash,
                          d.evidence_path, d.evidence_size_bytes, d.completed_at_utc
             FROM dbo.ev_discovery_runs d
-            WHERE d.environment_id = e.environment_id AND d.status <> 6
+            WHERE d.environment_id = e.environment_id AND d.project_id = @project AND d.status <> 6
             ORDER BY d.discovery_version DESC
         ) r
+        WHERE e.project_id = @project
         ORDER BY e.site_name ASC;
         """;
 
@@ -99,6 +105,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
     {
         await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var command = new SqlCommand(DashboardSql, tenant.Connection);
+        AddProject(command, scope);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
         return new DashboardSummary(
@@ -112,6 +119,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         var projects = new List<ProjectSummary>();
         await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var command = new SqlCommand(ProjectsSql, tenant.Connection);
+        AddProject(command, scope);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -135,6 +143,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var command = new SqlCommand(WavesSql, tenant.Connection);
         command.Parameters.Add(new SqlParameter("@max", SqlDbType.Int) { Value = Math.Clamp(max, 1, 500) });
+        AddProject(command, scope);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -161,6 +170,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var command = new SqlCommand(JobsSql, tenant.Connection);
         command.Parameters.Add(new SqlParameter("@max", SqlDbType.Int) { Value = Math.Clamp(max, 1, 500) });
+        AddProject(command, scope);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -187,6 +197,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var command = new SqlCommand(TransitionsSql, tenant.Connection);
         command.Parameters.Add(new SqlParameter("@jobId", SqlDbType.UniqueIdentifier) { Value = jobId });
+        AddProject(command, scope);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -210,6 +221,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         var environments = new List<EvEnvironmentSummary>();
         await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var command = new SqlCommand(EnvironmentsSql, tenant.Connection);
+        AddProject(command, scope);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -237,4 +249,7 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
 
         return environments;
     }
+
+    private static void AddProject(SqlCommand command, TenantScope scope) =>
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
 }

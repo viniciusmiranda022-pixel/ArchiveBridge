@@ -15,10 +15,11 @@ leitura) e a **identidade do portal**. Não há execução de exportação nem i
 | Ameaça | Mitigação |
 | --- | --- |
 | Acesso não autenticado a dados | Política de autorização **fail-closed** (fallback exige usuário autenticado); só login/erro/health são anônimos. |
-| Elevação de privilégio (papel) | RBAC por papel; Administração exige `Administrator` (política + `AuthorizeFolder`). Catálogo de papéis fechado por FK/CHECK no banco. |
-| Vazamento cross-tenant | Toda leitura ocorre sob `SESSION_CONTEXT('tenant_id')` do usuário (RLS). Tenant vem da claim, nunca do cliente. Teste de integração comprova o isolamento. |
-| Roubo/força bruta de senha | PBKDF2-HMAC-SHA256, sal por usuário, 210k iterações, verificação em tempo constante. Falhas de login auditadas; mensagem genérica (não revela existência do login). |
-| Sequestro de sessão | Cookie `HttpOnly`, `SameSite=Lax`, `SecurePolicy=SameAsRequest` (TLS no IIS), expiração deslizante. |
+| Elevação de privilégio (papel) | RBAC por papel; Administração exige `Administrator` e a trilha de auditoria exige `Auditor`/`Administrator` (política + `AuthorizeFolder`). Catálogo de papéis fechado por FK/CHECK no banco. |
+| Vazamento cross-tenant | As leituras de negócio ocorrem sob `SESSION_CONTEXT('tenant_id')` do usuário (RLS). A auditoria de login **não** está sob RLS (tabela de identidade) e é isolada por **filtro explícito** `tenant_id = @tenant`. Tenant vem da claim, nunca do cliente. Testes comprovam o isolamento (negócio e auditoria). |
+| Vazamento cross-project (IDOR) | Além da RLS por tenant, toda leitura de negócio filtra `project_id = @project` do usuário. Pedir transições de um job de outro projeto do mesmo tenant retorna vazio. Comprovado por teste tenant A/projeto 1 × tenant A/projeto 2. |
+| Roubo/força bruta de senha | PBKDF2-HMAC-SHA256, sal por usuário, 210k iterações, verificação em tempo constante. Usuário inexistente ainda executa uma derivação PBKDF2 dummy (equalização de timing — não revela existência do login). Falhas auditadas; mensagem genérica. Rate limiting: próximo incremento. |
+| Sequestro de sessão | Cookie `HttpOnly`, `SameSite=Lax`; `SecurePolicy=Always` fora de dev. Fora de desenvolvimento, `UseHsts()`+`UseHttpsRedirection()` tornam o HTTPS obrigatório (fail-closed). Expiração deslizante de 8 h. |
 | CSRF | Antiforgery em todos os POST (login/logout). |
 | XSS / injeção de conteúdo externo | Página **autocontida** + **CSP** `default-src 'self'` (sem CDN/script externo); saída Razor codificada por padrão. Cabeçalhos `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. |
 | SQL injection | Todo acesso a dados é parametrizado (ADO com `SqlParameter`). |
@@ -34,4 +35,5 @@ não existem nesta fatia e serão modeladas ao serem implementadas.
 ## Higiene de logs
 
 Nenhuma senha, hash, cookie ou segredo é registrado. A auditoria de autenticação grava apenas login,
-resultado, motivo curto não sensível e endereço remoto.
+resultado, motivo curto não sensível, endereço remoto, o escopo quando conhecido
+(tenant/projeto/usuário) e um `correlation_id` por tentativa.
