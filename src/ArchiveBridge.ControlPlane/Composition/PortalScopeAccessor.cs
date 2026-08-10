@@ -11,6 +11,9 @@ namespace ArchiveBridge.ControlPlane.Composition;
 /// </summary>
 public static class PortalClaims
 {
+    /// <summary>Identidade persistida do usuário do portal (GUID), usada para auditoria operacional.</summary>
+    public const string UserId = "portal_user_id";
+
     /// <summary>Nome de exibição do usuário.</summary>
     public const string DisplayName = "display_name";
 
