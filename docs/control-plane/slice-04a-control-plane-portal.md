@@ -7,8 +7,8 @@
 
 Entregar o **plano de controle** do ArchiveBridge como uma aplicação **on-premises** navegável, consumindo
 o que já foi construído nos Slices 1–3 (jobs duráveis, projetos/ondas/mapping, descoberta de capacidades do
-Enterprise Vault). O operador autentica-se, enxerga o estado da plataforma dentro do **seu tenant** (isolado
-por RLS) e audita o que aconteceu — tudo **sem** disparar execução.
+Enterprise Vault). O operador autentica-se, enxerga o estado da plataforma dentro do **seu tenant/projeto**
+e audita o que aconteceu — sem iniciar exportação ou ingestão.
 
 ## Princípio: a interface não simula o que ainda não existe
 
@@ -18,8 +18,8 @@ por quê — nunca um botão que aparenta funcionar. Exemplos nesta fatia:
 - **Exportação** (`/Export`): "Status: indisponível — Slice 4B ainda não implementado".
 - **Disparo de descoberta**: o portal mostra os resultados já registrados; enfileirar nova descoberta é
   ação de escrita e entra em rodada seguinte.
-- **Download de evidência** e **gestão de usuários**: marcados como próxima rodada, com o dado factual
-  (hashes/caminho) exibido para conferência.
+- **Gestão de usuários**: permanece indisponível pela interface; provisionamento inicial é controlado.
+- **Download de evidência**: implementado como leitura autenticada e verificada, sem reserializar os bytes.
 
 ## Arquitetura
 
@@ -29,10 +29,12 @@ Navegador
 ArchiveBridge.ControlPlane  (ASP.NET Core, Microsoft.NET.Sdk.Web)
     ├── Portal Web (Razor Pages, CSS autocontido — sem CDN, sem script externo)
     ├── Autenticação por cookie + RBAC (fallback fail-closed: tudo exige login)
-    ├── Read-model (IControlPlaneQueries) — leitura sob RLS por tenant
+    ├── Read-model (IControlPlaneQueries) — tenant RLS + filtro explícito por projeto
+    ├── IEvDiscoveryEvidenceStore — valida bundle imutável on-premises antes do download
+    ├── IPortalOperationalAudit — trilha append-only sob tenant/projeto
     └── Identidade do portal (IPortalUserStore / IPortalSignInAudit)
             ↓
-        SQL Server on-premises (mesmo banco dos Slices 1–3)
+        SQL Server on-premises + filesystem/SMB de evidências do Slice 3
 ```
 
 Mantém a arquitetura aprovada: **on-premises**; **IIS ou Windows Service**; **sem** Azure App Service,
@@ -47,91 +49,105 @@ host.
   ou versionada.
 - A porta `IPasswordHasher` e o modelo de identidade estão isolados para permitir, em rodada futura, um
   provedor externo (ex.: **Windows Authentication/AD**) sem reescrever as telas.
-- **Papéis (RBAC):** `Viewer`, `Operator`, `Approver`, `Auditor`, `Administrator` (conforme a especificação
-  de design do slice). As telas de leitura são abertas a qualquer papel autenticado; a área de
-  **Administração** exige `Administrator` (política + autorização de pasta). O catálogo de papéis é fechado
-  por FK/CHECK no banco (fail-closed). As ações de escrita de rodadas futuras serão gated pelos papéis
-  correspondentes (ex.: retry/discovery por `Operator`, aprovações por `Approver`).
-- **Fail-closed:** a política padrão exige usuário autenticado; apenas login, acesso-negado e
-  `/health/live` são anônimos. Toda tentativa de login (sucesso e falha) é **auditada** — sem segredo.
-- **Escopo efetivo:** o tenant e o projeto do usuário autenticado (claims) são a **única** fonte do escopo
-  de dados; o cliente nunca informa tenant como se fosse autorização.
+- **Papéis (RBAC):** `Viewer`, `Operator`, `Approver`, `Auditor`, `Administrator`. As leituras de evidência
+  são permitidas a qualquer papel autenticado dentro do próprio escopo; a área de **Administração** exige
+  `Administrator`, e `/Audit` exige `Auditor` ou `Administrator`.
+- **Fail-closed:** a política padrão exige usuário autenticado; apenas login, acesso-negado e health são
+  anônimos. Toda tentativa de login (sucesso e falha) é auditada — sem segredo.
+- **Escopo efetivo:** tenant, projeto e identidade persistida do usuário vêm das claims emitidas no login;
+  o cliente nunca informa tenant/projeto como se fosse autorização.
 
 ## Isolamento por tenant (RLS) **e** por projeto (filtro explícito)
 
 O read-model abre conexões da identidade da aplicação com `SESSION_CONTEXT('tenant_id')` = tenant do
 usuário (mesma `TenantConnectionFactory` da produção) **e** filtra explicitamente por `project_id = @project`
-em todas as consultas de negócio (projetos, ondas, jobs, transições e Enterprise Vault). O isolamento é,
-portanto, **por tenant (RLS) e por projeto (filtro)** — exatamente como as operações de Job dos Slices 1–3.
-Um usuário vinculado a um projeto **nunca** enxerga outro projeto do mesmo tenant, e pedir as transições de
-um job de outro projeto (IDOR) retorna vazio. Comprovado por testes de integração contra SQL real
-(tenant A × tenant B **e** tenant A/projeto 1 × tenant A/projeto 2).
+em todas as consultas de negócio. O isolamento é, portanto, **por tenant (RLS) e por projeto (filtro)**.
+Um usuário vinculado a um projeto nunca enxerga outro projeto do mesmo tenant; pedidos de recurso de outro
+projeto retornam a mesma ausência usada para inexistente (anti-IDOR).
 
-A **trilha de auditoria de login** não está sob a RLS por tenant (as tabelas de identidade são o mecanismo
-que estabelece o tenant); seu isolamento é feito por **filtro explícito** `tenant_id = @tenant` na leitura,
-e a página `/Audit` é **restrita aos papéis Auditor e Administrator**. Falhas de login com usuário
-inexistente não têm tenant atribuível e não aparecem em nenhuma trilha por tenant.
+A auditoria de login não está sob RLS porque participa do estabelecimento da identidade; sua leitura é
+filtrada por tenant. Já a **auditoria operacional** ocorre depois da autenticação e fica sob RLS por tenant,
+FK coerente `(tenant_id, project_id)` e filtro explícito por projeto.
 
-## Telas (somente leitura nesta fatia)
+## Download verificado de `evidence.json`
+
+O download reutiliza integralmente o contrato e o store imutável do Slice 3. O Portal **não lê arquivo por
+caminho fornecido pelo cliente**. O fluxo é:
+
+1. ambiente + versão são resolvidos no SQL dentro do tenant/projeto autenticado;
+2. inexistente/cross-tenant/cross-project retorna `404` sem revelar a existência do recurso;
+3. o caminho lógico esperado é reconstruído deterministicamente pelo `EvDiscoveryEvidenceDescriptor`;
+4. `FileSystemEvDiscoveryEvidenceStore.GetAsync` valida containment/path traversal, presença dos **três e
+   somente três** arquivos (`evidence.json`, `evidence.sha256`, `manifest.json`), sidecar SHA-256, manifesto,
+   tenant/projeto/ambiente/versão, caminho lógico e tamanho;
+5. o Portal reconcilia novamente `content_sha256`, tamanho e caminho lógico contra a âncora SQL;
+6. qualquer divergência retorna falha genérica e registra auditoria operacional;
+7. a auditoria de sucesso é persistida **antes** da entrega; falha ao auditar impede o download;
+8. os bytes validados são entregues diretamente como `application/json`/attachment, sem parse/serialização.
+
+`EvidenceHash` no SQL é o **hash semântico** da evidência. A integridade byte-a-byte do arquivo é ancorada
+por `content_sha256`, que é o valor comparado ao SHA-256 calculado pelo store.
+
+## Telas
 
 | Rota | Conteúdo |
 | --- | --- |
-| `/` | Painel: contagens de projetos, ondas, jobs (pendentes/execução/falha) e EV (Ready/Blocked/Unsupported). |
-| `/Projects` | Projetos do tenant (governança; sem segredo/conteúdo). |
-| `/Waves` | Ondas: capacidade planejada, aprovação/congelamento. |
-| `/Jobs` + `/Jobs/Details` | Fila durável: estado, tentativas, dono, erro; trilha de transições por job. |
-| `/EnterpriseVault` | Descoberta de capacidades: `Ready`/`Blocked`/`Unsupported` por ambiente, com evidência. |
-| `/Evidence` | Metadados do artefato imutável de evidência (hashes, caminho, tamanho). |
-| `/Audit` | Tentativas de autenticação **do tenant do usuário** (restrito a Auditor/Administrator). |
-| `/Export` | **Indisponível — Slice 4B** (declarado honestamente). |
-| `/Admin` | Restrito a `Administrator`: modelo de papéis e contagem de usuários. |
+| `/` | Painel inicial de projetos, ondas, jobs e resultados EV. |
+| `/Projects` | Projeto do escopo autenticado. |
+| `/Waves` | Ondas do projeto. |
+| `/Jobs` + `/Jobs/Details` | Fila durável e transições de estado no projeto. |
+| `/EnterpriseVault` | Descoberta de capacidades por ambiente. |
+| `/Evidence` | Metadados + link para download verificado de `evidence.json`. |
+| `/Evidence/Download` | Entrega autenticada, anti-IDOR e verificada do artefato imutável. |
+| `/Audit` | Autenticação do tenant + eventos operacionais do tenant/projeto (Auditor/Administrator). |
+| `/Export` | **Indisponível — Slice 4B**. |
+| `/Admin` | Restrito a `Administrator`. |
 
 ## Segurança da superfície web
 
 - **CSP restrita** (`default-src 'self'`), `X-Content-Type-Options`, `X-Frame-Options: DENY`,
-  `Referrer-Policy: no-referrer`. Página **autocontida** (CSS próprio; sem CDN, fonte ou script externo).
-- **Antiforgery** em todos os POST (login/logout).
+  `Referrer-Policy: no-referrer`; sem CDN/script externo.
+- **Antiforgery** nos POST baseados em cookie.
 - Cookie `HttpOnly`, `SameSite=Lax`, expiração deslizante de 8 h; `SecurePolicy=Always` fora de
-  desenvolvimento (em dev local, `SameAsRequest`).
-- **HTTPS obrigatório fora de desenvolvimento:** `UseHsts()` + `UseHttpsRedirection()` (fail-closed em
-  produção; desabilitado apenas no ambiente Development).
-- **Equalização de timing no login:** quando o usuário não existe, o fluxo ainda executa uma derivação
-  PBKDF2 contra um hash dummy, para não revelar por tempo a existência do login (a mensagem já é genérica).
+  desenvolvimento.
+- **HTTPS obrigatório fora de desenvolvimento:** `UseHsts()` + `UseHttpsRedirection()`.
+- **Equalização de timing no login:** usuário inexistente ainda executa derivação PBKDF2 dummy.
+- Download de evidência: `Cache-Control: no-store`, filename fixo, nenhuma entrada do cliente vira caminho
+  físico, validação fail-closed do bundle + fingerprint SQL, logs sem caminho físico/segredo.
 
-> Ainda pendentes de hardening (próximo incremento, ver PR): **rate limiting** de login, gates de
-> **SAST/DAST**, **coverage/mutation** e revisão independente.
+> Ainda pendentes de hardening: **rate limiting** de login, gates de **SAST/DAST**, **coverage/mutation** e
+> revisão independente.
 
 ## Nota sobre o dashboard
 
-O painel entrega o **read-model inicial** (contagens por projeto/onda/job e resultados EV). O **dashboard
-operacional completo** da especificação (jobs por todos os estados, tentativas/retries agregados,
-aprovações pendentes, eventos recentes) é **parcial** e será completado em incremento seguinte.
+O painel entrega o **read-model inicial**. O dashboard operacional completo da especificação (todos os
+estados, tentativas/retries agregados, aprovações pendentes e eventos recentes) permanece parcial.
 
 ## Persistência
 
-- **Migration `0014_slice4a_portal_identity.sql`** (aditiva; não altera 0001–0013): `portal_users`,
-  `portal_roles` (catálogo semeado), `portal_user_roles`, `portal_sign_in_events`, com GRANTs à identidade
-  da aplicação. As tabelas de identidade **não** estão sob a RLS por tenant — são o mecanismo que
-  estabelece o tenant do usuário; o isolamento é por privilégio e constraint.
+- **Migration `0014_slice4a_portal_identity.sql`**: identidade do portal e auditoria de autenticação.
+- **Migration `0015_slice4a_operational_audit.sql`**: trilha operacional append-only sob RLS, FK de escopo,
+  índice tenant/projeto/tempo e apenas `SELECT/INSERT` para a identidade da aplicação.
+- `ev_discovery_runs.content_sha256`, `evidence_path` e `evidence_size_bytes` continuam sendo as âncoras SQL
+  do Slice 3; o conteúdo permanece no storage imutável, não no banco.
 
 ## Provisionamento (on-premises)
 
 Um administrador inicial pode ser criado no primeiro start **se** o portal estiver vazio **e** uma senha de
-bootstrap for injetada pelo ambiente (jamais versionada). Senha vazia ⇒ bootstrap desabilitado
-(fail-closed). Migrations são um passo de implantação/CI explícito (identidade com DDL, nunca a da
-aplicação); o start pode aplicá-las opcionalmente via `ControlPlane:RunMigrationsAtStartup`.
+bootstrap for injetada pelo ambiente. A raiz do storage de evidência é configurada por
+`ControlPlane:EvidenceRoot`; caminho relativo é resolvido sob o `ContentRoot`, e implantação pode apontar
+para volume/SMB on-premises com ACL apropriada.
 
 ## Fora do escopo desta fatia
 
 Execução de `Export-EVArchive`; geração de PST; Purview; Microsoft Graph; AzCopy; ingestão no Microsoft
-365; reconciliação final; homologação real contra Enterprise Vault. Ações de **escrita** (aprovações,
-upload/validação de CSV, disparo de descoberta, gestão de usuários) entram em rodadas seguintes.
+365; reconciliação final; homologação real contra Enterprise Vault. Ações de escrita como aprovação,
+upload/validação de CSV, disparo de discovery e gestão de usuários permanecem em incrementos seguintes.
 
 ## Testes
 
-- **Unidade/SQL real:** hash de senha (round-trip, senha errada, hash adulterado, algoritmo desconhecido);
-  store de usuários (criação atômica, papéis, login duplicado e papel desconhecido recusados fail-closed);
-  auditoria de login; read-model com **isolamento por tenant** e mapeamento de descoberta EV.
-- **HTTP real (WebApplicationFactory):** host sobe (`/health/live`); página protegida redireciona ao login
-  (fail-closed); login por formulário de ponta a ponta; **RBAC** nega Administração a um Auditor e permite
-  a um Administrator; senha errada não autentica.
+- SQL real: identidade, auditoria, isolamento tenant/projeto e resolução de evidência anti-IDOR.
+- HTTP + filesystem real: download retorna **bytes exatamente iguais** aos publicados; bundle adulterado é
+  recusado; recurso de outro projeto no mesmo tenant retorna `404`; sucesso/falha de leitura são auditados.
+- O store do Slice 3 continua sendo o responsável por containment/path traversal, sidecar, manifesto,
+  hash e conjunto fechado de arquivos.
