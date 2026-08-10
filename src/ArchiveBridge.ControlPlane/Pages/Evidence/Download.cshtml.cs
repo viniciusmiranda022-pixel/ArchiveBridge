@@ -20,8 +20,7 @@ public sealed class DownloadModel(
     IEvDiscoveryEvidenceStore evidenceStore,
     IPortalOperationalAudit operationalAudit,
     IPortalScopeAccessor scopeAccessor,
-    IClock clock,
-    ILogger<DownloadModel> logger) : PageModel
+    IClock clock) : PageModel
 {
     private const string ActionCode = "evidence.download";
     private const string ResourceType = "ev-discovery-evidence";
@@ -31,7 +30,6 @@ public sealed class DownloadModel(
     private readonly IPortalOperationalAudit _operationalAudit = operationalAudit;
     private readonly IPortalScopeAccessor _scopeAccessor = scopeAccessor;
     private readonly IClock _clock = clock;
-    private readonly ILogger<DownloadModel> _logger = logger;
 
     /// <summary>Executa o download verificado.</summary>
     public async Task<IActionResult> OnGetAsync(
@@ -46,7 +44,6 @@ public sealed class DownloadModel(
 
         if (!Guid.TryParse(User.FindFirstValue(PortalClaims.UserId), out var userId))
         {
-            _logger.LogWarning("Evidence download denied: missing user claim. CorrelationId={CorrelationId}", correlationId);
             return Forbid();
         }
 
@@ -71,7 +68,6 @@ public sealed class DownloadModel(
         {
             await AuditAsync(scope, userId, username, resourceId, false, "metadata-path-mismatch", correlationId, cancellationToken)
                 .ConfigureAwait(false);
-            _logger.LogWarning("Evidence download blocked by metadata mismatch. CorrelationId={CorrelationId}", correlationId);
             return StatusCode(StatusCodes.Status409Conflict);
         }
 
@@ -88,21 +84,18 @@ public sealed class DownloadModel(
         {
             await AuditAsync(scope, userId, username, resourceId, false, "bundle-integrity-failed", correlationId, cancellationToken)
                 .ConfigureAwait(false);
-            _logger.LogWarning("Evidence download blocked by bundle integrity validation. CorrelationId={CorrelationId}", correlationId);
             return StatusCode(StatusCodes.Status409Conflict);
         }
         catch (IOException)
         {
             await AuditAsync(scope, userId, username, resourceId, false, "bundle-unavailable", correlationId, cancellationToken)
                 .ConfigureAwait(false);
-            _logger.LogWarning("Evidence download blocked because the bundle is unavailable. CorrelationId={CorrelationId}", correlationId);
             return StatusCode(StatusCodes.Status409Conflict);
         }
         catch (UnauthorizedAccessException)
         {
             await AuditAsync(scope, userId, username, resourceId, false, "bundle-access-denied", correlationId, cancellationToken)
                 .ConfigureAwait(false);
-            _logger.LogWarning("Evidence download blocked by filesystem authorization. CorrelationId={CorrelationId}", correlationId);
             return StatusCode(StatusCodes.Status409Conflict);
         }
 
@@ -119,7 +112,6 @@ public sealed class DownloadModel(
         {
             await AuditAsync(scope, userId, username, resourceId, false, "sql-bundle-fingerprint-mismatch", correlationId, cancellationToken)
                 .ConfigureAwait(false);
-            _logger.LogWarning("Evidence download blocked by SQL/bundle fingerprint mismatch. CorrelationId={CorrelationId}", correlationId);
             return StatusCode(StatusCodes.Status409Conflict);
         }
 
