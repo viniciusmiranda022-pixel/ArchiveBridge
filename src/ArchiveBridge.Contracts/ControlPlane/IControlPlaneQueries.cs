@@ -2,7 +2,7 @@ using ArchiveBridge.Contracts.Jobs;
 
 namespace ArchiveBridge.Contracts.ControlPlane;
 
-/// <summary>Contagens agregadas para o painel operacional (todas dentro do tenant do usuário, sob RLS).</summary>
+/// <summary>Contagens agregadas para o painel operacional (todas dentro do tenant/projeto do usuário).</summary>
 public sealed record DashboardSummary(
     int Projects,
     int Waves,
@@ -71,7 +71,10 @@ public sealed record EvEnvironmentSummary(
     string DirectoryServer,
     EvDiscoverySummary? LatestDiscovery);
 
-/// <summary>Metadados da descoberta (nunca a evidência bruta): versão, resultado, adapter e ponteiros de evidência.</summary>
+/// <summary>
+/// Metadados da descoberta (nunca a evidência bruta). <see cref="EvidenceHash"/> é o hash SEMÂNTICO da
+/// evidência; <see cref="ContentSha256"/> é o SHA-256 dos bytes exatos de <c>evidence.json</c>.
+/// </summary>
 public sealed record EvDiscoverySummary(
     int DiscoveryVersion,
     string Status,
@@ -82,34 +85,55 @@ public sealed record EvDiscoverySummary(
     string ObservedVersion,
     string ConfigurationHash,
     string EvidenceHash,
+    string ContentSha256,
     string EvidencePath,
     long EvidenceSizeBytes,
     DateTimeOffset CompletedAtUtc);
 
 /// <summary>
+/// Âncora autoritativa para um download de evidência. Só é retornada quando ambiente+versão pertencem ao
+/// tenant/projeto autenticado e a execução já saiu dos estados de reserva/execução. O conteúdo NÃO vem do SQL.
+/// </summary>
+public sealed record EvEvidenceDownloadMetadata(
+    Guid EnvironmentId,
+    int DiscoveryVersion,
+    string ContentSha256,
+    string EvidencePath,
+    long EvidenceSizeBytes);
+
+/// <summary>
 /// Read-model do plano de controle: consultas de LEITURA que sustentam o portal operacional. Toda consulta
-/// carrega o <see cref="TenantScope"/> do usuário autenticado e executa sob a RLS por tenant (o cliente
-/// nunca fornece tenant como autorização). Expõe apenas projeções leves de governança/observabilidade —
-/// jamais segredo, SAS, token, PST ou evidência bruta. Não dispara nenhuma execução (Export-EVArchive,
-/// Purview, Graph, AzCopy etc. permanecem fora deste slice).
+/// carrega o <see cref="TenantScope"/> do usuário autenticado, executa sob a RLS por tenant e filtra o projeto
+/// explicitamente. Expõe apenas projeções leves de governança/observabilidade — jamais segredo, SAS, token,
+/// PST ou evidência bruta. Não dispara nenhuma execução (Export-EVArchive, Purview, Graph, AzCopy etc.).
 /// </summary>
 public interface IControlPlaneQueries
 {
-    /// <summary>Contagens agregadas do painel dentro do tenant do escopo.</summary>
+    /// <summary>Contagens agregadas do painel dentro do tenant/projeto do escopo.</summary>
     Task<DashboardSummary> GetDashboardAsync(TenantScope scope, CancellationToken cancellationToken);
 
-    /// <summary>Projetos do tenant (ordenados por nome).</summary>
+    /// <summary>Projeto do escopo autenticado.</summary>
     Task<IReadOnlyList<ProjectSummary>> ListProjectsAsync(TenantScope scope, CancellationToken cancellationToken);
 
-    /// <summary>Ondas do tenant (ordenadas por criação decrescente), limitadas a <paramref name="max"/>.</summary>
+    /// <summary>Ondas do projeto autenticado, limitadas a <paramref name="max"/>.</summary>
     Task<IReadOnlyList<WaveSummary>> ListWavesAsync(TenantScope scope, int max, CancellationToken cancellationToken);
 
-    /// <summary>Jobs do tenant (ordenados por atualização decrescente), limitados a <paramref name="max"/>.</summary>
+    /// <summary>Jobs do projeto autenticado, limitados a <paramref name="max"/>.</summary>
     Task<IReadOnlyList<JobSummary>> ListJobsAsync(TenantScope scope, int max, CancellationToken cancellationToken);
 
-    /// <summary>Transições de um job dentro do escopo (ordem cronológica); vazio se inexistente/cross-tenant.</summary>
+    /// <summary>Transições de um job dentro do escopo; vazio se inexistente/cross-tenant/cross-project.</summary>
     Task<IReadOnlyList<JobTransitionView>> ListJobTransitionsAsync(TenantScope scope, Guid jobId, CancellationToken cancellationToken);
 
-    /// <summary>Ambientes EV do tenant com sua descoberta utilizável mais recente (ordenados por site).</summary>
+    /// <summary>Ambientes EV do projeto autenticado com sua descoberta utilizável mais recente.</summary>
     Task<IReadOnlyList<EvEnvironmentSummary>> ListEvEnvironmentsAsync(TenantScope scope, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Resolve os metadados autoritativos de uma evidência por ambiente/versão no escopo autenticado.
+    /// Retorna <see langword="null"/> para inexistente, cross-tenant ou cross-project (anti-IDOR).
+    /// </summary>
+    Task<EvEvidenceDownloadMetadata?> GetEvEvidenceAsync(
+        TenantScope scope,
+        Guid environmentId,
+        int discoveryVersion,
+        CancellationToken cancellationToken);
 }
