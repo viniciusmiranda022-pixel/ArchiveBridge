@@ -127,8 +127,8 @@ public sealed class DownloadModel(
         await AuditAsync(scope, userId, username, resourceId, true, "verified", correlationId, cancellationToken)
             .ConfigureAwait(false);
 
-        Response.Headers.CacheControl = "no-store";
-        Response.Headers.Pragma = "no-cache";
+        Response.Headers["Cache-Control"] = "no-store";
+        Response.Headers["Pragma"] = "no-cache";
         return File(content.Bytes.ToArray(), "application/json", "evidence.json");
     }
 
