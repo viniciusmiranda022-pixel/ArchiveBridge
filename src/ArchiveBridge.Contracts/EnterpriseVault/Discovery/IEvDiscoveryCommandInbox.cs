@@ -51,6 +51,17 @@ public interface IEvDiscoveryCommandInbox
     Task<JobId> EnqueueAsync(EvDiscoveryCommand command, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Enfileira de forma IDEMPOTENTE sob a chave informada. Na MESMA transação, procura a chave sob lock
+    /// (UPDLOCK/HOLDLOCK) dentro do tenant/projeto; se já existir com o MESMO comando, devolve o Job existente
+    /// (replay) sem criar nada; se existir com comando DIFERENTE, lança
+    /// <see cref="EvDiscoveryIdempotencyConflictException"/>; caso contrário cria Job + contexto atomicamente.
+    /// O índice único filtrado <c>(tenant_id, project_id, idempotency_key)</c> é o backstop SQL contra corrida:
+    /// duas requisições concorrentes com a mesma chave resultam em EXATAMENTE um Job e um comando.
+    /// </summary>
+    Task<EvDiscoveryEnqueueResult> EnqueueIdempotentAsync(
+        EvDiscoveryCommand command, Guid idempotencyKey, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Reivindica o próximo comando de descoberta elegível do escopo (Job EnterpriseVault com contexto) e
     /// carrega o comando; <see langword="null"/> quando não há trabalho.
     /// </summary>
