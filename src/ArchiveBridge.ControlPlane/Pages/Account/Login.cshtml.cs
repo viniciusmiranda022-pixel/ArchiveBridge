@@ -79,6 +79,7 @@ public sealed class LoginModel(
         var claims = new List<Claim>
         {
             new(ClaimTypes.Name, user.Username),
+            new(PortalClaims.UserId, user.UserId.ToString()),
             new(PortalClaims.DisplayName, user.DisplayName),
             new(PortalClaims.TenantId, user.Tenant.Value.ToString()),
             new(PortalClaims.ProjectId, user.Project.Value.ToString()),
