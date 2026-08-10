@@ -10,26 +10,30 @@
 <h1>Evidências de descoberta</h1>
 <p class="lead">
     Metadados do artefato imutável de evidência (<span class="mono">evidence.json</span>): hashes autoritativos,
-    caminho lógico e tamanho. O read-model nunca expõe a evidência bruta.
+    caminho lógico e tamanho. O read-model nunca expõe a evidência bruta diretamente.
 </p>
 
 <div class="notice">
-    <strong>Download pelo portal na próxima rodada.</strong> O artefato imutável
-    (<span class="mono">evidence.json + evidence.sha256 + manifest.json</span>) reside no armazenamento
-    on-premises no caminho lógico indicado abaixo. O streaming autenticado pelo portal entra na rodada
-    seguinte; até lá, o <span class="mono">SHA-256</span> aqui publicado permite conferir a integridade.
+    <strong>Download verificado habilitado.</strong> Antes de entregar <span class="mono">evidence.json</span>,
+    o portal resolve a evidência no tenant/projeto autenticado, valida o bundle imutável
+    (<span class="mono">evidence.json + evidence.sha256 + manifest.json</span>), confere caminho lógico,
+    tamanho e SHA-256 dos bytes contra o SQL e registra a leitura na trilha operacional. Qualquer divergência
+    bloqueia o download; os bytes do JSON nunca são reserializados.
 </div>
 
 @if (withEvidence.Count == 0)
 {
-    <p class="empty">Nenhuma evidência de descoberta registrada neste tenant.</p>
+    <p class="empty">Nenhuma evidência de descoberta registrada neste projeto.</p>
 }
 else
 {
     <div class="tablewrap">
         <table>
             <thead>
-                <tr><th>Site</th><th>Versão</th><th>Resultado</th><th>Config. hash</th><th>Evidência (SHA-256)</th><th>Caminho lógico</th><th>Tamanho</th></tr>
+                <tr>
+                    <th>Site</th><th>Versão</th><th>Resultado</th><th>Config. hash</th>
+                    <th>Hash semântico</th><th>SHA-256 do arquivo</th><th>Caminho lógico</th><th>Tamanho</th><th>Ação</th>
+                </tr>
             </thead>
             <tbody>
                 @foreach (var e in withEvidence)
@@ -41,8 +45,14 @@ else
                         <td>@disc.ResultStatus</td>
                         <td class="mono">@disc.ConfigurationHash[..Math.Min(16, disc.ConfigurationHash.Length)]…</td>
                         <td class="mono">@disc.EvidenceHash</td>
+                        <td class="mono">@disc.ContentSha256</td>
                         <td class="mono">@disc.EvidencePath</td>
                         <td>@disc.EvidenceSizeBytes.ToString("N0") B</td>
+                        <td>
+                            <a asp-page="/Evidence/Download"
+                               asp-route-environmentId="@e.EnvironmentId"
+                               asp-route-version="@disc.DiscoveryVersion">Baixar evidence.json</a>
+                        </td>
                     </tr>
                 }
             </tbody>
