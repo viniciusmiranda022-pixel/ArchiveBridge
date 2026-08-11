@@ -99,11 +99,13 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
 
     // Procura a chave de idempotência sob lock de RANGE (UPDLOCK+HOLDLOCK): serializa concorrentes com a
     // mesma chave dentro do tenant/projeto, de modo que a segunda transação enxergue a linha da primeira.
+    // Carrega TAMBÉM site_name/directory_server: fazem parte do alvo operacional efetivamente persistido e
+    // entram na equivalência do comando (uma chave antiga não pode reaproveitar um Job de outro alvo).
     private const string LookupIdempotentSql =
         """
         SET NOCOUNT ON;
         SELECT job_id, environment_id, command_schema_version, expected_project_configuration_version,
-               expected_configuration_hash, discovery_policy_version
+               expected_configuration_hash, discovery_policy_version, site_name, directory_server
         FROM dbo.ev_discovery_commands WITH (UPDLOCK, HOLDLOCK)
         WHERE tenant_id = @tenant AND project_id = @project AND idempotency_key = @key;
         """;
@@ -188,6 +190,13 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
         EvDiscoveryCommand command, Guid idempotencyKey, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(command);
+        // Fail-closed na borda de infraestrutura (não só no caso de uso): uma chave vazia é rejeitada ANTES
+        // de abrir conexão/transação — nenhuma escrita ocorre.
+        if (idempotencyKey == Guid.Empty)
+        {
+            throw new ArgumentException("A chave de idempotência é obrigatória.", nameof(idempotencyKey));
+        }
+
         EvDiscoveryCommandValidation.EnsureValid(command);
         var now = SqlJobMapping.ToDbUtc(_clock.UtcNow);
         var scope = command.Scope;
@@ -337,9 +346,13 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
 
         return new ExistingCommand(
             reader.GetGuid(0), reader.GetGuid(1), reader.GetInt32(2), reader.GetInt32(3),
-            reader.GetString(4).TrimEnd(), reader.GetInt32(5));
+            reader.GetString(4).TrimEnd(), reader.GetInt32(5), reader.GetString(6), reader.GetString(7));
     }
 
+    // A equivalência cobre TODO o alvo operacional efetivamente persistido/executado: ambiente, schema,
+    // versão/hash de configuração, versão da política E o alvo de rede (site_name/directory_server). Não
+    // inclui correlation_id (muda por request) nem requested_by (é o solicitante, não o alvo). Comparação
+    // de texto Ordinal. Divergência ⇒ conflito (uma chave antiga não reaproveita um Job de outro alvo).
     private static void EnsureSameCommand(ExistingCommand existing, EvDiscoveryCommand command)
     {
         var context = command.Context;
@@ -347,7 +360,9 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
             && existing.SchemaVersion == context.SchemaVersion
             && existing.ExpectedProjectConfigurationVersion == context.ExpectedProjectConfigurationVersion
             && string.Equals(existing.ExpectedConfigurationHash, context.ExpectedConfigurationHash?.Value, StringComparison.Ordinal)
-            && existing.DiscoveryPolicyVersion == context.DiscoveryPolicyVersion;
+            && existing.DiscoveryPolicyVersion == context.DiscoveryPolicyVersion
+            && string.Equals(existing.SiteName, command.SiteName, StringComparison.Ordinal)
+            && string.Equals(existing.DirectoryServer, command.DirectoryServer, StringComparison.Ordinal);
         if (!same)
         {
             throw new EvDiscoveryIdempotencyConflictException(
@@ -361,5 +376,7 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
         int SchemaVersion,
         int ExpectedProjectConfigurationVersion,
         string ExpectedConfigurationHash,
-        int DiscoveryPolicyVersion);
+        int DiscoveryPolicyVersion,
+        string SiteName,
+        string DirectoryServer);
 }

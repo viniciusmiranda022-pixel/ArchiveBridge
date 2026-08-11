@@ -55,6 +55,56 @@ public sealed class Slice4aEvDiscoveryRequestTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task SameKeyAfterEnvironmentTargetChangeConflicts()
+    {
+        var inbox = new SqlEvDiscoveryCommandInbox(_fixture.Factory, Clock);
+        var scope = SqlServerFixture.NewScope();
+        var key = Guid.NewGuid();
+        var environmentId = Guid.NewGuid();
+
+        // Mesmo tenant/projeto/ambiente/versão-hash de config/política, porém o DirectoryServer do alvo mudou
+        // no cadastro do ambiente: reaproveitar a chave apontaria para um alvo operacional DIFERENTE.
+        await inbox.EnqueueIdempotentAsync(
+            BuildCommand(scope, environmentId, directory: "dir-a.contoso.local"), key, CancellationToken.None);
+        await Assert.ThrowsAsync<EvDiscoveryIdempotencyConflictException>(() => inbox.EnqueueIdempotentAsync(
+            BuildCommand(scope, environmentId, directory: "dir-b.contoso.local"), key, CancellationToken.None));
+
+        Assert.Equal(1, await CountJobsAsync(scope));         // o conflito NÃO cria um segundo Job
+        Assert.Equal(1, await CountCommandsAsync(scope, key)); // exatamente um comando
+    }
+
+    [Fact]
+    public async Task SameKeyAfterSiteNameChangeConflicts()
+    {
+        var inbox = new SqlEvDiscoveryCommandInbox(_fixture.Factory, Clock);
+        var scope = SqlServerFixture.NewScope();
+        var key = Guid.NewGuid();
+        var environmentId = Guid.NewGuid();
+
+        // O SiteName também faz parte do alvo persistido/executado: uma mudança conflita, não reaproveita.
+        await inbox.EnqueueIdempotentAsync(
+            BuildCommand(scope, environmentId, site: "site-a"), key, CancellationToken.None);
+        await Assert.ThrowsAsync<EvDiscoveryIdempotencyConflictException>(() => inbox.EnqueueIdempotentAsync(
+            BuildCommand(scope, environmentId, site: "site-b"), key, CancellationToken.None));
+
+        Assert.Equal(1, await CountJobsAsync(scope));
+        Assert.Equal(1, await CountCommandsAsync(scope, key));
+    }
+
+    [Fact]
+    public async Task EmptyIdempotencyKeyIsRejectedWithoutWrite()
+    {
+        var inbox = new SqlEvDiscoveryCommandInbox(_fixture.Factory, Clock);
+        var scope = SqlServerFixture.NewScope();
+
+        // Guid.Empty é recusado na própria borda de infraestrutura, antes de qualquer escrita.
+        await Assert.ThrowsAsync<ArgumentException>(() => inbox.EnqueueIdempotentAsync(
+            BuildCommand(scope, Guid.NewGuid()), Guid.Empty, CancellationToken.None));
+
+        Assert.Equal(0, await CountJobsAsync(scope)); // nenhuma escrita ocorreu
+    }
+
+    [Fact]
     public async Task ConcurrentSameKeyProducesExactlyOneJob()
     {
         var inbox = new SqlEvDiscoveryCommandInbox(_fixture.Factory, Clock);
@@ -90,12 +140,13 @@ public sealed class Slice4aEvDiscoveryRequestTests(SqlServerFixture fixture)
         Assert.Null(await catalog.GetAsync(otherTenant, environmentId, CancellationToken.None)); // cross-tenant
     }
 
-    private static EvDiscoveryCommand BuildCommand(TenantScope scope, Guid environmentId) =>
+    private static EvDiscoveryCommand BuildCommand(
+        TenantScope scope, Guid environmentId, string site = "site-a", string directory = "dir-a.contoso.local") =>
         new(
             scope,
             new EvEnvironmentId(environmentId),
-            "site-a",
-            "dir-a.contoso.local",
+            site,
+            directory,
             "operator@contoso.local",
             CorrelationId.New(),
             new EvDiscoveryCommandContext(
