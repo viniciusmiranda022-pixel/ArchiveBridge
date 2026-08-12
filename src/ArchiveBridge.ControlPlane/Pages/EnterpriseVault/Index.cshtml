@@ -1,6 +1,5 @@
 @page
-@inject IControlPlaneQueries Queries
-@inject IPortalScopeAccessor ScopeAccessor
+@model ArchiveBridge.ControlPlane.Pages.EnterpriseVault.IndexModel
 @functions {
     static string PillClass(string? resultStatus) => resultStatus switch
     {
@@ -13,8 +12,6 @@
 }
 @{
     ViewData["Title"] = "Enterprise Vault";
-    var scope = ScopeAccessor.Resolve(User);
-    var environments = await Queries.ListEvEnvironmentsAsync(scope, HttpContext.RequestAborted);
 }
 <h1>Enterprise Vault — descoberta de capacidades</h1>
 <p class="lead">
@@ -23,12 +20,30 @@
     <strong>READ-ONLY</strong>: nenhuma exportação é executada.
 </p>
 
-<div class="notice">
-    <strong>Disparo de descoberta indisponível nesta rodada.</strong> O portal exibe os resultados já
-    registrados; enfileirar uma nova descoberta é uma ação de escrita que entra em rodada seguinte.
-</div>
+@if (!Model.DiscoveryEnabled)
+{
+    <div class="notice">
+        <strong>Discovery indisponível neste deployment.</strong> A solicitação de novas descobertas está
+        desabilitada por configuração; o portal exibe apenas os resultados já registrados.
+    </div>
+}
+else if (!Model.CanRequestDiscovery)
+{
+    <div class="notice">
+        Você tem acesso de <strong>leitura</strong> aos resultados. Solicitar uma nova descoberta requer o
+        papel <strong>Operator</strong> ou <strong>Administrator</strong>.
+    </div>
+}
+else
+{
+    <div class="notice">
+        Solicitar uma descoberta apenas <strong>descobre capacidades</strong> (READ-ONLY) de forma assíncrona:
+        um Job durável é enfileirado e processado depois pelo Worker EV. <strong>Não executa Export-EVArchive
+        e não exporta dados.</strong>
+    </div>
+}
 
-@if (environments.Count == 0)
+@if (Model.Environments.Count == 0)
 {
     <p class="empty">Nenhum ambiente Enterprise Vault neste tenant.</p>
 }
@@ -37,11 +52,12 @@ else
     <div class="tablewrap">
         <table>
             <thead>
-                <tr><th>Site</th><th>Directory Server</th><th>Resultado</th><th>Versão desc.</th><th>Adapter</th><th>Versão observada</th><th>Evidência (SHA-256)</th><th>Tamanho</th><th>Concluída (UTC)</th></tr>
+                <tr><th>Site</th><th>Directory Server</th><th>Resultado</th><th>Versão desc.</th><th>Adapter</th><th>Versão observada</th><th>Evidência (SHA-256)</th><th>Tamanho</th><th>Concluída (UTC)</th>@if (Model.CanRequestDiscovery){<th>Ação</th>}</tr>
             </thead>
             <tbody>
-                @foreach (var e in environments)
+                @foreach (var row in Model.Environments)
                 {
+                    var e = row.Summary;
                     <tr>
                         <td>@e.SiteName</td>
                         <td class="mono">@e.DirectoryServer</td>
@@ -60,9 +76,25 @@ else
                             <td><span class="pill">sem descoberta</span></td>
                             <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
                         }
+                        @if (Model.CanRequestDiscovery)
+                        {
+                            <td>
+                                <form method="post" asp-page-handler="RequestDiscovery">
+                                    <input type="hidden" name="EnvironmentId" value="@e.EnvironmentId" />
+                                    <input type="hidden" name="IdempotencyKey" value="@row.IdempotencyKey" />
+                                    <button type="submit" class="btn">Executar discovery READ-ONLY</button>
+                                </form>
+                            </td>
+                        }
                     </tr>
                 }
             </tbody>
         </table>
     </div>
+    @if (Model.CanRequestDiscovery)
+    {
+        <p class="empty">
+            Esta operação apenas descobre capacidades. Não executa Export-EVArchive e não exporta dados.
+        </p>
+    }
 }

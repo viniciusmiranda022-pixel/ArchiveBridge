@@ -4,13 +4,16 @@
 // sem comunicação externa além das integrações explicitamente configuradas. Esta fatia entrega apenas
 // LEITURA (observabilidade de projetos, ondas, jobs, descoberta EV e evidências) sob autenticação e RBAC;
 // nenhuma capacidade do Slice 4B (exportação, PST, Purview, Graph, AzCopy) é executada nem simulada.
+using ArchiveBridge.Application.EnterpriseVault.Discovery;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
 using ArchiveBridge.ControlPlane.Composition;
+using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 using ArchiveBridge.Infrastructure.ControlPlane;
 using ArchiveBridge.Infrastructure.EnterpriseVault.Discovery;
 using ArchiveBridge.Infrastructure.Persistence;
+using ArchiveBridge.Infrastructure.Projects;
 using ArchiveBridge.Infrastructure.Time;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
@@ -42,6 +45,27 @@ builder.Services.AddScoped<IPortalSignInAudit>(_ => new SqlPortalSignInAudit(app
 builder.Services.AddScoped<IPortalOperationalAudit>(_ => new SqlPortalOperationalAudit(connectionFactory));
 builder.Services.AddScoped<IControlPlaneQueries>(_ => new SqlControlPlaneQueries(connectionFactory));
 
+// Feature gate LOCAL do Portal para a superfície de SOLICITAÇÃO de descoberta (default fail-closed = false).
+// Deliberadamente uma opção do Control Plane — sem dependência de ArchiveBridge.Workers.Ev.
+var discoveryPortalOptions =
+    builder.Configuration.GetSection(EnterpriseVaultDiscoveryPortalOptions.SectionName)
+        .Get<EnterpriseVaultDiscoveryPortalOptions>() ?? new EnterpriseVaultDiscoveryPortalOptions();
+builder.Services.AddSingleton(discoveryPortalOptions);
+
+// Caso de uso de SOLICITAÇÃO de descoberta READ-ONLY: resolve o contexto autoritativo server-side (site/
+// directory, versão/hash de configuração do projeto, versão da política) e ENFILEIRA de forma durável e
+// idempotente — NÃO executa descoberta. Usa a identidade da APLICAÇÃO (OpenForTenantAsync + RLS + filtro por
+// projeto); a identidade de manutenção NUNCA participa do POST.
+builder.Services.AddScoped(serviceProvider =>
+{
+    var clock = serviceProvider.GetRequiredService<IClock>();
+    return new RequestEvCapabilityDiscoveryUseCase(
+        new SqlEvEnvironmentCatalog(connectionFactory),
+        new SqlProjectStore(connectionFactory, clock),
+        new SqlEvDiscoveryCommandInbox(connectionFactory, clock),
+        EvDiscoveryPolicy.Default);
+});
+
 builder.Services
     .AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
     .AddCookie(cookie =>
@@ -67,6 +91,11 @@ builder.Services.AddAuthorization(authorization =>
     authorization.AddPolicy("Administrator", policy => policy.RequireRole(PortalRoles.Administrator));
     // A trilha de auditoria é sensível: restrita a quem tem mandato de auditoria/administração.
     authorization.AddPolicy("AuditReaders", policy => policy.RequireRole(PortalRoles.Auditor, PortalRoles.Administrator));
+    // Ação de ESCRITA (solicitar descoberta EV): apenas Operator/Administrator. Não protege a PÁGINA
+    // /EnterpriseVault (que continua legível pelos papéis de leitura) — protege o handler POST, autorizado
+    // server-side via IAuthorizationService, para que uma tentativa negada seja bloqueada E auditada.
+    authorization.AddPolicy(
+        "EvDiscoveryOperators", policy => policy.RequireRole(PortalRoles.Operator, PortalRoles.Administrator));
 });
 
 builder.Services.AddRazorPages(razor =>

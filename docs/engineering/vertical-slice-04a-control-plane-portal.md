@@ -266,11 +266,21 @@ Endpoints mutáveis devem exigir proteção contra CSRF quando aplicável, auten
 1. Contratos do Control Plane, autenticação e isolamento.
 2. Read models para dashboard, projetos, ondas e jobs.
 3. Portal navegável e estados indisponíveis explícitos.
-4. Integração com discovery EV do Slice 3.
+4. Integração com discovery EV do Slice 3 — **solicitação autorizada e durável** (ver abaixo).
 5. Evidências, download verificado e auditoria.
 6. Validação segura de CSV.
 7. Retry autorizado e idempotente.
 8. Hardening, testes de segurança, documentação e empacotamento on-premises.
+
+### Stage 4 — Solicitação autorizada de descoberta EV (write-path)
+
+O passo 4 é entregue como uma **solicitação assíncrona e durável**: o POST autenticado
+(`EvDiscoveryOperators` = Operator/Administrator, protegido server-side; antiforgery ativo) resolve o escopo
+a partir do principal, resolve site/directory/versão/hash/política **server-side** e enfileira um Job durável
+idempotente via `RequestEvCapabilityDiscoveryUseCase`. O **processo web nunca executa a descoberta** — quem
+executa é o Worker EV, mais tarde. Um feature gate local (`EnterpriseVaultDiscovery:Enabled`, default `false`)
+controla se o Portal pode solicitar. Detalhes do contrato HTTP e do threat-model delta em
+`docs/control-plane/slice-04a-control-plane-portal.md`.
 
 ## Regra de encerramento
 

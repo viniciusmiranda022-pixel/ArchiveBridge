@@ -138,11 +138,74 @@ bootstrap for injetada pelo ambiente. A raiz do storage de evidência é configu
 `ControlPlane:EvidenceRoot`; caminho relativo é resolvido sob o `ContentRoot`, e implantação pode apontar
 para volume/SMB on-premises com ACL apropriada.
 
+## Stage 4 — Solicitação autorizada de descoberta EV (primeira ação de escrita)
+
+A primeira ação de **escrita** do Portal: um usuário autenticado e autorizado SOLICITA uma descoberta EV
+READ-ONLY. O HTTP **não executa descoberta** — apenas resolve o escopo autenticado e chama
+`RequestEvCapabilityDiscoveryUseCase`, que enfileira um Job durável idempotente. O Worker EV (fora do
+processo web) processa depois. O caminho:
+
+```
+POST /EnterpriseVault?handler=RequestDiscovery
+  → fallback policy (autenticado) + antiforgery (Razor Pages)
+  → UserId (PortalClaims.UserId) válido? senão 403
+  → TenantScope = IPortalScopeAccessor.Resolve(User)   (nunca do formulário)
+  → feature gate do deployment habilitado? senão 503 (audit feature-disabled)
+  → IAuthorizationService.AuthorizeAsync("EvDiscoveryOperators")  → 403 + audit forbidden se negado
+  → EnvironmentId/IdempotencyKey GUID não vazios? senão 400
+  → RequestEvCapabilityDiscoveryUseCase.ExecuteAsync(scope, env, RequestedBy=User.Identity.Name, key, correlation-server)
+        · ambiente resolvido no SQL sob o escopo (fora do escopo ⇒ 404 anti-IDOR)
+        · site/directory, versão/hash de configuração e versão da política resolvidos server-side
+        · enqueue durável idempotente (índice único filtrado como backstop)
+  → audit accepted|idempotent-replay (ANTES do redirect; falha ⇒ 500 fail-closed)
+  → PRG 302 → /Jobs/Details?jobId=…
+```
+
+Entradas aceitas do navegador: **somente** `EnvironmentId` e `IdempotencyKey`. Tenant/projeto vêm do
+principal; `RequestedBy` é `User.Identity.Name`; o `CorrelationId` é criado no servidor. Campos extras do
+formulário (TenantId, ProjectId, SiteName, DirectoryServer, ConfigurationVersion/Hash, DiscoveryPolicyVersion,
+RequestedBy, CorrelationId, JobId, Role) **não são vinculados**. A policy `EvDiscoveryOperators`
+(Operator/Administrator) protege a **ação POST** via `IAuthorizationService` — não a página, que continua
+legível pelos papéis de leitura. O gate é uma opção **local** do Control Plane
+(`EnterpriseVaultDiscoveryPortalOptions`, seção `EnterpriseVaultDiscovery`, default `Enabled=false`), sem
+dependência de projeto `ControlPlane → Workers.Ev`.
+
+### Contrato HTTP
+
+`302 → /Jobs/Details` (accepted/replay) · `400` (input inválido / antiforgery inválido) · `403` (papel não
+autorizado / principal inválido) · `404` (ambiente inexistente/fora do escopo) · `409` (conflito de
+idempotência) · `503` (gate desabilitado) · `500` (falha inesperada / auditoria obrigatória falhou).
+
+### Threat-model delta (write-path)
+
+| Ameaça | Controle |
+| --- | --- |
+| CSRF | antiforgery Razor Pages (token+cookie); POST sem token ⇒ 400 |
+| IDOR (ambiente de outro projeto/tenant) | catálogo resolve só no escopo; `404` indistinguível; audit `not-found-or-not-authorized` |
+| Escalonamento de papel | `EvDiscoveryOperators` server-side; POST manual de Viewer/Auditor/Approver ⇒ 403 + audit `forbidden` |
+| Substituição de tenant/projeto | escopo derivado só do principal (`IPortalScopeAccessor`) |
+| Substituição do contexto do comando | site/directory/versão/hash/política resolvidos server-side; campos do formulário ignorados |
+| Double-submit / retry | idempotency key por formulário (estável no GET) ⇒ replay, 1 Job |
+| Conflito de idempotência | mesma chave + comando diferente ⇒ `409` + audit `idempotency-conflict`; nenhum Job novo |
+| Perda de auditoria | auditoria de resultado ANTES do redirect; falha ⇒ `500` fail-closed; Job durável permanece; retry com a mesma chave devolve o mesmo Job |
+| Execução de discovery inline | proibida no processo web; só `RequestEvCapabilityDiscoveryUseCase`; teste arquitetural garante ausência de processor/host/PowerShell |
+| Bypass do feature gate | gate `Enabled=false` ⇒ nenhum Job, `503`, audit `feature-disabled` (mesmo para usuário autorizado) |
+
+**Risco residual:** o enqueue durável e a trilha operacional **não compartilham uma transação distribuída**.
+Se a auditoria de sucesso falhar após o enqueue, respondemos `500` (fail-closed) sem compensação destrutiva;
+o Job permanece e o retry com a mesma chave de idempotência é seguro (devolve o mesmo Job).
+
+Eventos operacionais (`ev.discovery.request`): `accepted`, `idempotent-replay`, `idempotency-conflict`,
+`not-found-or-not-authorized`, `forbidden`, `feature-disabled`, `invalid-input`. Nunca são auditados
+site, directory server, hash de configuração, PowerShell, stdout/stderr, evidência, senha, token ou cookie.
+
 ## Fora do escopo desta fatia
 
 Execução de `Export-EVArchive`; geração de PST; Purview; Microsoft Graph; AzCopy; ingestão no Microsoft
-365; reconciliação final; homologação real contra Enterprise Vault. Ações de escrita como aprovação,
-upload/validação de CSV, disparo de discovery e gestão de usuários permanecem em incrementos seguintes.
+365; reconciliação final; homologação real contra Enterprise Vault (`LaboratoryValidated` permanece
+`false`). Ações de escrita como aprovação, upload/validação de CSV, retry autorizado e gestão de usuários
+permanecem em incrementos seguintes. **O disparo de descoberta passou a ser suportado como SOLICITAÇÃO
+durável (Stage 4) — o processo web nunca executa a descoberta.**
 
 ## Testes
 
