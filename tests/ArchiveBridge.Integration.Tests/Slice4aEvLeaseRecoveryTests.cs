@@ -22,6 +22,10 @@ namespace ArchiveBridge.Integration.Tests;
 public sealed class Slice4aEvLeaseRecoveryTests(SqlServerFixture fixture)
 {
     private static readonly TimeSpan Lease = TimeSpan.FromMinutes(5);
+
+    // Lote amplo usado só na drenagem de isolamento (limpar resquícios de testes anteriores da coleção).
+    private const int EvDrainBatchSize = 1000;
+
     private readonly SqlServerFixture _fixture = fixture;
 
     [Fact]
@@ -85,13 +89,24 @@ public sealed class Slice4aEvLeaseRecoveryTests(SqlServerFixture fixture)
         var store = _fixture.Store(clock);
         var worker = new WorkerId("worker");
 
-        // Job EnterpriseVault: enfileira e reivindica ⇒ Processing.
+        // Isolamento DETERMINÍSTICO. O reaper é GLOBAL por workload (identidade de manutenção, cross-tenant),
+        // e a coleção de integração compartilha um único banco: qualquer Job EV deixado em Processing/expirado
+        // por outro teste contaria no total. Antes de montar o cenário, drenamos esses resquícios — avançamos
+        // bem à frente (todo lease pré-existente fica expirado) e recuperamos até esgotar. A partir daqui, o
+        // ÚNICO Job EV Processing/expirado no banco será o que este teste cria, tornando a contagem exata.
+        clock.Advance(TimeSpan.FromDays(365));
+        while (await leaseManager.RecoverExpiredLeasesAsync(
+                   Workload.EnterpriseVault, EvDrainBatchSize, CancellationToken.None) > 0)
+        {
+            // drena lotes até não restar nenhum Job EV Processing/expirado de testes anteriores
+        }
+
+        // Cenário: EXATAMENTE 1 Job EnterpriseVault + 1 Job de OUTRO workload (Pst), ambos Processing.
         var evScope = SqlServerFixture.NewScope();
         await inbox.EnqueueAsync(BuildCommand(evScope), CancellationToken.None);
         var evClaim = await inbox.TryClaimNextAsync(evScope, worker, Lease, CorrelationId.New(), CancellationToken.None);
         Assert.NotNull(evClaim);
 
-        // Job de OUTRO workload (Pst): cria e reivindica ⇒ Processing.
         var pstScope = SqlServerFixture.NewScope();
         var pstJob = await store.CreateAsync(
             new CreateJobCommand(pstScope, Workload.Pst, JobPriority.Normal, CorrelationId.New()), CancellationToken.None);
@@ -101,13 +116,14 @@ public sealed class Slice4aEvLeaseRecoveryTests(SqlServerFixture fixture)
 
         clock.Advance(Lease + TimeSpan.FromMinutes(1)); // ambos os leases expiram
         var recovered = await leaseManager.RecoverExpiredLeasesAsync(Workload.EnterpriseVault, 64, CancellationToken.None);
-        Assert.True(recovered >= 1);
 
-        // O Job EV foi recuperado; o de OUTRO workload continua Processing (não tocado pelo reaper EV).
-        Assert.Equal(2, (await ReadJobAsync(evScope, evClaim!.Job.JobId.Value)).State);   // RetryScheduled
+        // EXATAMENTE 1 recuperado: só o Job EV. O de OUTRO workload continua Processing (não tocado pelo reaper EV).
+        Assert.Equal(1, recovered);
+        Assert.NotEqual(1, (await ReadJobAsync(evScope, evClaim!.Job.JobId.Value)).State); // EV Job != Processing
         var pst = await ReadJobAsync(pstScope, pstJob.Value);
         Assert.Equal(1, pst.State);                 // ainda Processing
         Assert.NotNull(pst.OwnerWorker);            // owner preservado
+        Assert.NotNull(pst.LeaseExpires);           // lease preservado
     }
 
     [Fact]
