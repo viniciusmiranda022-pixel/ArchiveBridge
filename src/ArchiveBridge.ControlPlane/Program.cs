@@ -1,9 +1,11 @@
 // ArchiveBridge Control Plane — API + Portal Operacional (Slice 4A).
 //
 // Instalação ON-PREMISES (IIS ou Windows Service): sem Azure App Service, sem banco em nuvem, sem SaaS,
-// sem comunicação externa além das integrações explicitamente configuradas. Esta fatia entrega apenas
-// LEITURA (observabilidade de projetos, ondas, jobs, descoberta EV e evidências) sob autenticação e RBAC;
-// nenhuma capacidade do Slice 4B (exportação, PST, Purview, Graph, AzCopy) é executada nem simulada.
+// sem comunicação externa além das integrações explicitamente configuradas. Esta fatia entrega superfícies
+// de OBSERVABILIDADE/LEITURA (projetos, ondas, jobs, descoberta EV e evidências) e um WRITE-PATH autorizado
+// que apenas SOLICITA (enfileira) a descoberta EV — a execução ocorre depois, no Worker EV, e a descoberta
+// é READ-ONLY contra o Enterprise Vault. Tudo sob autenticação e RBAC; nenhuma capacidade do Slice 4B
+// (exportação, PST, Purview, Graph, AzCopy) é executada nem simulada.
 using ArchiveBridge.Application.EnterpriseVault.Discovery;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;

@@ -150,8 +150,8 @@ POST /EnterpriseVault?handler=RequestDiscovery
   → fallback policy (autenticado) + antiforgery (Razor Pages)
   → UserId (PortalClaims.UserId) válido? senão 403
   → TenantScope = IPortalScopeAccessor.Resolve(User)   (nunca do formulário)
+  → IAuthorizationService.AuthorizeAsync("EvDiscoveryOperators")  → 403 + audit forbidden se negado (PRECEDE o gate)
   → feature gate do deployment habilitado? senão 503 (audit feature-disabled)
-  → IAuthorizationService.AuthorizeAsync("EvDiscoveryOperators")  → 403 + audit forbidden se negado
   → EnvironmentId/IdempotencyKey GUID não vazios? senão 400
   → RequestEvCapabilityDiscoveryUseCase.ExecuteAsync(scope, env, RequestedBy=User.Identity.Name, key, correlation-server)
         · ambiente resolvido no SQL sob o escopo (fora do escopo ⇒ 404 anti-IDOR)
@@ -183,6 +183,7 @@ idempotência) · `503` (gate desabilitado) · `500` (falha inesperada / auditor
 | CSRF | antiforgery Razor Pages (token+cookie); POST sem token ⇒ 400 |
 | IDOR (ambiente de outro projeto/tenant) | catálogo resolve só no escopo; `404` indistinguível; audit `not-found-or-not-authorized` |
 | Escalonamento de papel | `EvDiscoveryOperators` server-side; POST manual de Viewer/Auditor/Approver ⇒ 403 + audit `forbidden` |
+| Vazamento do estado do gate | RBAC **precede** o feature gate: um principal sem mandato recebe `403` com `Enabled=true` **ou** `false` (não infere o gate pela resposta); só um usuário autorizado vê `503`/`feature-disabled` |
 | Substituição de tenant/projeto | escopo derivado só do principal (`IPortalScopeAccessor`) |
 | Substituição do contexto do comando | site/directory/versão/hash/política resolvidos server-side; campos do formulário ignorados |
 | Double-submit / retry | idempotency key por formulário (estável no GET) ⇒ replay, 1 Job |

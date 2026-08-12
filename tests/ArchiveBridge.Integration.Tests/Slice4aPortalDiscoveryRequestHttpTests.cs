@@ -119,6 +119,85 @@ public sealed class Slice4aPortalDiscoveryRequestHttpTests(SqlServerFixture fixt
         Assert.Contains(events, e => e.Username == username && !e.Succeeded && e.Reason == "feature-disabled");
     }
 
+    // ---- §2 PRECEDÊNCIA: RBAC é avaliado ANTES do feature gate (um principal sem mandato não infere o gate).
+
+    [Theory]
+    [InlineData(PortalRoles.Viewer)]
+    [InlineData(PortalRoles.Auditor)]
+    [InlineData(PortalRoles.Approver)]
+    public async Task NonOperatorRolesAreForbiddenEvenWhenGateDisabled(string role)
+    {
+        var scope = SqlServerFixture.NewScope();
+        var environmentId = await SeedProjectAndEnvironmentAsync(scope, "site-prec", "dir-prec.contoso.local");
+        var (username, password) = await SeedUserAsync(scope, role);
+
+        using var factory = CreateFactory(discoveryEnabled: false); // gate DESABILITADO
+        using var client = factory.CreateClient(NoRedirect());
+        await LoginAsync(client, username, password);
+
+        using var response = await PostRequestDiscoveryAsync(client, environmentId, Guid.NewGuid());
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode); // 403 — NÃO 503 (RBAC precede o gate)
+        Assert.Equal(0, await CountCommandsAsync(scope));
+        var events = await AuditAsync(scope);
+        Assert.Contains(events, e => e.Username == username && !e.Succeeded && e.Reason == "forbidden");
+        Assert.DoesNotContain(events, e => e.Username == username && e.Reason == "feature-disabled");
+    }
+
+    [Fact]
+    public async Task NonOperatorAuthorizationResponseIsIdenticalRegardlessOfGate()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var environmentId = await SeedProjectAndEnvironmentAsync(scope, "site-eq", "dir-eq.contoso.local");
+        var (username, password) = await SeedUserAsync(scope, PortalRoles.Viewer);
+
+        HttpStatusCode gateEnabled;
+        using (var enabled = CreateFactory(discoveryEnabled: true))
+        using (var client = enabled.CreateClient(NoRedirect()))
+        {
+            await LoginAsync(client, username, password);
+            using var response = await PostRequestDiscoveryAsync(client, environmentId, Guid.NewGuid());
+            gateEnabled = response.StatusCode;
+        }
+
+        HttpStatusCode gateDisabled;
+        using (var disabled = CreateFactory(discoveryEnabled: false))
+        using (var client = disabled.CreateClient(NoRedirect()))
+        {
+            await LoginAsync(client, username, password);
+            using var response = await PostRequestDiscoveryAsync(client, environmentId, Guid.NewGuid());
+            gateDisabled = response.StatusCode;
+        }
+
+        Assert.Equal(HttpStatusCode.Forbidden, gateEnabled);
+        Assert.Equal(gateEnabled, gateDisabled); // resposta de autorização idêntica: o gate não vaza
+        Assert.Equal(0, await CountCommandsAsync(scope));
+    }
+
+    // ---- §8 verdade operacional do layout: sem afirmar que a FATIA é somente leitura; discovery EV é
+    // READ-ONLY; exportação (Slice 4B) indisponível.
+    [Fact]
+    public async Task LayoutTellsDiscoveryReadOnlyAndExportUnavailableWithoutClaimingSliceIsReadOnly()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var (username, password) = await SeedUserAsync(scope, PortalRoles.Viewer);
+
+        using var factory = CreateFactory(discoveryEnabled: false);
+        using var client = factory.CreateClient(NoRedirect());
+        await LoginAsync(client, username, password);
+
+        using var response = await client.GetAsync(new Uri("/Jobs/Index", UriKind.Relative));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var html = await response.Content.ReadAsStringAsync();
+
+        // O texto do rodapé quebra em duas linhas no Razor (whitespace preservado); afirmamos por fragmentos
+        // de linha única.
+        Assert.Contains("A descoberta Enterprise Vault disponível nesta", html, StringComparison.Ordinal);
+        Assert.Contains("fatia é READ-ONLY; a exportação Enterprise Vault (Slice 4B) permanece indisponível", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("Slice 4A · READ-ONLY", html, StringComparison.Ordinal);      // badge antigo removido
+        Assert.DoesNotContain("Esta fatia (Slice 4A) é somente leitura", html, StringComparison.Ordinal); // claim antigo removido
+    }
+
     // ---- §27 antiforgery.
 
     [Fact]

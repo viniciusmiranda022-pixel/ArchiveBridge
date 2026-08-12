@@ -99,22 +99,24 @@ public sealed class IndexModel(
             return StatusCode(StatusCodes.Status403Forbidden);
         }
 
-        // Feature gate do deployment: se desabilitado, nada é enfileirado (nem por POST manual autorizado).
-        if (!_discoveryGate.Enabled)
-        {
-            await AuditAsync(scope, userId, username, environmentId, false, "feature-disabled", correlation, cancellationToken)
-                .ConfigureAwait(false);
-            return StatusCode(StatusCodes.Status503ServiceUnavailable);
-        }
-
-        // Autorização SERVER-SIDE (não confiar em esconder o botão): Operator/Administrator apenas. Negativa
-        // com escopo/usuário conhecidos é auditada como "forbidden".
+        // Autorização RBAC SERVER-SIDE (não confiar em esconder o botão): Operator/Administrator apenas. A
+        // autorização PRECEDE o feature gate — um principal sem mandato NUNCA infere o estado do gate pela
+        // resposta (403 idêntico com Enabled=true/false). Negativa é auditada como "forbidden".
         var authorized = await _authorization.AuthorizeAsync(User, DiscoveryOperatorsPolicy).ConfigureAwait(false);
         if (!authorized.Succeeded)
         {
             await AuditAsync(scope, userId, username, environmentId, false, "forbidden", correlation, cancellationToken)
                 .ConfigureAwait(false);
             return StatusCode(StatusCodes.Status403Forbidden);
+        }
+
+        // Somente APÓS a autorização: feature gate do deployment. Desabilitado ⇒ nada é enfileirado (nem por
+        // usuário autorizado); o "feature-disabled" só é revelado a quem já tem mandato.
+        if (!_discoveryGate.Enabled)
+        {
+            await AuditAsync(scope, userId, username, environmentId, false, "feature-disabled", correlation, cancellationToken)
+                .ConfigureAwait(false);
+            return StatusCode(StatusCodes.Status503ServiceUnavailable);
         }
 
         // Validação de entrada: identificadores GUID não vazios. Inválido ⇒ 400, zero Job.

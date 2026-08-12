@@ -9,7 +9,7 @@
 <body>
     <header class="topbar">
         <a class="brand" asp-page="/Index">ArchiveBridge</a>
-        <span class="badge">Control Plane · Slice 4A · READ-ONLY</span>
+        <span class="badge">Control Plane · Slice 4A</span>
         @if (User.Identity?.IsAuthenticated == true)
         {
             <span class="spacer"></span>
@@ -43,8 +43,8 @@
     </main>
 
     <footer class="footer">
-        ArchiveBridge Control Plane — operação on-premises. Esta fatia (Slice 4A) é somente leitura;
-        a exportação do Enterprise Vault (Slice 4B) ainda não está disponível.
+        ArchiveBridge Control Plane — operação on-premises. A descoberta Enterprise Vault disponível nesta
+        fatia é READ-ONLY; a exportação Enterprise Vault (Slice 4B) permanece indisponível.
     </footer>
 </body>
 </html>
