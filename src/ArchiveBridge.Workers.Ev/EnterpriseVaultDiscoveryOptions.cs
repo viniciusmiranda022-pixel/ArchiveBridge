@@ -15,6 +15,9 @@ public sealed class EnterpriseVaultDiscoveryOptions
     /// <summary>Teto defensivo do número de escopos por poll (evita enumeração/lotes desproporcionais).</summary>
     public const int MaxScopesPerPollUpperBound = 512;
 
+    /// <summary>Teto defensivo do lote de recuperação de leases por ciclo do reaper.</summary>
+    public const int LeaseRecoveryBatchSizeUpperBound = 1000;
+
     /// <summary>Habilita o worker operacional. Padrão <see langword="false"/> (fail-closed).</summary>
     public bool Enabled { get; set; }
 
@@ -39,11 +42,20 @@ public sealed class EnterpriseVaultDiscoveryOptions
     /// <summary>Diretório de trabalho controlado da sonda (vazio ⇒ diretório base do processo).</summary>
     public string WorkingDirectory { get; set; } = string.Empty;
 
+    /// <summary>Intervalo entre ciclos do reaper de leases expirados do workload EV, em segundos. Deve ser &gt; 0.</summary>
+    public int LeaseRecoveryIntervalSeconds { get; set; } = 15;
+
+    /// <summary>Lote máximo de leases recuperados por ciclo do reaper. Deve estar em [1, <see cref="LeaseRecoveryBatchSizeUpperBound"/>].</summary>
+    public int LeaseRecoveryBatchSize { get; set; } = 64;
+
     /// <summary>Intervalo de poll materializado.</summary>
     public TimeSpan PollInterval => TimeSpan.FromSeconds(PollIntervalSeconds);
 
     /// <summary>Duração de lease materializada.</summary>
     public TimeSpan LeaseDuration => TimeSpan.FromSeconds(LeaseSeconds);
+
+    /// <summary>Intervalo do reaper materializado.</summary>
+    public TimeSpan LeaseRecoveryInterval => TimeSpan.FromSeconds(LeaseRecoveryIntervalSeconds);
 
     /// <summary>
     /// Valida a configuração OPERACIONAL (só faz sentido quando <see cref="Enabled"/>). Fail-closed: qualquer
@@ -81,6 +93,16 @@ public sealed class EnterpriseVaultDiscoveryOptions
         if (MaxScopesPerPoll <= 0 || MaxScopesPerPoll > MaxScopesPerPollUpperBound)
         {
             errors.Add($"EnterpriseVaultDiscovery:MaxScopesPerPoll deve estar em [1, {MaxScopesPerPollUpperBound}].");
+        }
+
+        if (LeaseRecoveryIntervalSeconds <= 0)
+        {
+            errors.Add("EnterpriseVaultDiscovery:LeaseRecoveryIntervalSeconds deve ser > 0.");
+        }
+
+        if (LeaseRecoveryBatchSize <= 0 || LeaseRecoveryBatchSize > LeaseRecoveryBatchSizeUpperBound)
+        {
+            errors.Add($"EnterpriseVaultDiscovery:LeaseRecoveryBatchSize deve estar em [1, {LeaseRecoveryBatchSizeUpperBound}].");
         }
 
         if (errors.Count > 0)

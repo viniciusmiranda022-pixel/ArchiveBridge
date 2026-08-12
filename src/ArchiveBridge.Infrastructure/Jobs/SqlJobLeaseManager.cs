@@ -3,6 +3,7 @@ using System.Globalization;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
+using ArchiveBridge.Domain.IdentityAndAccess;
 using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Infrastructure.Persistence;
 using Microsoft.Data.SqlClient;
@@ -42,6 +43,17 @@ public sealed class SqlJobLeaseManager(
         ORDER BY lease_expires_at_utc ASC;
         """;
 
+    // Seleção ESCOPADA por workload: só recupera leases expirados do workload informado (isolamento entre
+    // workers). O @now e o @batchSize seguem idênticos à global.
+    private const string SelectExpiredByWorkloadSql =
+        """
+        SELECT TOP (@batchSize) job_id, tenant_id, project_id, attempt_count, lease_epoch, owner_worker
+        FROM dbo.jobs
+        WHERE state = 1 AND workload = @workload
+          AND lease_expires_at_utc IS NOT NULL AND lease_expires_at_utc < @now
+        ORDER BY lease_expires_at_utc ASC;
+        """;
+
     private const string RecoverOneSql =
         """
         SET NOCOUNT ON;
@@ -54,7 +66,8 @@ public sealed class SqlJobLeaseManager(
             last_error_code = @lastError,
             updated_at_utc = @now
         OUTPUT inserted.project_id INTO @applied
-        WHERE job_id = @jobId AND lease_epoch = @epoch AND state = 1 AND lease_expires_at_utc < @now;
+        WHERE job_id = @jobId AND lease_epoch = @epoch AND state = 1 AND lease_expires_at_utc < @now
+              AND (@workload IS NULL OR workload = @workload);
 
         IF EXISTS (SELECT 1 FROM @applied)
         BEGIN
@@ -92,7 +105,16 @@ public sealed class SqlJobLeaseManager(
     }
 
     /// <inheritdoc />
-    public async Task<int> RecoverExpiredLeasesAsync(int batchSize, CancellationToken cancellationToken)
+    public Task<int> RecoverExpiredLeasesAsync(int batchSize, CancellationToken cancellationToken) =>
+        RecoverExpiredLeasesCoreAsync(workload: null, batchSize, cancellationToken);
+
+    /// <inheritdoc />
+    public Task<int> RecoverExpiredLeasesAsync(Workload workload, int batchSize, CancellationToken cancellationToken) =>
+        RecoverExpiredLeasesCoreAsync((byte)workload, batchSize, cancellationToken);
+
+    // Núcleo compartilhado. workload == null ⇒ recuperação global (comportamento aceito preservado);
+    // workload != null ⇒ seleção E UPDATE exigem o workload (defesa em profundidade, isolamento entre workers).
+    private async Task<int> RecoverExpiredLeasesCoreAsync(byte? workload, int batchSize, CancellationToken cancellationToken)
     {
         var now = _clock.UtcNow;
         var candidates = new List<ExpiredLease>();
@@ -100,10 +122,16 @@ public sealed class SqlJobLeaseManager(
         await using var maintenanceConnection = await _connectionFactory
             .OpenForMaintenanceAsync(cancellationToken).ConfigureAwait(false);
 
-        await using (var select = new SqlCommand(SelectExpiredSql, maintenanceConnection.Connection))
+        var selectSql = workload is null ? SelectExpiredSql : SelectExpiredByWorkloadSql;
+        await using (var select = new SqlCommand(selectSql, maintenanceConnection.Connection))
         {
             select.Parameters.Add(new SqlParameter("@batchSize", SqlDbType.Int) { Value = batchSize });
             select.Parameters.Add(new SqlParameter("@now", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(now) });
+            if (workload is not null)
+            {
+                select.Parameters.Add(new SqlParameter("@workload", SqlDbType.TinyInt) { Value = workload.Value });
+            }
+
             await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -119,7 +147,7 @@ public sealed class SqlJobLeaseManager(
         var recovered = 0;
         foreach (var candidate in candidates)
         {
-            if (await RecoverOneAsync(maintenanceConnection.Connection, candidate, now, cancellationToken).ConfigureAwait(false))
+            if (await RecoverOneAsync(maintenanceConnection.Connection, candidate, workload, now, cancellationToken).ConfigureAwait(false))
             {
                 recovered++;
             }
@@ -131,6 +159,7 @@ public sealed class SqlJobLeaseManager(
     private async Task<bool> RecoverOneAsync(
         SqlConnection connection,
         ExpiredLease candidate,
+        byte? workload,
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
@@ -158,6 +187,7 @@ public sealed class SqlJobLeaseManager(
                 command.Parameters.Add(new SqlParameter("@worker", SqlDbType.NVarChar, 200) { Value = (object?)candidate.OwnerWorker ?? DBNull.Value });
                 command.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = CorrelationId.New().Value });
                 command.Parameters.Add(new SqlParameter("@now", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(now) });
+                command.Parameters.Add(new SqlParameter("@workload", SqlDbType.TinyInt) { Value = (object?)workload ?? DBNull.Value });
                 var scalar = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
                 result = Convert.ToInt32(scalar, CultureInfo.InvariantCulture);
             }

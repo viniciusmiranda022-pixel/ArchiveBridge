@@ -1,6 +1,7 @@
 using ArchiveBridge.Application.EnterpriseVault.Discovery;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
+using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Infrastructure.EnterpriseVault.Discovery;
@@ -56,6 +57,8 @@ public static class EnterpriseVaultDiscoveryComposition
 
         RegisterOperationalServices(builder.Services, options, applicationConnection!, maintenanceConnection!);
         builder.Services.AddHostedService<EvDiscoveryWorker>();
+        // Reaper de crash recovery (workload EV): recupera Jobs cujo lease expirou após uma queda de worker.
+        builder.Services.AddHostedService<EvLeaseRecoveryWorker>();
     }
 
     /// <summary>
@@ -110,5 +113,8 @@ public static class EnterpriseVaultDiscoveryComposition
 
         services.AddSingleton<IEvDiscoveryPendingScopeReader>(scopeReader);
         services.AddSingleton(processor);
+        // MESMA instância do lease manager do processor: o reaper e o processamento compartilham a política
+        // e a duração de lease (não há SqlJobLeaseManager duplicado com políticas divergentes).
+        services.AddSingleton<IJobLeaseManager>(leaseManager);
     }
 }

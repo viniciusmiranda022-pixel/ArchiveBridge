@@ -5,11 +5,13 @@ using ArchiveBridge.Workers.Ev;
 namespace ArchiveBridge.Architecture.Tests;
 
 /// <summary>
-/// Fronteiras arquiteturais do Worker EV operacional (sub-incremento 2):
+/// Fronteiras arquiteturais do Worker EV operacional (sub-incrementos 2 e 2B):
 /// (1) <see cref="EvDiscoveryWorker"/> delega SOMENTE ao processor da Application (nunca PowerShell/host/
 /// caso de uso diretamente); (2) o host do worker (o novo caminho Request→Queue→Worker→Processor→Discovery)
-/// não introduz nenhuma integração de Slice 4B nem pacotes de fornecedor; (3) a identidade de MANUTENÇÃO só
-/// aparece no leitor de escopos dentro do caminho de descoberta EV.
+/// não introduz nenhuma integração de Slice 4B nem pacotes de fornecedor; (3) a identidade de MANUTENÇÃO,
+/// dentro do caminho ESPECÍFICO de descoberta EV (Infrastructure/EnterpriseVault), só aparece na enumeração
+/// de escopos — a recuperação técnica de leases expirados é a OUTRA operação cross-tenant aprovada e reutiliza
+/// o <c>SqlJobLeaseManager</c> do Slice 1 (Infrastructure/Jobs), não código EV específico.
 /// </summary>
 public sealed class EvWorkerBoundaryTests
 {
@@ -84,15 +86,19 @@ public sealed class EvWorkerBoundaryTests
         }
     }
 
-    // (3) A identidade de manutenção é confinada ao leitor de escopos dentro do caminho de descoberta EV.
+    // (3) A fronteira de MANUTENÇÃO é restrita a operações técnicas cross-tenant APROVADAS. No caminho EV
+    // específico (Infrastructure/EnterpriseVault), a única identidade de manutenção é a ENUMERAÇÃO de escopos;
+    // a recuperação de leases expirados (a outra operação aprovada) vive no SqlJobLeaseManager do Slice 1.
+    // Nenhum efeito de negócio EV (claim/discovery/evidência/conclusão) usa a identidade de manutenção.
     [Fact]
-    public void MaintenanceIdentityIsConfinedToThePendingScopeReader()
+    public void MaintenanceIdentityIsRestrictedToApprovedCrossTenantInfrastructureOperations()
     {
         var usingMaintenance = Directory.EnumerateFiles(InfrastructureEvDir, "*.cs", SearchOption.AllDirectories)
             .Where(file => File.ReadAllText(file).Contains("OpenForMaintenanceAsync", StringComparison.Ordinal))
             .Select(file => Path.GetFileName(file))
             .ToList();
 
+        // No código EV específico, manutenção = SOMENTE enumeração de escopos.
         Assert.Equal("SqlEvDiscoveryPendingScopeReader.cs", Assert.Single(usingMaintenance));
     }
 }
