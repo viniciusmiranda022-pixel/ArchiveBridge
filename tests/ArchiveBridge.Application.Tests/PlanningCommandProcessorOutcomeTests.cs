@@ -140,6 +140,8 @@ public sealed class PlanningCommandProcessorOutcomeTests
             Task.FromResult(JobCommandOutcome.Applied);
 
         public Task<int> RecoverExpiredLeasesAsync(int batchSize, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<int> RecoverExpiredLeasesAsync(Workload workload, int batchSize, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 
     private sealed class StubProjectStore(MigrationProject project, Exception? saveThrows) : IProjectStore

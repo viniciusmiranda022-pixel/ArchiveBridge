@@ -1,0 +1,73 @@
+@page
+@inject IPortalSignInAudit SignInAudit
+@inject IPortalOperationalAudit OperationalAudit
+@inject IPortalScopeAccessor ScopeAccessor
+@{
+    ViewData["Title"] = "Auditoria";
+    var scope = ScopeAccessor.Resolve(User);
+    var signIns = await SignInAudit.RecentAsync(scope.Tenant, 100, HttpContext.RequestAborted);
+    var operations = await OperationalAudit.RecentAsync(scope, 100, HttpContext.RequestAborted);
+}
+<h1>Trilha de auditoria</h1>
+<p class="lead">
+    Tentativas de autenticação deste tenant e eventos operacionais deste tenant/projeto. A página é restrita
+    aos papéis Auditor e Administrator. Nenhum segredo nem byte de evidência é registrado.
+</p>
+
+<h2>Eventos operacionais</h2>
+@if (operations.Count == 0)
+{
+    <p class="empty">Nenhum evento operacional registrado neste projeto.</p>
+}
+else
+{
+    <div class="tablewrap">
+        <table>
+            <thead>
+                <tr><th>Quando (UTC)</th><th>Usuário</th><th>Ação</th><th>Recurso</th><th>Resultado</th><th>Motivo</th><th>Correlação</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var e in operations)
+                {
+                    <tr>
+                        <td class="mono">@e.OccurredAtUtc.ToString("u")</td>
+                        <td>@e.Username</td>
+                        <td class="mono">@e.ActionCode</td>
+                        <td class="mono">@e.ResourceType/@e.ResourceId</td>
+                        <td>@(e.Succeeded ? Html.Raw("<span class=\"pill ok\">sucesso</span>") : Html.Raw("<span class=\"pill bad\">falha</span>"))</td>
+                        <td>@e.Reason</td>
+                        <td class="mono">@e.CorrelationId</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}
+
+<h2>Autenticação</h2>
+@if (signIns.Count == 0)
+{
+    <p class="empty">Nenhum evento de autenticação registrado.</p>
+}
+else
+{
+    <div class="tablewrap">
+        <table>
+            <thead>
+                <tr><th>Quando (UTC)</th><th>Usuário</th><th>Resultado</th><th>Motivo</th><th>Origem</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var e in signIns)
+                {
+                    <tr>
+                        <td class="mono">@e.OccurredAtUtc.ToString("u")</td>
+                        <td>@e.Username</td>
+                        <td>@(e.Succeeded ? Html.Raw("<span class=\"pill ok\">sucesso</span>") : Html.Raw("<span class=\"pill bad\">falha</span>"))</td>
+                        <td>@e.Reason</td>
+                        <td class="mono">@(e.RemoteAddress ?? "—")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}

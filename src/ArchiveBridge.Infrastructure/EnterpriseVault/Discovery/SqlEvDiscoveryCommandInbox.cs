@@ -97,6 +97,47 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
         FROM @claimed c INNER JOIN dbo.ev_discovery_commands dc ON dc.job_id = c.job_id;
         """;
 
+    // Procura a chave de idempotência sob lock de RANGE (UPDLOCK+HOLDLOCK): serializa concorrentes com a
+    // mesma chave dentro do tenant/projeto, de modo que a segunda transação enxergue a linha da primeira.
+    // Carrega TAMBÉM site_name/directory_server: fazem parte do alvo operacional efetivamente persistido e
+    // entram na equivalência do comando (uma chave antiga não pode reaproveitar um Job de outro alvo).
+    private const string LookupIdempotentSql =
+        """
+        SET NOCOUNT ON;
+        SELECT job_id, environment_id, command_schema_version, expected_project_configuration_version,
+               expected_configuration_hash, discovery_policy_version, site_name, directory_server
+        FROM dbo.ev_discovery_commands WITH (UPDLOCK, HOLDLOCK)
+        WHERE tenant_id = @tenant AND project_id = @project AND idempotency_key = @key;
+        """;
+
+    // Enfileiramento idêntico ao EnqueueSql, porém gravando a idempotency_key. O índice único filtrado é o
+    // backstop SQL: uma corrida que escape do lock falha com violação de unicidade e é reconciliada como replay.
+    private const string EnqueueIdempotentSql =
+        """
+        SET NOCOUNT ON;
+        IF NOT EXISTS (SELECT 1 FROM dbo.projects WHERE project_id = @projectId)
+            INSERT INTO dbo.projects (project_id, tenant_id, created_at_utc) VALUES (@projectId, @tenant, @now);
+
+        INSERT INTO dbo.jobs
+            (job_id, tenant_id, project_id, workload, state, priority, attempt_count, lease_epoch,
+             next_attempt_at_utc, created_at_utc, updated_at_utc)
+        VALUES
+            (@jobId, @tenant, @projectId, @workload, 0, 0, 0, 0, @now, @now, @now);
+
+        INSERT INTO dbo.job_state_transitions
+            (job_id, tenant_id, project_id, from_state, to_state, reason_code, lease_epoch, worker_id, correlation_id, occurred_at_utc)
+        VALUES
+            (@jobId, @tenant, @projectId, NULL, 0, 0, 0, NULL, @correlation, @now);
+
+        INSERT INTO dbo.ev_discovery_commands
+            (job_id, tenant_id, project_id, environment_id, site_name, directory_server, requested_by,
+             command_schema_version, expected_project_configuration_version, expected_configuration_hash,
+             discovery_policy_version, correlation_id, idempotency_key, created_at_utc)
+        VALUES
+            (@jobId, @tenant, @projectId, @environment, @site, @directory, @requestedBy,
+             @schemaVersion, @expProjectCfgVer, @expCfgHash, @policyVersion, @correlation, @key, @now);
+        """;
+
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
     private readonly IClock _clock = clock;
 
@@ -136,6 +177,66 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return jobId;
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<EvDiscoveryEnqueueResult> EnqueueIdempotentAsync(
+        EvDiscoveryCommand command, Guid idempotencyKey, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        // Fail-closed na borda de infraestrutura (não só no caso de uso): uma chave vazia é rejeitada ANTES
+        // de abrir conexão/transação — nenhuma escrita ocorre.
+        if (idempotencyKey == Guid.Empty)
+        {
+            throw new ArgumentException("A chave de idempotência é obrigatória.", nameof(idempotencyKey));
+        }
+
+        EvDiscoveryCommandValidation.EnsureValid(command);
+        var now = SqlJobMapping.ToDbUtc(_clock.UtcNow);
+        var scope = command.Scope;
+
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var transaction = (SqlTransaction)await connection.Connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var existing = await FindByKeyAsync(connection.Connection, transaction, scope, idempotencyKey, cancellationToken).ConfigureAwait(false);
+            if (existing is not null)
+            {
+                EnsureSameCommand(existing.Value, command); // divergente ⇒ EvDiscoveryIdempotencyConflictException
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return new EvDiscoveryEnqueueResult(new JobId(existing.Value.JobId), Created: false, Replayed: true);
+            }
+
+            var jobId = JobId.New();
+            try
+            {
+                await using var insert = new SqlCommand(EnqueueIdempotentSql, connection.Connection, transaction);
+                BindEnqueue(insert, jobId, command, now);
+                insert.Parameters.Add(new SqlParameter("@key", SqlDbType.UniqueIdentifier) { Value = idempotencyKey });
+                await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (SqlException sql) when (sql.Number is 2601 or 2627)
+            {
+                // Backstop: a corrida escapou do lock e a outra transação já criou a chave — reconcilia.
+                var raced = await FindByKeyAsync(connection.Connection, transaction, scope, idempotencyKey, cancellationToken).ConfigureAwait(false);
+                if (raced is null)
+                {
+                    throw;
+                }
+
+                EnsureSameCommand(raced.Value, command);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return new EvDiscoveryEnqueueResult(new JobId(raced.Value.JobId), Created: false, Replayed: true);
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new EvDiscoveryEnqueueResult(jobId, Created: true, Replayed: false);
         }
         catch
         {
@@ -209,4 +310,73 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
 
         return new ClaimedEvDiscoveryCommand(claimedJob, command);
     }
+
+    private static void BindEnqueue(SqlCommand command, JobId jobId, EvDiscoveryCommand source, object now)
+    {
+        var scope = source.Scope;
+        var context = source.Context;
+        command.Parameters.Add(new SqlParameter("@jobId", SqlDbType.UniqueIdentifier) { Value = jobId.Value });
+        command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+        command.Parameters.Add(new SqlParameter("@projectId", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        command.Parameters.Add(new SqlParameter("@workload", SqlDbType.TinyInt) { Value = EvWorkload });
+        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier) { Value = source.EnvironmentId.Value });
+        command.Parameters.Add(new SqlParameter("@site", SqlDbType.NVarChar, 200) { Value = source.SiteName });
+        command.Parameters.Add(new SqlParameter("@directory", SqlDbType.NVarChar, 260) { Value = source.DirectoryServer });
+        command.Parameters.Add(new SqlParameter("@requestedBy", SqlDbType.NVarChar, 200) { Value = source.RequestedBy });
+        command.Parameters.Add(new SqlParameter("@schemaVersion", SqlDbType.Int) { Value = context.SchemaVersion });
+        command.Parameters.Add(new SqlParameter("@expProjectCfgVer", SqlDbType.Int) { Value = context.ExpectedProjectConfigurationVersion!.Value });
+        command.Parameters.Add(new SqlParameter("@expCfgHash", SqlDbType.Char, 64) { Value = context.ExpectedConfigurationHash!.Value.Value });
+        command.Parameters.Add(new SqlParameter("@policyVersion", SqlDbType.Int) { Value = context.DiscoveryPolicyVersion });
+        command.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = source.Correlation.Value });
+        command.Parameters.Add(new SqlParameter("@now", SqlDbType.DateTime2) { Value = now });
+    }
+
+    private static async Task<ExistingCommand?> FindByKeyAsync(
+        SqlConnection connection, SqlTransaction transaction, TenantScope scope, Guid key, CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(LookupIdempotentSql, connection, transaction);
+        command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        command.Parameters.Add(new SqlParameter("@key", SqlDbType.UniqueIdentifier) { Value = key });
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        return new ExistingCommand(
+            reader.GetGuid(0), reader.GetGuid(1), reader.GetInt32(2), reader.GetInt32(3),
+            reader.GetString(4).TrimEnd(), reader.GetInt32(5), reader.GetString(6), reader.GetString(7));
+    }
+
+    // A equivalência cobre TODO o alvo operacional efetivamente persistido/executado: ambiente, schema,
+    // versão/hash de configuração, versão da política E o alvo de rede (site_name/directory_server). Não
+    // inclui correlation_id (muda por request) nem requested_by (é o solicitante, não o alvo). Comparação
+    // de texto Ordinal. Divergência ⇒ conflito (uma chave antiga não reaproveita um Job de outro alvo).
+    private static void EnsureSameCommand(ExistingCommand existing, EvDiscoveryCommand command)
+    {
+        var context = command.Context;
+        var same = existing.EnvironmentId == command.EnvironmentId.Value
+            && existing.SchemaVersion == context.SchemaVersion
+            && existing.ExpectedProjectConfigurationVersion == context.ExpectedProjectConfigurationVersion
+            && string.Equals(existing.ExpectedConfigurationHash, context.ExpectedConfigurationHash?.Value, StringComparison.Ordinal)
+            && existing.DiscoveryPolicyVersion == context.DiscoveryPolicyVersion
+            && string.Equals(existing.SiteName, command.SiteName, StringComparison.Ordinal)
+            && string.Equals(existing.DirectoryServer, command.DirectoryServer, StringComparison.Ordinal);
+        if (!same)
+        {
+            throw new EvDiscoveryIdempotencyConflictException(
+                "Chave de idempotência já vinculada a um comando de descoberta diferente (conteúdo divergente).");
+        }
+    }
+
+    private readonly record struct ExistingCommand(
+        Guid JobId,
+        Guid EnvironmentId,
+        int SchemaVersion,
+        int ExpectedProjectConfigurationVersion,
+        string ExpectedConfigurationHash,
+        int DiscoveryPolicyVersion,
+        string SiteName,
+        string DirectoryServer);
 }

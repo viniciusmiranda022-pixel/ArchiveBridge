@@ -1,3 +1,5 @@
+using ArchiveBridge.Domain.IdentityAndAccess;
+
 namespace ArchiveBridge.Contracts.Jobs;
 
 /// <summary>
@@ -19,4 +21,13 @@ public interface IJobLeaseManager
     /// política. Retorna a quantidade recuperada. Uma queda de worker não perde o Job.
     /// </summary>
     Task<int> RecoverExpiredLeasesAsync(int batchSize, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Recuperação ESCOPADA POR WORKLOAD: idêntica em semântica à sobrecarga global, porém a seleção E o
+    /// UPDATE de recuperação exigem <c>workload = <paramref name="workload"/></c> (defesa em profundidade).
+    /// Permite que o reaper de um worker específico (ex.: EnterpriseVault) recupere apenas os leases do seu
+    /// próprio workload, sem tocar Jobs de outros workloads — preservando o isolamento entre workers. A
+    /// revalidação da expiração e do epoch no UPDATE (proteção contra corrida com heartbeat) é preservada.
+    /// </summary>
+    Task<int> RecoverExpiredLeasesAsync(Workload workload, int batchSize, CancellationToken cancellationToken);
 }

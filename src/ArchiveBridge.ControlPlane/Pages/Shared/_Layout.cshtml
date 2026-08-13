@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@ViewData["Title"] · ArchiveBridge</title>
+    <link rel="stylesheet" href="~/css/site.css" asp-append-version="true" />
+</head>
+<body>
+    <header class="topbar">
+        <a class="brand" asp-page="/Index">ArchiveBridge</a>
+        <span class="badge">Control Plane · Slice 4A</span>
+        @if (User.Identity?.IsAuthenticated == true)
+        {
+            <span class="spacer"></span>
+            <span class="user">@(User.FindFirst(PortalClaims.DisplayName)?.Value) (@User.Identity!.Name)</span>
+            <form class="logout" asp-page="/Account/Logout" method="post">
+                <button type="submit">Sair</button>
+            </form>
+        }
+    </header>
+
+    @if (User.Identity?.IsAuthenticated == true)
+    {
+        <nav class="sidenav">
+            <a asp-page="/Index">Painel</a>
+            <a asp-page="/Projects/Index">Projetos</a>
+            <a asp-page="/Waves/Index">Ondas</a>
+            <a asp-page="/Jobs/Index">Jobs</a>
+            <a asp-page="/EnterpriseVault/Index">Enterprise Vault</a>
+            <a asp-page="/Evidence/Index">Evidências</a>
+            <a asp-page="/Audit/Index">Auditoria</a>
+            <a asp-page="/Export/Index">Exportação</a>
+            @if (User.IsInRole(PortalRoles.Administrator))
+            {
+                <a asp-page="/Admin/Index">Administração</a>
+            }
+        </nav>
+    }
+
+    <main class="content">
+        @RenderBody()
+    </main>
+
+    <footer class="footer">
+        ArchiveBridge Control Plane — operação on-premises. A descoberta Enterprise Vault disponível nesta
+        fatia é READ-ONLY; a exportação Enterprise Vault (Slice 4B) permanece indisponível.
+    </footer>
+</body>
+</html>

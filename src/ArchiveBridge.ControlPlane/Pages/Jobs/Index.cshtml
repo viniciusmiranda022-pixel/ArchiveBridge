@@ -1,0 +1,40 @@
+@page
+@inject IControlPlaneQueries Queries
+@inject IPortalScopeAccessor ScopeAccessor
+@{
+    ViewData["Title"] = "Jobs";
+    var scope = ScopeAccessor.Resolve(User);
+    var jobs = await Queries.ListJobsAsync(scope, 200, HttpContext.RequestAborted);
+}
+<h1>Jobs duráveis</h1>
+<p class="lead">Estado, tentativas, dono e último erro da fila durável (somente leitura).</p>
+
+@if (jobs.Count == 0)
+{
+    <p class="empty">Nenhum job neste tenant.</p>
+}
+else
+{
+    <div class="tablewrap">
+        <table>
+            <thead>
+                <tr><th>Job</th><th>Workload</th><th>Estado</th><th>Tentativas</th><th>Prioridade</th><th>Dono</th><th>Último erro</th><th>Atualizado (UTC)</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var j in jobs)
+                {
+                    <tr>
+                        <td><a asp-page="/Jobs/Details" asp-route-jobId="@j.JobId">@j.JobId.ToString()[..8]</a></td>
+                        <td>@j.Workload</td>
+                        <td><span class="pill">@j.State</span></td>
+                        <td>@j.AttemptCount</td>
+                        <td>@j.Priority</td>
+                        <td class="mono">@(j.OwnerWorker ?? "—")</td>
+                        <td>@(j.LastErrorCode ?? "—")</td>
+                        <td class="mono">@j.UpdatedAtUtc.ToString("u")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}

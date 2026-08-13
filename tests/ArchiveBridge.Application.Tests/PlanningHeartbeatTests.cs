@@ -137,6 +137,9 @@ public sealed class PlanningHeartbeatTests
 
         public Task<int> RecoverExpiredLeasesAsync(int batchSize, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
+
+        public Task<int> RecoverExpiredLeasesAsync(Workload workload, int batchSize, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
     }
 
     private sealed class ThrowingLeaseManager : IJobLeaseManager
@@ -145,6 +148,9 @@ public sealed class PlanningHeartbeatTests
             throw new InvalidOperationException("falha transitória de rede/SQL no batimento");
 
         public Task<int> RecoverExpiredLeasesAsync(int batchSize, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<int> RecoverExpiredLeasesAsync(Workload workload, int batchSize, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
     }
 }

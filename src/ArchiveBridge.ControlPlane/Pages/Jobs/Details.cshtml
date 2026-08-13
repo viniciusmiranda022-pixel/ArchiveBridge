@@ -1,0 +1,44 @@
+@page
+@inject IControlPlaneQueries Queries
+@inject IPortalScopeAccessor ScopeAccessor
+@{
+    ViewData["Title"] = "Job";
+    var scope = ScopeAccessor.Resolve(User);
+    var jobIdText = Request.Query["jobId"].ToString();
+    Guid.TryParse(jobIdText, out var jobId);
+    var transitions = jobId == Guid.Empty
+        ? Array.Empty<JobTransitionView>()
+        : await Queries.ListJobTransitionsAsync(scope, jobId, HttpContext.RequestAborted);
+}
+<h1>Job @(jobId == Guid.Empty ? "(inválido)" : jobIdText[..8])</h1>
+<p class="lead">Trilha de auditoria imutável das transições de estado (ordem cronológica).</p>
+<p><a class="btn" asp-page="/Jobs/Index">← Voltar aos jobs</a></p>
+
+@if (transitions.Count == 0)
+{
+    <p class="empty">Sem transições visíveis para este job neste tenant.</p>
+}
+else
+{
+    <div class="tablewrap">
+        <table>
+            <thead>
+                <tr><th>#</th><th>De</th><th>Para</th><th>Motivo</th><th>Época do lease</th><th>Worker</th><th>Quando (UTC)</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var t in transitions)
+                {
+                    <tr>
+                        <td>@t.TransitionId</td>
+                        <td>@(t.FromState ?? "—")</td>
+                        <td><span class="pill">@t.ToState</span></td>
+                        <td>@t.ReasonCode</td>
+                        <td>@t.LeaseEpoch</td>
+                        <td class="mono">@(t.WorkerId ?? "—")</td>
+                        <td class="mono">@t.OccurredAtUtc.ToString("u")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}
