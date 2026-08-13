@@ -1,23 +1,71 @@
 @page
-@inject IPortalSignInAudit SignInAudit
-@inject IPortalOperationalAudit OperationalAudit
-@inject IPortalScopeAccessor ScopeAccessor
+@model ArchiveBridge.ControlPlane.Pages.Audit.IndexModel
 @{
     ViewData["Title"] = "Auditoria";
-    var scope = ScopeAccessor.Resolve(User);
-    var signIns = await SignInAudit.RecentAsync(scope.Tenant, 100, HttpContext.RequestAborted);
-    var operations = await OperationalAudit.RecentAsync(scope, 100, HttpContext.RequestAborted);
 }
 <h1>Trilha de auditoria</h1>
 <p class="lead">
-    Tentativas de autenticação deste tenant e eventos operacionais deste tenant/projeto. A página é restrita
-    aos papéis Auditor e Administrator. Nenhum segredo nem byte de evidência é registrado.
+    Eventos operacionais deste tenant/projeto e tentativas de autenticação deste tenant. Restrita aos papéis
+    Auditor e Administrator. As listas são paginadas por keyset e independentes; visualizar ou filtrar é
+    somente leitura — não gera nenhum evento. Nenhum segredo nem byte de evidência é registrado.
 </p>
 
 <h2>Eventos operacionais</h2>
-@if (operations.Count == 0)
+<form method="get" class="filters">
+    <div class="field">
+        <label for="opAction">Ação</label>
+        <input id="opAction" name="opAction" value="@Model.OpAction" maxlength="64" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="opUsername">Usuário (prefixo)</label>
+        <input id="opUsername" name="opUsername" value="@Model.OpUsername" maxlength="200" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="opSucceeded">Resultado</label>
+        <select id="opSucceeded" name="opSucceeded">
+            <option value="">(todos)</option>
+            <option value="true" selected="@(Model.OpSucceeded == "true")">sucesso</option>
+            <option value="false" selected="@(Model.OpSucceeded == "false")">falha</option>
+        </select>
+    </div>
+    <div class="field">
+        <label for="opCorrelation">Correlação</label>
+        <input id="opCorrelation" name="opCorrelation" value="@Model.OpCorrelation" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="opFrom">De (UTC)</label>
+        <input id="opFrom" name="opFrom" value="@Model.OpFrom" placeholder="AAAA-MM-DDTHH:MM" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="opTo">Até (UTC)</label>
+        <input id="opTo" name="opTo" value="@Model.OpTo" placeholder="AAAA-MM-DDTHH:MM" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="opSize">Quantidade</label>
+        <select id="opSize" name="opSize">
+            @foreach (var size in new[] { 25, 50, 100 })
+            {
+                <option value="@size" selected="@(Model.OpPageSize == size)">@size</option>
+            }
+        </select>
+    </div>
+    @* Preserva o estado atual da lista de autenticação ao filtrar a operacional. *@
+    @if (Model.AuthUsername is not null) { <input type="hidden" name="authUsername" value="@Model.AuthUsername" /> }
+    @if (Model.AuthSucceeded is not null) { <input type="hidden" name="authSucceeded" value="@Model.AuthSucceeded" /> }
+    @if (Model.AuthReason is not null) { <input type="hidden" name="authReason" value="@Model.AuthReason" /> }
+    @if (Model.AuthFrom is not null) { <input type="hidden" name="authFrom" value="@Model.AuthFrom" /> }
+    @if (Model.AuthTo is not null) { <input type="hidden" name="authTo" value="@Model.AuthTo" /> }
+    @if (Model.AuthCursor is not null) { <input type="hidden" name="authCursor" value="@Model.AuthCursor" /> }
+    <input type="hidden" name="authSize" value="@Model.AuthPageSize" />
+    <div class="field actions">
+        <button type="submit" class="btn primary">Filtrar</button>
+        <a class="btn" asp-page="/Audit/Index">Limpar filtros</a>
+    </div>
+</form>
+
+@if (Model.Operations.Count == 0)
 {
-    <p class="empty">Nenhum evento operacional registrado neste projeto.</p>
+    <p class="empty">Nenhum evento operacional para os filtros selecionados neste projeto.</p>
 }
 else
 {
@@ -27,7 +75,7 @@ else
                 <tr><th>Quando (UTC)</th><th>Usuário</th><th>Ação</th><th>Recurso</th><th>Resultado</th><th>Motivo</th><th>Correlação</th></tr>
             </thead>
             <tbody>
-                @foreach (var e in operations)
+                @foreach (var e in Model.Operations)
                 {
                     <tr>
                         <td class="mono">@e.OccurredAtUtc.ToString("u")</td>
@@ -42,12 +90,66 @@ else
             </tbody>
         </table>
     </div>
+    <p class="empty">Mostrando até @Model.OpPageSize registros.</p>
+    @if (Model.OperationsHasMore)
+    {
+        <p><a class="btn" asp-page="/Audit/Index" asp-all-route-data="@Model.OperationsNextRoute">Próxima →</a></p>
+    }
 }
 
 <h2>Autenticação</h2>
-@if (signIns.Count == 0)
+<form method="get" class="filters">
+    <div class="field">
+        <label for="authUsername">Usuário (prefixo)</label>
+        <input id="authUsername" name="authUsername" value="@Model.AuthUsername" maxlength="200" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="authSucceeded">Resultado</label>
+        <select id="authSucceeded" name="authSucceeded">
+            <option value="">(todos)</option>
+            <option value="true" selected="@(Model.AuthSucceeded == "true")">sucesso</option>
+            <option value="false" selected="@(Model.AuthSucceeded == "false")">falha</option>
+        </select>
+    </div>
+    <div class="field">
+        <label for="authReason">Motivo</label>
+        <input id="authReason" name="authReason" value="@Model.AuthReason" maxlength="100" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="authFrom">De (UTC)</label>
+        <input id="authFrom" name="authFrom" value="@Model.AuthFrom" placeholder="AAAA-MM-DDTHH:MM" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="authTo">Até (UTC)</label>
+        <input id="authTo" name="authTo" value="@Model.AuthTo" placeholder="AAAA-MM-DDTHH:MM" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="authSize">Quantidade</label>
+        <select id="authSize" name="authSize">
+            @foreach (var size in new[] { 25, 50, 100 })
+            {
+                <option value="@size" selected="@(Model.AuthPageSize == size)">@size</option>
+            }
+        </select>
+    </div>
+    @* Preserva o estado atual da lista operacional ao filtrar a de autenticação. *@
+    @if (Model.OpAction is not null) { <input type="hidden" name="opAction" value="@Model.OpAction" /> }
+    @if (Model.OpUsername is not null) { <input type="hidden" name="opUsername" value="@Model.OpUsername" /> }
+    @if (Model.OpSucceeded is not null) { <input type="hidden" name="opSucceeded" value="@Model.OpSucceeded" /> }
+    @if (Model.OpCorrelation is not null) { <input type="hidden" name="opCorrelation" value="@Model.OpCorrelation" /> }
+    @if (Model.OpFrom is not null) { <input type="hidden" name="opFrom" value="@Model.OpFrom" /> }
+    @if (Model.OpTo is not null) { <input type="hidden" name="opTo" value="@Model.OpTo" /> }
+    @if (Model.OpCursor is not null) { <input type="hidden" name="opCursor" value="@Model.OpCursor" /> }
+    <input type="hidden" name="opSize" value="@Model.OpPageSize" />
+    <div class="field actions">
+        <button type="submit" class="btn primary">Filtrar</button>
+        <a class="btn" asp-page="/Audit/Index">Limpar filtros</a>
+    </div>
+</form>
+
+@if (Model.SignIns.Count == 0)
 {
-    <p class="empty">Nenhum evento de autenticação registrado.</p>
+    <p class="empty">Nenhum evento de autenticação para os filtros selecionados.</p>
 }
 else
 {
@@ -57,7 +159,7 @@ else
                 <tr><th>Quando (UTC)</th><th>Usuário</th><th>Resultado</th><th>Motivo</th><th>Origem</th></tr>
             </thead>
             <tbody>
-                @foreach (var e in signIns)
+                @foreach (var e in Model.SignIns)
                 {
                     <tr>
                         <td class="mono">@e.OccurredAtUtc.ToString("u")</td>
@@ -70,4 +172,9 @@ else
             </tbody>
         </table>
     </div>
+    <p class="empty">Mostrando até @Model.AuthPageSize registros.</p>
+    @if (Model.SignInsHasMore)
+    {
+        <p><a class="btn" asp-page="/Audit/Index" asp-all-route-data="@Model.SignInsNextRoute">Próxima →</a></p>
+    }
 }

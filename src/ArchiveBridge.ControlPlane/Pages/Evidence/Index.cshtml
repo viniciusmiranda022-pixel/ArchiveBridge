@@ -1,29 +1,81 @@
 @page
-@inject IControlPlaneQueries Queries
-@inject IPortalScopeAccessor ScopeAccessor
+@model ArchiveBridge.ControlPlane.Pages.Evidence.IndexModel
 @{
     ViewData["Title"] = "Evidências";
-    var scope = ScopeAccessor.Resolve(User);
-    var environments = await Queries.ListEvEnvironmentsAsync(scope, HttpContext.RequestAborted);
-    var withEvidence = environments.Where(e => e.LatestDiscovery is not null).ToList();
 }
-<h1>Evidências de descoberta</h1>
+<h1>Evidências de descoberta — histórico</h1>
 <p class="lead">
-    Metadados do artefato imutável de evidência (<span class="mono">evidence.json</span>): hashes autoritativos,
-    caminho lógico e tamanho. O read-model nunca expõe a evidência bruta diretamente.
+    Histórico navegável dos metadados do artefato imutável de evidência (<span class="mono">evidence.json</span>):
+    hashes autoritativos, caminho lógico e tamanho por versão de descoberta. O read-model nunca expõe a
+    evidência bruta; a paginação é keyset (estável sob inserções concorrentes), sem alterar o download verificado.
 </p>
 
 <div class="notice">
     <strong>Download verificado habilitado.</strong> Antes de entregar <span class="mono">evidence.json</span>,
-    o portal resolve a evidência no tenant/projeto autenticado, valida o bundle imutável
-    (<span class="mono">evidence.json + evidence.sha256 + manifest.json</span>), confere caminho lógico,
+    o portal resolve a evidência no tenant/projeto autenticado, valida o bundle imutável, confere caminho lógico,
     tamanho e SHA-256 dos bytes contra o SQL e registra a leitura na trilha operacional. Qualquer divergência
     bloqueia o download; os bytes do JSON nunca são reserializados.
 </div>
 
-@if (withEvidence.Count == 0)
+<form method="get" class="filters">
+    <div class="field">
+        <label for="site">Site (prefixo)</label>
+        <input id="site" name="site" value="@Model.SiteFilter" maxlength="100" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="env">Environment ID</label>
+        <input id="env" name="env" value="@Model.EnvironmentFilter" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="result">Resultado</label>
+        <select id="result" name="result">
+            <option value="">(todos)</option>
+            @foreach (var status in new[] { "Ready", "Blocked", "Unsupported", "Failed" })
+            {
+                if (Model.ResultStatusFilter == status)
+                {
+                    <option value="@status" selected>@status</option>
+                }
+                else
+                {
+                    <option value="@status">@status</option>
+                }
+            }
+        </select>
+    </div>
+    <div class="field">
+        <label for="from">De (UTC)</label>
+        <input id="from" name="from" value="@Model.FromFilter" placeholder="AAAA-MM-DDTHH:MM" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="to">Até (UTC)</label>
+        <input id="to" name="to" value="@Model.ToFilter" placeholder="AAAA-MM-DDTHH:MM" autocomplete="off" />
+    </div>
+    <div class="field">
+        <label for="size">Quantidade</label>
+        <select id="size" name="size">
+            @foreach (var size in new[] { 25, 50, 100 })
+            {
+                if (Model.PageSize == size)
+                {
+                    <option value="@size" selected>@size</option>
+                }
+                else
+                {
+                    <option value="@size">@size</option>
+                }
+            }
+        </select>
+    </div>
+    <div class="field actions">
+        <button type="submit" class="btn primary">Filtrar</button>
+        <a class="btn" asp-page="/Evidence/Index">Limpar filtros</a>
+    </div>
+</form>
+
+@if (Model.Items.Count == 0)
 {
-    <p class="empty">Nenhuma evidência de descoberta registrada neste projeto.</p>
+    <p class="empty">Nenhuma evidência histórica para os filtros selecionados neste projeto.</p>
 }
 else
 {
@@ -31,31 +83,37 @@ else
         <table>
             <thead>
                 <tr>
-                    <th>Site</th><th>Versão</th><th>Resultado</th><th>Config. hash</th>
-                    <th>Hash semântico</th><th>SHA-256 do arquivo</th><th>Caminho lógico</th><th>Tamanho</th><th>Ação</th>
+                    <th>Site</th><th>Versão</th><th>Ciclo de vida</th><th>Resultado</th><th>Config. hash</th>
+                    <th>Hash semântico</th><th>SHA-256 do arquivo</th><th>Caminho lógico</th><th>Tamanho</th><th>Concluída (UTC)</th><th>Ação</th>
                 </tr>
             </thead>
             <tbody>
-                @foreach (var e in withEvidence)
+                @foreach (var item in Model.Items)
                 {
-                    var disc = e.LatestDiscovery!;
                     <tr>
-                        <td>@e.SiteName</td>
-                        <td>v@disc.DiscoveryVersion</td>
-                        <td>@disc.ResultStatus</td>
-                        <td class="mono">@disc.ConfigurationHash[..Math.Min(16, disc.ConfigurationHash.Length)]…</td>
-                        <td class="mono">@disc.EvidenceHash</td>
-                        <td class="mono">@disc.ContentSha256</td>
-                        <td class="mono">@disc.EvidencePath</td>
-                        <td>@disc.EvidenceSizeBytes.ToString("N0") B</td>
+                        <td>@item.SiteName</td>
+                        <td>v@item.DiscoveryVersion</td>
+                        <td><span class="pill">@item.LifecycleStatus</span></td>
+                        <td>@item.ResultStatus</td>
+                        <td class="mono">@item.ConfigurationHash[..Math.Min(16, item.ConfigurationHash.Length)]…</td>
+                        <td class="mono">@item.EvidenceHash</td>
+                        <td class="mono">@item.ContentSha256</td>
+                        <td class="mono">@item.EvidencePath</td>
+                        <td>@item.EvidenceSizeBytes.ToString("N0") B</td>
+                        <td class="mono">@item.CompletedAtUtc.ToString("u")</td>
                         <td>
                             <a asp-page="/Evidence/Download"
-                               asp-route-environmentId="@e.EnvironmentId"
-                               asp-route-version="@disc.DiscoveryVersion">Baixar evidence.json</a>
+                               asp-route-environmentId="@item.EnvironmentId"
+                               asp-route-version="@item.DiscoveryVersion">Baixar evidence.json</a>
                         </td>
                     </tr>
                 }
             </tbody>
         </table>
     </div>
+    <p class="empty">Mostrando até @Model.PageSize registros.</p>
+    @if (Model.HasMore)
+    {
+        <p><a class="btn" asp-page="/Evidence/Index" asp-all-route-data="@Model.NextPageRoute">Próxima →</a></p>
+    }
 }

@@ -22,6 +22,17 @@ public sealed record PortalSignInEvent(
     DateTimeOffset OccurredAtUtc);
 
 /// <summary>
+/// Filtros da trilha de autenticação. Todos opcionais; valores textuais normalizados e nunca convertidos em
+/// SQL. O tenant NÃO faz parte do filtro público (server-side). <see cref="Succeeded"/> é tri-estado.
+/// </summary>
+public sealed record PortalSignInAuditFilter(
+    string? UsernamePrefix,
+    bool? Succeeded,
+    string? Reason,
+    DateTimeOffset? FromUtc,
+    DateTimeOffset? ToUtc);
+
+/// <summary>
 /// Porta de auditoria de autenticação do portal. As escritas são intrínsecas ao fluxo de login (toda
 /// tentativa é registrada, bem ou mal sucedida); a leitura alimenta a trilha de auditoria do portal e é
 /// SEMPRE escopada por tenant (as tabelas de identidade não estão sob a RLS por tenant, então o filtro
@@ -38,4 +49,16 @@ public interface IPortalSignInAudit
     /// tenant e não aparecem nesta trilha.
     /// </summary>
     Task<IReadOnlyList<PortalSignInEvent>> RecentAsync(TenantId tenant, int max, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Busca paginada (keyset/seek) das tentativas de autenticação DO TENANT informado. Ordem determinística
+    /// <c>occurred_at_utc</c> DESC, <c>event_id</c> DESC; filtro obrigatório <c>tenant_id = @tenant</c> (a
+    /// tabela não está sob RLS). Eventos com tenant nulo não aparecem. Nunca cross-tenant.
+    /// </summary>
+    Task<KeysetPage<PortalSignInEvent, AuditSeekPosition>> SearchAsync(
+        TenantId tenant,
+        PortalSignInAuditFilter filter,
+        int pageSize,
+        AuditSeekPosition? after,
+        CancellationToken cancellationToken);
 }

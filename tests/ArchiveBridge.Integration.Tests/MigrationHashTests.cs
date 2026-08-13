@@ -1,3 +1,4 @@
+using System.Globalization;
 using ArchiveBridge.Infrastructure.Persistence;
 using ArchiveBridge.Integration.Tests.Support;
 using Microsoft.Data.SqlClient;
@@ -8,6 +9,30 @@ namespace ArchiveBridge.Integration.Tests;
 [Collection(SqlServerCollectionDefinition.Name)]
 public sealed class MigrationHashTests(SqlServerFixture fixture)
 {
+    [Fact]
+    public async Task Migration0017AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // A fixture já aplicou TODAS as migrations (incluindo a 0017). Re-executar o runner é idempotente E
+        // revalida os hashes armazenados contra o conteúdo embutido: se qualquer migration 0011–0016 tivesse
+        // divergido, isto lançaria. Um re-apply limpo prova que os hashes anteriores permanecem estáveis.
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 17;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using var indexes = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.indexes WHERE name IN ('IX_evd_scope_completed', 'IX_portal_sign_in_events_tenant_time_event');",
+            connection);
+        Assert.Equal(2, Convert.ToInt32(await indexes.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
     [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
