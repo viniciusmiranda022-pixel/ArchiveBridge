@@ -12,6 +12,11 @@ namespace ArchiveBridge.Infrastructure.ControlPlane;
 /// </summary>
 public sealed class SqlPortalOperationalAudit(TenantConnectionFactory connectionFactory) : IPortalOperationalAudit
 {
+    // Espelha o teto de comprimento do prefixo de usuário imposto no PageModel (Audit/Index). O parâmetro
+    // @usernamePrefix é dimensionado pelo pior caso do escaping (ver SqlLikePattern.MaxEscapedPrefixLength)
+    // para nunca truncar o padrão escapado.
+    private const int UsernamePrefixRawMaxLength = 200;
+
     private const string InsertSql =
         """
         INSERT INTO dbo.portal_operational_audit_events
@@ -126,7 +131,8 @@ public sealed class SqlPortalOperationalAudit(TenantConnectionFactory connection
         command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
         command.Parameters.Add(new SqlParameter("@actionCode", SqlDbType.NVarChar, 64)
         { Value = filter.ActionCode is { } ac ? ac : DBNull.Value });
-        command.Parameters.Add(new SqlParameter("@usernamePrefix", SqlDbType.NVarChar, 200)
+        command.Parameters.Add(new SqlParameter("@usernamePrefix", SqlDbType.NVarChar,
+            SqlLikePattern.MaxEscapedPrefixLength(UsernamePrefixRawMaxLength))
         { Value = filter.UsernamePrefix is { } up ? SqlLikePattern.EscapedPrefix(up) : DBNull.Value });
         command.Parameters.Add(new SqlParameter("@succeeded", SqlDbType.Bit)
         { Value = filter.Succeeded is { } sc ? sc : DBNull.Value });

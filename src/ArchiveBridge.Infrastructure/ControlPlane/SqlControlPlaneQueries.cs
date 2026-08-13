@@ -22,6 +22,11 @@ namespace ArchiveBridge.Infrastructure.ControlPlane;
 /// </summary>
 public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFactory) : IControlPlaneQueries
 {
+    // Espelha o teto de comprimento do prefixo de site imposto no PageModel (Evidence/Index). O parâmetro
+    // @sitePrefix é dimensionado pelo pior caso do escaping (ver SqlLikePattern.MaxEscapedPrefixLength) para
+    // nunca truncar o padrão escapado.
+    private const int SitePrefixRawMaxLength = 100;
+
     private const string DashboardSql =
         """
         WITH latest_ev AS (
@@ -344,7 +349,8 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
         { Value = (object?)filter.EnvironmentId ?? DBNull.Value });
         command.Parameters.Add(new SqlParameter("@resultStatus", SqlDbType.TinyInt)
         { Value = filter.ResultStatus is { } rs ? (byte)rs : DBNull.Value });
-        command.Parameters.Add(new SqlParameter("@sitePrefix", SqlDbType.NVarChar, 200)
+        command.Parameters.Add(new SqlParameter("@sitePrefix", SqlDbType.NVarChar,
+            SqlLikePattern.MaxEscapedPrefixLength(SitePrefixRawMaxLength))
         { Value = filter.SitePrefix is { } sp ? SqlLikePattern.EscapedPrefix(sp) : DBNull.Value });
         command.Parameters.Add(new SqlParameter("@fromUtc", SqlDbType.DateTime2)
         { Value = filter.FromUtc is { } f ? f.UtcDateTime : DBNull.Value });

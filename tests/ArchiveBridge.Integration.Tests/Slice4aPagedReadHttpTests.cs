@@ -3,6 +3,7 @@ using System.Net;
 using System.Text.RegularExpressions;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.ControlPlane.Composition;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Infrastructure.ControlPlane;
 using ArchiveBridge.Integration.Tests.Support;
@@ -22,6 +23,7 @@ namespace ArchiveBridge.Integration.Tests;
 public sealed class Slice4aPagedReadHttpTests : IDisposable
 {
     private static readonly Pbkdf2PasswordHasher Hasher = new();
+    private static readonly DateTimeOffset Base = new(2027, 1, 1, 0, 0, 0, TimeSpan.Zero);
     private readonly SqlServerFixture _fixture;
     private readonly WebApplicationFactory<Program> _factory;
 
@@ -179,11 +181,172 @@ public sealed class Slice4aPagedReadHttpTests : IDisposable
         Assert.Equal(before, after); // visualizar/paginar auditoria NÃO gera evento (sem recursão)
     }
 
+    [Fact]
+    public async Task EvidenceHistoryRejectsInvertedDateRangeWith400()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+        var (username, password) = await SeedUserAsync(scope, PortalRoles.Viewer);
+
+        using var client = _factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+        await LoginAsync(client, username, password);
+
+        // From > To ⇒ 400 fail-closed (nenhuma query executa).
+        using var response = await client.GetAsync(new Uri(
+            "/Evidence/Index?from=2027-01-02T00:00:00Z&to=2027-01-01T00:00:00Z", UriKind.Relative));
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task AuditRejectsInvalidAuthCursorWith400()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+        var (auditor, auditorPw) = await SeedUserAsync(scope, PortalRoles.Auditor);
+
+        using var client = _factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+        await LoginAsync(client, auditor, auditorPw);
+
+        // authCursor inválido ⇒ 400 (prova equivalente à do opCursor, para a lista de autenticação).
+        using var response = await client.GetAsync(new Uri("/Audit/Index?authCursor=@@invalid@@", UriKind.Relative));
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task AuditRejectsAuthCursorWithDivergentFiltersWith400()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+        var (auditor, auditorPw) = await SeedUserAsync(scope, PortalRoles.Auditor);
+
+        using var client = _factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+        await LoginAsync(client, auditor, auditorPw);
+
+        // Cursor bem-formado, gerado com o fingerprint dos filtros VAZIOS; reusado com um filtro divergente
+        // (authReason) ⇒ o fingerprint recomputado não casa ⇒ 400.
+        var cursor = KeysetCursor.Encode(
+            FilterFingerprint.Compute(null, null, null, null, null), new AuditSeekPosition(Base, 5));
+        using var response = await client.GetAsync(new Uri(
+            $"/Audit/Index?authReason=login-failed&authCursor={cursor}", UriKind.Relative));
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task AuditOperationalAndSignInPaginateIndependently()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+        var (auditor, auditorPw) = await SeedUserAsync(scope, PortalRoles.Auditor);
+        var userId = await FindUserIdAsync(auditor);
+        await SeedOperationalEventsAsync(scope, userId, 60);
+        await SeedSignInEventsAsync(scope.Tenant.Value, 60);
+
+        var audit = new SqlPortalOperationalAudit(_fixture.Factory);
+        var before = (await audit.RecentAsync(scope, 500, CancellationToken.None)).Count;
+
+        using var client = _factory.CreateClient();
+        await LoginAsync(client, auditor, auditorPw);
+
+        // Página inicial: ambas as listas têm "Próxima"; a auth carrega um filtro (authSucceeded=true).
+        var html1 = await GetStringAsync(client, "/Audit/Index?opSize=25&authSize=25&authSucceeded=true");
+        var (opNext1, authNext1) = ExtractAuditNextLinks(html1);
+        Assert.NotNull(opNext1);
+        Assert.NotNull(authNext1);
+        // "Próxima" da operacional: muda opCursor, preserva o filtro de auth e NÃO toca no cursor de auth.
+        Assert.Contains("opCursor=", opNext1!, StringComparison.Ordinal);
+        Assert.Contains("authSucceeded=true", opNext1!, StringComparison.Ordinal);
+        Assert.DoesNotContain("authCursor=", opNext1!, StringComparison.Ordinal);
+        // "Próxima" da auth: muda authCursor, preserva o filtro; op ainda na página 1 (sem opCursor).
+        Assert.Contains("authCursor=", authNext1!, StringComparison.Ordinal);
+        Assert.Contains("authSucceeded=true", authNext1!, StringComparison.Ordinal);
+        Assert.DoesNotContain("opCursor=", authNext1!, StringComparison.Ordinal);
+
+        // Avança a OPERACIONAL para a página 2.
+        var html2 = await GetStringAsync(client, WebUtility.HtmlDecode(opNext1!));
+        var (opNext2, authNext2) = ExtractAuditNextLinks(html2);
+        Assert.NotNull(opNext2);
+        Assert.NotNull(authNext2);
+        Assert.NotEqual(QueryValue(opNext1!, "opCursor"), QueryValue(opNext2!, "opCursor")); // op avançou
+        // A "Próxima" da auth nesta página preserva o estado da operacional (op page-2) + o filtro de auth.
+        Assert.Contains("authCursor=", authNext2!, StringComparison.Ordinal);
+        Assert.Contains("opCursor=", authNext2!, StringComparison.Ordinal);
+        Assert.Contains("authSucceeded=true", authNext2!, StringComparison.Ordinal);
+
+        // Agora avança a AUTH, preservando a operacional na página 2.
+        var html3 = await GetStringAsync(client, WebUtility.HtmlDecode(authNext2!));
+        var (opNext3, _) = ExtractAuditNextLinks(html3);
+        Assert.NotNull(opNext3);
+        // A operacional permaneceu na página 2 (mesmo opCursor de destino que em html2): estado preservado.
+        Assert.Equal(QueryValue(opNext2!, "opCursor"), QueryValue(opNext3!, "opCursor"));
+
+        // Nenhuma dessas navegações de leitura gerou evento operacional (sem recursão de auditoria).
+        var after = (await audit.RecentAsync(scope, 500, CancellationToken.None)).Count;
+        Assert.Equal(before, after);
+    }
+
     private static string? ExtractNextHref(string html)
     {
         // O link "Próxima" resolve para /Evidence (Index é a página padrão) e é o único com "cursor=".
         var match = Regex.Match(html, "href=\"(/Evidence[^\"]*cursor=[^\"]*)\"", RegexOptions.CultureInvariant);
         return match.Success ? match.Groups[1].Value : null;
+    }
+
+    // Extrai os DOIS links "Próxima" da página de auditoria — um por seção (operacional e autenticação),
+    // separadas pelo cabeçalho "<h2>Autenticação</h2>". Cada link resolve para /Audit (Index é a página padrão).
+    private static (string? OpNext, string? AuthNext) ExtractAuditNextLinks(string html)
+    {
+        var split = html.IndexOf("<h2>Autenticação</h2>", StringComparison.Ordinal);
+        var opSection = split >= 0 ? html[..split] : html;
+        var authSection = split >= 0 ? html[split..] : string.Empty;
+        return (ExtractAuditHref(opSection), ExtractAuditHref(authSection));
+    }
+
+    private static string? ExtractAuditHref(string section)
+    {
+        var match = Regex.Match(section, "href=\"(/Audit\\?[^\"]*)\"[^>]*>Próxima", RegexOptions.CultureInvariant);
+        return match.Success ? match.Groups[1].Value : null;
+    }
+
+    private static string QueryValue(string href, string key)
+    {
+        var match = Regex.Match(href, Regex.Escape(key) + "=([^&\"]*)", RegexOptions.CultureInvariant);
+        return match.Success ? match.Groups[1].Value : string.Empty;
+    }
+
+    private static async Task<string> GetStringAsync(HttpClient client, string relativeUri)
+    {
+        using var response = await client.GetAsync(new Uri(relativeUri, UriKind.Relative));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return await response.Content.ReadAsStringAsync();
+    }
+
+    private async Task<Guid> FindUserIdAsync(string username)
+    {
+        var record = await new SqlPortalUserStore(_fixture.ConnectionString)
+            .FindByUsernameAsync(username, CancellationToken.None);
+        return record!.UserId;
+    }
+
+    private async Task SeedOperationalEventsAsync(TenantScope scope, Guid userId, int count)
+    {
+        var audit = new SqlPortalOperationalAudit(_fixture.Factory);
+        for (var i = 0; i < count; i++)
+        {
+            await audit.RecordAsync(scope, new PortalOperationalAuditEvent(
+                userId, "opuser", "op.act", "res", $"res{i:D4}", true, "reason", Guid.NewGuid(), Base.AddSeconds(i)),
+                CancellationToken.None);
+        }
+    }
+
+    private async Task SeedSignInEventsAsync(Guid tenantId, int count)
+    {
+        var audit = new SqlPortalSignInAudit(_fixture.ConnectionString);
+        for (var i = 0; i < count; i++)
+        {
+            await audit.RecordAsync(new PortalSignInEvent(
+                tenantId, null, null, "signin-user", true, $"r{i:D4}", "127.0.0.1", Guid.NewGuid(), Base.AddSeconds(i)),
+                CancellationToken.None);
+        }
     }
 
     private async Task<(string Username, string Password)> SeedUserAsync(TenantScope scope, string role)

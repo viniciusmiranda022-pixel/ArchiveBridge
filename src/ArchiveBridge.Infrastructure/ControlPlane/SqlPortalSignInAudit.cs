@@ -14,6 +14,11 @@ namespace ArchiveBridge.Infrastructure.ControlPlane;
 /// </summary>
 public sealed class SqlPortalSignInAudit(string connectionString) : IPortalSignInAudit
 {
+    // Espelha o teto de comprimento do prefixo de usuário imposto no PageModel (Audit/Index). O parâmetro
+    // @usernamePrefix é dimensionado pelo pior caso do escaping (ver SqlLikePattern.MaxEscapedPrefixLength)
+    // para nunca truncar o padrão escapado.
+    private const int UsernamePrefixRawMaxLength = 200;
+
     private const string InsertSql =
         """
         INSERT INTO dbo.portal_sign_in_events
@@ -120,7 +125,8 @@ public sealed class SqlPortalSignInAudit(string connectionString) : IPortalSignI
         await using var command = new SqlCommand(SearchSql, connection);
         command.Parameters.Add(new SqlParameter("@take", SqlDbType.Int) { Value = bounded + 1 });
         command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = tenant.Value });
-        command.Parameters.Add(new SqlParameter("@usernamePrefix", SqlDbType.NVarChar, 200)
+        command.Parameters.Add(new SqlParameter("@usernamePrefix", SqlDbType.NVarChar,
+            SqlLikePattern.MaxEscapedPrefixLength(UsernamePrefixRawMaxLength))
         { Value = filter.UsernamePrefix is { } up ? SqlLikePattern.EscapedPrefix(up) : DBNull.Value });
         command.Parameters.Add(new SqlParameter("@succeeded", SqlDbType.Bit)
         { Value = filter.Succeeded is { } sc ? sc : DBNull.Value });

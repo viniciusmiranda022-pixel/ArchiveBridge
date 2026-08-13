@@ -52,6 +52,50 @@ public sealed class Slice4aKeysetCursorTests
         Assert.Null(decoded);
     }
 
+    [Fact]
+    public void OversizedCursorIsRejectedBeforeDecoding()
+    {
+        // Muito acima do teto (2048). Deve ser recusado ANTES de qualquer normalização/deserialização — sem
+        // exceção. (Caracteres do alfabeto Base64Url para provar que é o TAMANHO, não o alfabeto, que barra.)
+        var oversized = new string('A', 4096);
+        Assert.False(KeysetCursor.TryDecode<AuditSeekPosition>(oversized, Fingerprint, out var decoded));
+        Assert.Null(decoded);
+    }
+
+    [Theory]
+    [InlineData("YWJ+")]     // '+' — alfabeto Base64 padrão, NÃO Base64Url
+    [InlineData("YWJ/")]     // '/' — idem
+    [InlineData("YWJj=")]    // '=' — padding não é cursor canônico
+    [InlineData("YW Jj")]    // espaço
+    [InlineData("YWJj\n")]   // controle
+    public void NonCanonicalBase64UrlAlphabetIsRejected(string cursor)
+    {
+        // "URL-safe estrito": só A–Z a–z 0–9 - _ são aceitos. '+', '/', '=' e quaisquer outros ⇒ recusa.
+        Assert.False(KeysetCursor.TryDecode<AuditSeekPosition>(cursor, Fingerprint, out var decoded));
+        Assert.Null(decoded);
+    }
+
+    [Fact]
+    public void StandardBase64OfAValidEnvelopeIsRejectedWhenNotUrlSafe()
+    {
+        // Mesmo payload de um cursor válido, mas em Base64 PADRÃO (com '+'/'/' e padding '='): não é canônico.
+        var position = new AuditSeekPosition(new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero), 7);
+        var urlSafe = KeysetCursor.Encode(Fingerprint, position);
+        var standard = urlSafe.Replace('-', '+').Replace('_', '/');
+        switch (standard.Length % 4)
+        {
+            case 2: standard += "=="; break;
+            case 3: standard += "="; break;
+        }
+
+        // O canônico decodifica; a forma padrão (se diferir por conter +/ / ou '=') é recusada.
+        Assert.True(KeysetCursor.TryDecode<AuditSeekPosition>(urlSafe, Fingerprint, out _));
+        if (!string.Equals(standard, urlSafe, StringComparison.Ordinal))
+        {
+            Assert.False(KeysetCursor.TryDecode<AuditSeekPosition>(standard, Fingerprint, out _));
+        }
+    }
+
     [Theory]
     [InlineData("")]
     [InlineData("!!!not-base64!!!")]

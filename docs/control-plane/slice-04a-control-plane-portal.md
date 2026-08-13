@@ -221,13 +221,21 @@ parametrizados e o predicado de seek, recebendo uma posição já validada. O Co
 **cursor** URL-safe.
 
 **Cursor.** Envelope versionado (Base64Url + JSON) que carrega **apenas** as chaves de ordenação e o
-**fingerprint** dos filtros. Decodificação estrita e fail-closed: Base64/JSON inválido, versão desconhecida,
-posição malformada ou fingerprint divergente ⇒ `HTTP 400` (nunca `500`; nenhuma query com valor parcial). O
-cursor **não é autorização** e **não contém** tenant/projeto — o escopo é sempre re-resolvido do principal.
+**fingerprint** dos filtros. Decodificação estrita e fail-closed: cursor acima do teto de tamanho (`2048`,
+checado antes de qualquer alocação), fora do alfabeto Base64Url estrito (`A–Z a–z 0–9 - _`; `=`, `+`, `/`
+recusados), Base64/JSON inválido, versão desconhecida, posição malformada ou fingerprint divergente ⇒
+`HTTP 400` (nunca `500`; nenhuma query com valor parcial). O cursor é **entrada não confiável** e **não é
+autorização**: Base64Url **não é assinatura**, o fingerprint **não é MAC** (garante só a consistência
+cursor↔filtros — um cliente deliberado pode forjar um cursor bem-formado, o que **não** concede autoridade),
+e o cursor **não contém** tenant/projeto. O escopo é sempre re-resolvido do principal (RLS + `project_id =
+@project`); uma posição forjada só desloca o ponto temporal da consulta já escopada, jamais troca o escopo.
+Autenticidade criptográfica do cursor, se exigida, é hardening do Passo 8.
 
 **Limites e segurança.** `pageSize` do cliente é normalizado (clamp `[1, 100]`) server-side; `TOP
 (pageSize + 1)` decide `HasMore` sem contagem total. Prefixos usam `LIKE ESCAPE N'\'` com escaping literal
-(curingas são dados). Sem ordenação dinâmica. Índices de seek na migration **aditiva** `0017`
+(curingas são dados); o parâmetro `NVARCHAR` é dimensionado pelo pior caso do escaping (`rawMax*2+1` —
+SitePrefix `201`, UsernamePrefix `401`), nunca truncando o padrão no boundary. Sem ordenação dinâmica. Índices
+de seek na migration **aditiva** `0017`
 (`IX_evd_scope_completed`; `IX_portal_sign_in_events_tenant_time_event`; a trilha operacional já tinha
 índice alinhado). Nenhuma navegação de leitura gera evento de auditoria (sem recursão). O threat-model delta
 está em `docs/security/threat-model-slice-04a.md`.

@@ -1,6 +1,7 @@
 using System.Data;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.ControlPlane.Composition;
 using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 using ArchiveBridge.Domain.IdentityAndAccess;
 using ArchiveBridge.Domain.Projects;
@@ -286,9 +287,306 @@ public sealed class Slice4aPagedReadTests(SqlServerFixture fixture)
         Assert.Equal("prod_site", page.Items[0].SiteName); // '_' literal, não curinga
     }
 
+    [Fact]
+    public async Task EvidenceHistoryIsDeterministicWhenTimestampsAreEqual()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+
+        // 120 execuções MADURAS (uma por ambiente, pela UX_evd_single_current) com EXATAMENTE o mesmo
+        // completed_at_utc: o desempate (environment_id DESC, discovery_version DESC) tem de resolver tudo.
+        var expected = new HashSet<Guid>();
+        for (var i = 0; i < 120; i++)
+        {
+            expected.Add(await SeedRunOnNewEnvironmentAsync(scope, status: 2, resultStatus: 2, Base));
+        }
+
+        var queries = new SqlControlPlaneQueries(_fixture.Factory);
+        var filter = new EvEvidenceFilter(null, null, null, null, null);
+        var all = await TraverseAsync<EvEvidenceListItem, EvidenceSeekPosition>(
+            (size, after) => queries.SearchEvEvidencePageAsync(scope, filter, size, after, CancellationToken.None), 25);
+
+        Assert.Equal(120, all.Count);                                   // travessia termina
+        Assert.Equal(120, all.Select(e => e.EnvironmentId).Distinct().Count()); // zero duplicatas/lacunas
+        Assert.True(expected.SetEquals(all.Select(e => e.EnvironmentId)));
+    }
+
+    [Fact]
+    public async Task EvidenceInsertBetweenPagesDoesNotDuplicateEarlierRows()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+        for (var i = 0; i < 120; i++)
+        {
+            await SeedRunOnNewEnvironmentAsync(scope, status: 2, resultStatus: 2, Base.AddSeconds(i));
+        }
+
+        var queries = new SqlControlPlaneQueries(_fixture.Factory);
+        var filter = new EvEvidenceFilter(null, null, null, null, null);
+
+        var page1 = await queries.SearchEvEvidencePageAsync(scope, filter, 25, null, CancellationToken.None);
+        Assert.True(page1.HasMore);
+        var page1Ids = page1.Items.Select(e => e.EnvironmentId).ToHashSet();
+
+        // Insere uma evidência MAIS NOVA que a fronteira da página 1 (num novo ambiente).
+        await SeedRunOnNewEnvironmentAsync(scope, status: 2, resultStatus: 2, Base.AddSeconds(10_000));
+
+        var page2 = await queries.SearchEvEvidencePageAsync(scope, filter, 25, page1.NextPosition, CancellationToken.None);
+        Assert.All(page2.Items, e => Assert.DoesNotContain(e.EnvironmentId, page1Ids)); // nenhuma linha da p1 reaparece
+    }
+
+    [Fact]
+    public async Task EvidencePageSizeIsBounded()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+        for (var i = 0; i < 120; i++)
+        {
+            await SeedRunOnNewEnvironmentAsync(scope, status: 2, resultStatus: 2, Base.AddSeconds(i));
+        }
+
+        var queries = new SqlControlPlaneQueries(_fixture.Factory);
+        var page = await queries.SearchEvEvidencePageAsync(
+            scope, new EvEvidenceFilter(null, null, null, null, null), 1_000_000, null, CancellationToken.None);
+        Assert.Equal(KeysetPaging.MaxPageSize, page.Items.Count); // teto = 100, nunca 120
+        Assert.True(page.HasMore);
+    }
+
+    [Fact]
+    public async Task EvidenceFiltersMatchEnvironmentResultStatusAndDateRange()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+        var envReadyEarly = Guid.NewGuid();
+        var envFailedMid = Guid.NewGuid();
+        var envReadyLate = Guid.NewGuid();
+        await SeedEnvironmentAsync(scope, envReadyEarly, "ready-early");
+        await SeedEnvironmentAsync(scope, envFailedMid, "failed-mid");
+        await SeedEnvironmentAsync(scope, envReadyLate, "ready-late");
+        await SeedRunAsync(scope, envReadyEarly, 1, status: 2, resultStatus: 2, Base);                 // Ready @ 0
+        await SeedRunAsync(scope, envFailedMid, 1, status: 5, resultStatus: 5, Base.AddSeconds(100));  // Failed @ 100
+        await SeedRunAsync(scope, envReadyLate, 1, status: 2, resultStatus: 2, Base.AddSeconds(200));  // Ready @ 200
+
+        var queries = new SqlControlPlaneQueries(_fixture.Factory);
+
+        // EnvironmentId
+        var byEnv = await queries.SearchEvEvidencePageAsync(
+            scope, new EvEvidenceFilter(null, envFailedMid, null, null, null), 50, null, CancellationToken.None);
+        Assert.Equal(envFailedMid, Assert.Single(byEnv.Items).EnvironmentId);
+
+        // ResultStatus (conjunto fechado)
+        var byFailed = await queries.SearchEvEvidencePageAsync(
+            scope, new EvEvidenceFilter(null, null, EvDiscoveryStatus.Failed, null, null), 50, null, CancellationToken.None);
+        Assert.Equal(envFailedMid, Assert.Single(byFailed.Items).EnvironmentId);
+        var byReady = await queries.SearchEvEvidencePageAsync(
+            scope, new EvEvidenceFilter(null, null, EvDiscoveryStatus.Ready, null, null), 50, null, CancellationToken.None);
+        Assert.Equal(new HashSet<Guid> { envReadyEarly, envReadyLate }, byReady.Items.Select(e => e.EnvironmentId).ToHashSet());
+
+        // Intervalo UTC [From, To] — só a execução do meio.
+        var byRange = await queries.SearchEvEvidencePageAsync(
+            scope, new EvEvidenceFilter(null, null, null, Base.AddSeconds(50), Base.AddSeconds(150)), 50, null, CancellationToken.None);
+        Assert.Equal(envFailedMid, Assert.Single(byRange.Items).EnvironmentId);
+    }
+
+    [Fact]
+    public async Task ForgedCursorFromAnotherScopeCannotCrossScope()
+    {
+        // Prova de que CURSOR != AUTORIZAÇÃO: um cursor BEM-FORMADO cujas chaves de seek vêm de A/P2 ou B, usado
+        // por um principal de A/P1, só desloca o ponto temporal DENTRO de A/P1 — nunca revela A/P2 nem B.
+        var a1 = SqlServerFixture.NewScope();
+        var a2 = new TenantScope(a1.Tenant, new ProjectId(Guid.NewGuid()));
+        var b3 = SqlServerFixture.NewScope();
+        foreach (var s in new[] { a1, a2, b3 })
+        {
+            await SeedProjectAsync(s);
+        }
+
+        var env1a = await SeedRunOnNewEnvironmentAsync(a1, status: 2, resultStatus: 2, Base);
+        var env2a = await SeedRunOnNewEnvironmentAsync(a1, status: 2, resultStatus: 2, Base.AddSeconds(10));
+        var foreignA2 = await SeedRunOnNewEnvironmentAsync(a2, status: 2, resultStatus: 2, Base.AddSeconds(15));
+        var foreignB3 = await SeedRunOnNewEnvironmentAsync(b3, status: 2, resultStatus: 2, Base.AddSeconds(15));
+
+        // Constrói MANUALMENTE um cursor bem-formado a partir de dados de A/P2 e o valida com o fingerprint dos
+        // filtros vazios do PageModel de A/P1 (por isso é aceito pelo handler — mesmo assim não troca o escopo).
+        var forgedPosition = new EvidenceSeekPosition(Base.AddSeconds(15), foreignA2, 1);
+        var fingerprint = FilterFingerprint.Compute(null, null, null, null, null);
+        var cursor = KeysetCursor.Encode(fingerprint, forgedPosition);
+        Assert.True(KeysetCursor.TryDecode<EvidenceSeekPosition>(cursor, fingerprint, out var decoded));
+
+        var queries = new SqlControlPlaneQueries(_fixture.Factory);
+        var page = await queries.SearchEvEvidencePageAsync(
+            a1, new EvEvidenceFilter(null, null, null, null, null), 50, decoded, CancellationToken.None);
+
+        var seen = page.Items.Select(e => e.EnvironmentId).ToHashSet();
+        Assert.Equal(new HashSet<Guid> { env1a, env2a }, seen);  // só A/P1, mais antigas que a posição forjada
+        Assert.DoesNotContain(foreignA2, seen);                  // A/P2 jamais aparece
+        Assert.DoesNotContain(foreignB3, seen);                  // B jamais aparece
+    }
+
+    [Fact]
+    public async Task SignInHistoryIsDeterministicWhenTimestampsAreEqual()
+    {
+        var tenant = new TenantId(Guid.NewGuid());
+        for (var i = 0; i < 120; i++)
+        {
+            await SeedSignInAsync(tenant.Value, $"r{i:D5}", Base); // TODOS com o MESMO occurred_at
+        }
+
+        var audit = new SqlPortalSignInAudit(_fixture.ConnectionString);
+        var filter = new PortalSignInAuditFilter(null, null, null, null, null);
+        var reasons = (await TraverseAsync<PortalSignInEvent, AuditSeekPosition>(
+            (size, after) => audit.SearchAsync(tenant, filter, size, after, CancellationToken.None), 25))
+            .Select(e => e.Reason).ToList();
+
+        Assert.Equal(120, reasons.Count);
+        Assert.Equal(120, reasons.Distinct().Count()); // event_id resolve o empate: sem duplicata/lacuna/loop
+    }
+
+    [Fact]
+    public async Task SignInPageSizeIsBounded()
+    {
+        var tenant = new TenantId(Guid.NewGuid());
+        for (var i = 0; i < 120; i++)
+        {
+            await SeedSignInAsync(tenant.Value, $"r{i:D5}", Base.AddSeconds(i));
+        }
+
+        var audit = new SqlPortalSignInAudit(_fixture.ConnectionString);
+        var page = await audit.SearchAsync(
+            tenant, new PortalSignInAuditFilter(null, null, null, null, null), 1_000_000, null, CancellationToken.None);
+        Assert.Equal(KeysetPaging.MaxPageSize, page.Items.Count); // teto = 100
+        Assert.True(page.HasMore);
+    }
+
+    [Fact]
+    public async Task SignInFiltersMatchUsernameSucceededReasonAndDateRange()
+    {
+        var tenant = new TenantId(Guid.NewGuid());
+        await SeedSignInFullAsync(tenant.Value, "alice", succeeded: true, "login-ok", Base);
+        await SeedSignInFullAsync(tenant.Value, "bob", succeeded: false, "bad-password", Base.AddSeconds(100));
+
+        var audit = new SqlPortalSignInAudit(_fixture.ConnectionString);
+
+        var byUser = await audit.SearchAsync(tenant, new PortalSignInAuditFilter("ali", null, null, null, null), 50, null, CancellationToken.None);
+        Assert.Equal("alice", Assert.Single(byUser.Items).Username);
+
+        var byFail = await audit.SearchAsync(tenant, new PortalSignInAuditFilter(null, false, null, null, null), 50, null, CancellationToken.None);
+        Assert.Equal("bob", Assert.Single(byFail.Items).Username);
+
+        var byReason = await audit.SearchAsync(tenant, new PortalSignInAuditFilter(null, null, "bad-password", null, null), 50, null, CancellationToken.None);
+        Assert.Equal("bob", Assert.Single(byReason.Items).Username);
+
+        var byRange = await audit.SearchAsync(
+            tenant, new PortalSignInAuditFilter(null, null, null, Base.AddSeconds(50), Base.AddSeconds(150)), 50, null, CancellationToken.None);
+        Assert.Equal("bob", Assert.Single(byRange.Items).Username);
+    }
+
+    [Fact]
+    public async Task OperationalFiltersMatchActionCodeSucceededAndDateRange()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+        var userId = await SeedUserAsync(scope);
+        await SeedOneOperationalFullAsync(scope, userId, "act.approve", succeeded: true, "u1", Base);
+        await SeedOneOperationalFullAsync(scope, userId, "act.reject", succeeded: false, "u2", Base.AddSeconds(100));
+        await SeedOneOperationalFullAsync(scope, userId, "act.approve", succeeded: true, "u3", Base.AddSeconds(200));
+
+        var audit = new SqlPortalOperationalAudit(_fixture.Factory);
+
+        var byAction = await audit.SearchAsync(scope, new PortalOperationalAuditFilter("act.reject", null, null, null, null, null), 50, null, CancellationToken.None);
+        Assert.Equal("u2", Assert.Single(byAction.Items).Username);
+
+        var byFail = await audit.SearchAsync(scope, new PortalOperationalAuditFilter(null, null, false, null, null, null), 50, null, CancellationToken.None);
+        Assert.Equal("u2", Assert.Single(byFail.Items).Username);
+
+        var byRange = await audit.SearchAsync(
+            scope, new PortalOperationalAuditFilter(null, null, null, null, Base.AddSeconds(50), Base.AddSeconds(150)), 50, null, CancellationToken.None);
+        Assert.Equal("u2", Assert.Single(byRange.Items).Username);
+
+        var byApprove = await audit.SearchAsync(scope, new PortalOperationalAuditFilter("act.approve", null, null, null, null, null), 50, null, CancellationToken.None);
+        var approveNames = byApprove.Items.Select(e => e.Username).ToHashSet();
+        Assert.Equal(2, approveNames.Count);
+        Assert.Contains("u1", approveNames);
+        Assert.Contains("u3", approveNames);
+    }
+
+    // ===================== boundary do escaping LIKE (comprimento máximo) =====================
+
+    [Fact]
+    public async Task EvidenceSitePrefixEscapingHoldsAtMaxLength()
+    {
+        // Prefixo de site no comprimento MÁXIMO (100) saturado de metacaracteres ⇒ padrão escapado de 201 chars.
+        // Com o parâmetro @sitePrefix dimensionado (NVARCHAR 201), o padrão não trunca: o '%' final é preservado
+        // e o site literal (com sufixo) é encontrado; a semântica de curinga permanece INERTE (dados, não sintaxe).
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+        var prefix = MetaChars(100);
+        var envLiteral = Guid.NewGuid();
+        var envWildcard = Guid.NewGuid();
+        await SeedEnvironmentAsync(scope, envLiteral, prefix + "-tail");        // começa com o prefixo LITERAL
+        await SeedEnvironmentAsync(scope, envWildcard, new string('Z', 100) + "-tail"); // só casa se '%'/'_' fossem curinga
+        await SeedRunAsync(scope, envLiteral, 1, status: 2, resultStatus: 2, Base);
+        await SeedRunAsync(scope, envWildcard, 1, status: 2, resultStatus: 2, Base.AddSeconds(1));
+
+        var queries = new SqlControlPlaneQueries(_fixture.Factory);
+        var page = await queries.SearchEvEvidencePageAsync(
+            scope, new EvEvidenceFilter(prefix, null, null, null, null), 50, null, CancellationToken.None);
+
+        Assert.Equal(envLiteral, Assert.Single(page.Items).EnvironmentId); // achado, sem truncar
+        Assert.DoesNotContain(envWildcard, page.Items.Select(e => e.EnvironmentId)); // curinga inerte
+    }
+
+    [Fact]
+    public async Task OperationalUsernamePrefixEscapingHoldsAtMaxLength()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(scope);
+        var userId = await SeedUserAsync(scope);
+        var prefix = MetaChars(200); // padrão escapado = 401 chars (⇒ @usernamePrefix NVARCHAR 401)
+        await SeedOneOperationalFullAsync(scope, userId, "act", true, prefix, Base);            // username = 200 metachars
+        await SeedOneOperationalFullAsync(scope, userId, "act", true, new string('Z', 200), Base.AddSeconds(1));
+
+        var audit = new SqlPortalOperationalAudit(_fixture.Factory);
+        var page = await audit.SearchAsync(
+            scope, new PortalOperationalAuditFilter(null, prefix, null, null, null, null), 50, null, CancellationToken.None);
+
+        Assert.Single(page.Items);
+        Assert.Equal(prefix, page.Items[0].Username); // casa o literal de 200 chars: padrão não truncou
+    }
+
+    [Fact]
+    public async Task SignInUsernamePrefixEscapingHoldsAtMaxLength()
+    {
+        var tenant = new TenantId(Guid.NewGuid());
+        var prefix = MetaChars(200);
+        await SeedSignInFullAsync(tenant.Value, prefix, succeeded: true, "r", Base);
+        await SeedSignInFullAsync(tenant.Value, new string('Z', 200), succeeded: true, "r", Base.AddSeconds(1));
+
+        var audit = new SqlPortalSignInAudit(_fixture.ConnectionString);
+        var page = await audit.SearchAsync(
+            tenant, new PortalSignInAuditFilter(prefix, null, null, null, null), 50, null, CancellationToken.None);
+
+        Assert.Single(page.Items);
+        Assert.Equal(prefix, page.Items[0].Username);
+    }
+
     // ===================== helpers =====================
 
     private static string Resource(int index) => $"r{index:D5}";
+
+    // Sequência determinística SÓ de metacaracteres de LIKE (\ % _ [): cada char dobra ao escapar, então um
+    // prefixo de N metacaracteres produz padrão escapado de 2N+1 chars (o pior caso de dimensionamento).
+    private static string MetaChars(int length)
+    {
+        const string cycle = "%_[\\";
+        var chars = new char[length];
+        for (var i = 0; i < length; i++)
+        {
+            chars[i] = cycle[i % cycle.Length];
+        }
+
+        return new string(chars);
+    }
 
     private static async Task<List<T>> TraverseAsync<T, TPos>(
         Func<int, TPos?, Task<KeysetPage<T, TPos>>> fetch, int pageSize)
@@ -360,6 +658,24 @@ public sealed class Slice4aPagedReadTests(SqlServerFixture fixture)
         var audit = new SqlPortalSignInAudit(_fixture.ConnectionString);
         await audit.RecordAsync(new PortalSignInEvent(
             tenantIdToStore, null, null, "user", true, reason, "127.0.0.1", Guid.NewGuid(), occurredAt),
+            CancellationToken.None);
+    }
+
+    private async Task SeedSignInFullAsync(
+        Guid? tenantIdToStore, string username, bool succeeded, string reason, DateTimeOffset occurredAt)
+    {
+        var audit = new SqlPortalSignInAudit(_fixture.ConnectionString);
+        await audit.RecordAsync(new PortalSignInEvent(
+            tenantIdToStore, null, null, username, succeeded, reason, "127.0.0.1", Guid.NewGuid(), occurredAt),
+            CancellationToken.None);
+    }
+
+    private async Task SeedOneOperationalFullAsync(
+        TenantScope scope, Guid userId, string action, bool succeeded, string username, DateTimeOffset occurredAt)
+    {
+        var audit = new SqlPortalOperationalAudit(_fixture.Factory);
+        await audit.RecordAsync(scope, new PortalOperationalAuditEvent(
+            userId, username, action, "res", "res-" + Guid.NewGuid().ToString("N"), succeeded, "reason", Guid.NewGuid(), occurredAt),
             CancellationToken.None);
     }
 

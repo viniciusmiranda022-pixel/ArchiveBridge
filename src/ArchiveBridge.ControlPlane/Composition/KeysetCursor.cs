@@ -12,13 +12,29 @@ namespace ArchiveBridge.ControlPlane.Composition;
 /// envelope VERSIONADO e URL-safe que carrega apenas a posição de seek (chaves de ordenação) e o fingerprint
 /// dos filtros que o geraram. O cursor NÃO é autorização: nunca contém tenant/projeto, papel, usuário, SQL,
 /// caminho físico ou segredo, e jamais troca o escopo (o servidor sempre re-resolve o escopo do principal).
-/// A decodificação é estrita e fail-closed: Base64/JSON inválido, versão desconhecida, posição malformada ou
-/// fingerprint divergente resultam em <see langword="false"/> (o handler responde 400) — nunca 500, e nenhuma
-/// query executa com valores parcialmente parseados.
+/// <para>
+/// SEGURANÇA — o cursor é <b>ENTRADA NÃO CONFIÁVEL</b>. Base64Url NÃO é assinatura e o fingerprint NÃO é um
+/// MAC: um cliente deliberado pode fabricar um cursor bem-formado com qualquer posição de seek. Isso é
+/// aceitável e NÃO concede autoridade — a posição de seek só desloca o ponto de ordenação DENTRO do resultado
+/// já autorizado (principal autenticado → re-resolução de tenant/projeto → RLS → filtro de projeto explícito →
+/// parâmetros SQL). O fingerprint garante apenas a consistência normal entre o cursor e os filtros da consulta
+/// (mismatch ⇒ 400); não é um controle contra adversário. Autenticidade criptográfica do cursor, se exigida,
+/// é hardening do Passo 8 (decisão sobre chaves/rotação/multi-instância), não deste passo.
+/// </para>
+/// A decodificação é estrita e fail-closed: cursor acima do teto de tamanho, fora do alfabeto Base64Url,
+/// Base64/JSON inválido, versão desconhecida, posição malformada ou fingerprint divergente resultam em
+/// <see langword="false"/> (o handler responde 400) — nunca 500, e nenhuma query executa com valores
+/// parcialmente parseados.
 /// </summary>
 public static class KeysetCursor
 {
     private const int SchemaVersion = 1;
+
+    /// <summary>
+    /// Teto de tamanho do cursor (caracteres). Um cursor legítimo é muito menor; o teto é uma defesa barata,
+    /// aplicada ANTES de qualquer alocação/normalização/deserialização, contra entrada oversized.
+    /// </summary>
+    private const int MaxCursorLength = 2048;
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
@@ -49,6 +65,12 @@ public static class KeysetCursor
     {
         position = null;
         if (string.IsNullOrEmpty(cursor))
+        {
+            return false;
+        }
+
+        // Defesa de tamanho ANTES de qualquer Replace/alocação/deserialização — entrada oversized é recusada.
+        if (cursor.Length > MaxCursorLength)
         {
             return false;
         }
@@ -97,6 +119,19 @@ public static class KeysetCursor
     private static bool TryFromBase64Url(string value, out byte[] bytes)
     {
         bytes = [];
+
+        // URL-safe ESTRITO: só o alfabeto Base64Url canônico é aceito (A-Z a-z 0-9 - _). Padding '=' e os
+        // caracteres do Base64 padrão ('+' '/') NÃO são cursores canônicos e são recusados aqui — antes de
+        // qualquer normalização/alocação.
+        foreach (var c in value)
+        {
+            var canonical = c is (>= 'A' and <= 'Z') or (>= 'a' and <= 'z') or (>= '0' and <= '9') or '-' or '_';
+            if (!canonical)
+            {
+                return false;
+            }
+        }
+
         var normalized = value.Replace('-', '+').Replace('_', '/');
         switch (normalized.Length % 4)
         {
@@ -128,7 +163,10 @@ public static class KeysetCursor
 /// <summary>
 /// Fingerprint canônico e determinístico dos filtros normalizados de uma consulta paginada. Vincula um cursor
 /// aos filtros que o geraram: reaproveitar um cursor com filtros diferentes produz mismatch (o handler
-/// responde 400). NÃO é segredo — é apenas proteção contra mistura acidental/maliciosa de estados de paginação.
+/// responde 400). NÃO é segredo e NÃO é um MAC — garante apenas a consistência normal entre o cursor e os
+/// filtros, evitando reuso acidental de cursor entre estados de paginação. Não é um controle de autenticidade:
+/// um cliente deliberado pode recomputar o fingerprint e forjar um cursor bem-formado — mas isso não concede
+/// autoridade, pois o escopo é sempre re-resolvido do principal (RLS + filtro de projeto explícito).
 /// A codificação é length-prefixed (cada parte precedida do seu comprimento), o que elimina qualquer
 /// ambiguidade de delimitador sem depender de caractere separador reservado.
 /// </summary>

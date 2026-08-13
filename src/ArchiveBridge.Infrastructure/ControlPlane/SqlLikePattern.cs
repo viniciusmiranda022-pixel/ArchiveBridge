@@ -18,4 +18,14 @@ internal static class SqlLikePattern
             .Replace("[", "\\[", StringComparison.Ordinal);
         return escaped + "%";
     }
+
+    /// <summary>
+    /// Tamanho máximo (em caracteres) que <see cref="EscapedPrefix"/> pode produzir para uma entrada de até
+    /// <paramref name="rawMaxLength"/> caracteres. Cada caractere pode ser um metacaractere de <c>LIKE</c>
+    /// (<c>\ % _ [</c>) e virar dois caracteres, e o servidor anexa um <c>%</c> de prefixo — logo o pior caso é
+    /// <c>rawMaxLength * 2 + 1</c>. O parâmetro SQL <c>NVARCHAR</c> deve ter ESTE tamanho para nunca truncar o
+    /// padrão escapado (truncar quebraria o escaping e reintroduziria semântica de curinga). <c>checked</c>
+    /// documenta que a expansão é determinística e não transborda.
+    /// </summary>
+    public static int MaxEscapedPrefixLength(int rawMaxLength) => checked((rawMaxLength * 2) + 1);
 }
