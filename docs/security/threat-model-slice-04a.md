@@ -26,6 +26,34 @@ leitura) e a **identidade do portal**. Não há execução de exportação nem i
 | Exposição de segredo em repositório | Sem senha versionada: strings de conexão on-premises usam *Integrated Security* (sem senha); bootstrap exige senha injetada pelo ambiente (vazia ⇒ desabilitado). |
 | Simulação enganosa de capacidade | Telas de capacidades ausentes (exportação/disparo/download/gestão de usuários) declaram indisponibilidade honesta; nenhum botão executa mock. |
 
+## Delta — Passo 5: paginação keyset e filtros (histórico de evidências e auditoria)
+
+Superfícies **somente leitura** que passam a aceitar novas entradas não confiáveis do navegador: `cursor`,
+`pageSize`, prefixo de site, prefixo de usuário, `ActionCode`, `Reason`, `CorrelationId`, intervalo de datas,
+`EnvironmentId` e filtros de status.
+
+| Ameaça | Controle |
+| --- | --- |
+| SQL injection via filtro | SQL **estático** com predicados opcionais parametrizados (`@x IS NULL OR col = @x`); todo valor é `SqlParameter`. Zero concatenação de entrada do usuário. Sem ordenação dinâmica (`?orderBy` não existe). |
+| Abuso de curinga (`%` `_` `[`) | Prefixos usam `LIKE @p ESCAPE N'\'` com escaping literal server-side; o curinga de prefixo é anexado pelo servidor. Curingas do usuário são DADOS, nunca sintaxe. Teste com `%`, `_`, `[`, `\`, `' OR 1=1 --`. |
+| Adulteração de cursor / Base64/JSON malformado | Cursor é envelope **versionado**, URL-safe, decodificado **estritamente**; Base64/JSON inválido, versão desconhecida ou posição malformada ⇒ `400` (nunca `500`, nenhuma query com valor parcial). |
+| Mistura de cursor com filtros divergentes | O cursor carrega o **fingerprint** canônico dos filtros; mismatch ⇒ `400`. |
+| Bypass de escopo por tenant/projeto | O cursor **não** carrega escopo. Tenant/projeto são sempre re-resolvidos do principal. Evidência e auditoria operacional: RLS por tenant **+** `project_id = @project` explícito (inclusive no JOIN). |
+| Vazamento cross-tenant na autenticação | `portal_sign_in_events` está fora da RLS; a busca aplica `tenant_id = @tenant` obrigatório (tenant nunca vem do cliente). Eventos com `tenant_id` nulo (usuário inexistente) não aparecem. |
+| Exaustão de recursos por page size | `pageSize` do cliente nunca controla o `TOP` sem limite: clamp determinístico para `[1, 100]` server-side; `TOP (@pageSize + 1)` (a linha extra só decide `HasMore`, sem `COUNT(*)`). |
+| Duplicatas/lacunas sob inserção concorrente | Paginação **keyset/seek** com ordenação fixa e desempate determinístico (`event_id`; `environment_id`+`discovery_version`). Sem `OFFSET`. Teste de inserção entre páginas: nenhuma linha reaparece. |
+| Recursão de auditoria | Visualizar/filtrar/paginar auditoria é read-only e **não** gera evento operacional. |
+
+**Controles:** parsing tipado; comprimentos limitados; SQL parametrizado; keyset pagination; ordenação fixa
+server-side; teto de page size; filter fingerprint; escopo derivado do principal; RLS + filtro de projeto
+explícito; filtro de tenant explícito na autenticação; desempates determinísticos; índices de seek
+(migration `0017`, aditiva); `HTTP 400` fail-closed. O **download verificado** de `evidence.json` permanece
+inalterado — o Passo 5 só melhora a listagem.
+
+**Cursor (documentação):** o cursor **não é autorização** e **não contém** tenant/projeto — apenas as chaves
+de ordenação, a versão do schema e o fingerprint dos filtros. Um cursor válido de uma consulta jamais troca
+o escopo: o servidor sempre re-resolve tenant/projeto a partir do principal autenticado.
+
 ## Fora do escopo (fail-closed por ausência)
 
 Nenhuma execução de `Export-EVArchive`, PST, Purview, Microsoft Graph, AzCopy ou ingestão no Microsoft 365.
