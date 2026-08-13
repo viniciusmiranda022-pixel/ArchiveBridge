@@ -22,6 +22,11 @@ namespace ArchiveBridge.Infrastructure.ControlPlane;
 /// </summary>
 public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFactory) : IControlPlaneQueries
 {
+    // Espelha o teto de comprimento do prefixo de site imposto no PageModel (Evidence/Index). O parâmetro
+    // @sitePrefix é dimensionado pelo pior caso do escaping (ver SqlLikePattern.MaxEscapedPrefixLength) para
+    // nunca truncar o padrão escapado.
+    private const int SitePrefixRawMaxLength = 100;
+
     private const string DashboardSql =
         """
         WITH latest_ev AS (
@@ -107,6 +112,37 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
           AND project_id = @project
           AND status NOT IN (0, 1)
         ORDER BY discovery_version DESC;
+        """;
+
+    // HISTÓRICO paginado (keyset/seek). SQL ESTÁTICO: os filtros são predicados opcionais parametrizados
+    // (@x IS NULL OR ...) e o seek é um predicado parametrizado — nenhum valor do usuário é concatenado. O
+    // isolamento é por RLS (conexão tenant-scoped) E por project_id explícito (tanto em d quanto no JOIN e).
+    // status NOT IN (0,1) exclui Pending/Discovering; Superseded (6) permanece visível no histórico.
+    private const string EvidencePageSql =
+        """
+        SELECT TOP (@take)
+               e.environment_id, e.site_name, d.discovery_version, d.status, d.result_status, d.result_code,
+               d.configuration_hash, d.evidence_hash, d.content_sha256, d.evidence_path, d.evidence_size_bytes,
+               d.completed_at_utc
+        FROM dbo.ev_discovery_runs d
+        INNER JOIN dbo.ev_environments e
+            ON e.environment_id = d.environment_id AND e.tenant_id = d.tenant_id AND e.project_id = d.project_id
+        WHERE d.project_id = @project
+          AND e.project_id = @project
+          AND d.status NOT IN (0, 1)
+          AND (@environment IS NULL OR d.environment_id = @environment)
+          AND (@resultStatus IS NULL OR d.result_status = @resultStatus)
+          AND (@sitePrefix IS NULL OR e.site_name LIKE @sitePrefix ESCAPE N'\')
+          AND (@fromUtc IS NULL OR d.completed_at_utc >= @fromUtc)
+          AND (@toUtc IS NULL OR d.completed_at_utc <= @toUtc)
+          AND (
+                @cursorCompleted IS NULL
+                OR d.completed_at_utc < @cursorCompleted
+                OR (d.completed_at_utc = @cursorCompleted AND d.environment_id < @cursorEnvironment)
+                OR (d.completed_at_utc = @cursorCompleted AND d.environment_id = @cursorEnvironment
+                    AND d.discovery_version < @cursorVersion)
+              )
+        ORDER BY d.completed_at_utc DESC, d.environment_id DESC, d.discovery_version DESC;
         """;
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
@@ -291,6 +327,62 @@ public sealed class SqlControlPlaneQueries(TenantConnectionFactory connectionFac
             reader.GetString(2).TrimEnd(),
             reader.GetString(3),
             reader.GetInt64(4));
+    }
+
+    /// <inheritdoc />
+    public async Task<KeysetPage<EvEvidenceListItem, EvidenceSeekPosition>> SearchEvEvidencePageAsync(
+        TenantScope scope,
+        EvEvidenceFilter filter,
+        int pageSize,
+        EvidenceSeekPosition? after,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        var bounded = KeysetPaging.ClampPageSize(pageSize);
+        var fetched = new List<EvEvidenceListItem>();
+
+        await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var command = new SqlCommand(EvidencePageSql, tenant.Connection);
+        command.Parameters.Add(new SqlParameter("@take", SqlDbType.Int) { Value = bounded + 1 });
+        AddProject(command, scope);
+        command.Parameters.Add(new SqlParameter("@environment", SqlDbType.UniqueIdentifier)
+        { Value = (object?)filter.EnvironmentId ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@resultStatus", SqlDbType.TinyInt)
+        { Value = filter.ResultStatus is { } rs ? (byte)rs : DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@sitePrefix", SqlDbType.NVarChar,
+            SqlLikePattern.MaxEscapedPrefixLength(SitePrefixRawMaxLength))
+        { Value = filter.SitePrefix is { } sp ? SqlLikePattern.EscapedPrefix(sp) : DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@fromUtc", SqlDbType.DateTime2)
+        { Value = filter.FromUtc is { } f ? f.UtcDateTime : DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@toUtc", SqlDbType.DateTime2)
+        { Value = filter.ToUtc is { } t ? t.UtcDateTime : DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@cursorCompleted", SqlDbType.DateTime2)
+        { Value = after is not null ? after.CompletedAtUtc.UtcDateTime : DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@cursorEnvironment", SqlDbType.UniqueIdentifier)
+        { Value = after is not null ? after.EnvironmentId : DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@cursorVersion", SqlDbType.Int)
+        { Value = after is not null ? after.DiscoveryVersion : DBNull.Value });
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            fetched.Add(new EvEvidenceListItem(
+                reader.GetGuid(0),
+                reader.GetString(1),
+                reader.GetInt32(2),
+                ((EvDiscoveryStatus)reader.GetByte(3)).ToString(),
+                ((EvDiscoveryStatus)reader.GetByte(4)).ToString(),
+                reader.GetString(5),
+                reader.GetString(6).TrimEnd(),
+                reader.GetString(7).TrimEnd(),
+                reader.GetString(8).TrimEnd(),
+                reader.GetString(9),
+                reader.GetInt64(10),
+                SqlJobMapping.ReadUtc(reader.GetDateTime(11))));
+        }
+
+        return KeysetPageBuilder.Build(fetched, bounded,
+            last => new EvidenceSeekPosition(last.CompletedAtUtc, last.EnvironmentId, last.DiscoveryVersion));
     }
 
     private static void AddProject(SqlCommand command, TenantScope scope) =>

@@ -200,6 +200,46 @@ Eventos operacionais (`ev.discovery.request`): `accepted`, `idempotent-replay`, 
 `not-found-or-not-authorized`, `forbidden`, `feature-disabled`, `invalid-input`. Nunca são auditados
 site, directory server, hash de configuração, PowerShell, stdout/stderr, evidência, senha, token ou cookie.
 
+## Passo 5 — Paginação keyset + filtros (histórico de evidências e auditoria)
+
+Superfícies **somente leitura** com paginação **keyset/seek** (estável sob inserções concorrentes, custo
+independente do número da página, sem `OFFSET` e sem `COUNT(*)`), e filtros bounded/parametrizados.
+
+- **Histórico de evidências** (`/Evidence`): deixa de mostrar só a última descoberta por ambiente e passa a
+  ser um histórico navegável de execuções **maduras** (`status NOT IN (Pending, Discovering)`), inclusive
+  `Superseded`. Ordem `completed_at_utc DESC, environment_id DESC, discovery_version DESC`. Filtros: prefixo
+  de site, `EnvironmentId`, resultado (`Ready`/`Blocked`/`Unsupported`/`Failed`), intervalo UTC, quantidade.
+  O **download verificado** (`/Evidence/Download`) permanece inalterado.
+- **Auditoria** (`/Audit`, restrita a `Auditor`/`Administrator`): duas listas **independentes** —
+  operacional (tenant + projeto, sob RLS) e autenticação (tenant-wide, `tenant_id = @tenant` explícito, fora
+  da RLS; eventos com tenant nulo não aparecem). Cada lista tem filtros e cursor próprios; avançar uma
+  preserva o estado da outra. Ordem `occurred_at_utc DESC, event_id DESC`.
+
+**Camadas.** Contracts define os tipos (`KeysetPage<TItem,TPosition>`, filtros, `EvidenceSeekPosition`,
+`AuditSeekPosition`) sem conhecer UI. A Infrastructure executa SQL **estático** com predicados opcionais
+parametrizados e o predicado de seek, recebendo uma posição já validada. O Control Plane codifica/valida o
+**cursor** URL-safe.
+
+**Cursor.** Envelope versionado (Base64Url + JSON) que carrega **apenas** as chaves de ordenação e o
+**fingerprint** dos filtros. Decodificação estrita e fail-closed: cursor acima do teto de tamanho (`2048`,
+checado antes de qualquer alocação), fora do alfabeto Base64Url estrito (`A–Z a–z 0–9 - _`; `=`, `+`, `/`
+recusados), Base64/JSON inválido, versão desconhecida, posição malformada ou fingerprint divergente ⇒
+`HTTP 400` (nunca `500`; nenhuma query com valor parcial). O cursor é **entrada não confiável** e **não é
+autorização**: Base64Url **não é assinatura**, o fingerprint **não é MAC** (garante só a consistência
+cursor↔filtros — um cliente deliberado pode forjar um cursor bem-formado, o que **não** concede autoridade),
+e o cursor **não contém** tenant/projeto. O escopo é sempre re-resolvido do principal (RLS + `project_id =
+@project`); uma posição forjada só desloca o ponto temporal da consulta já escopada, jamais troca o escopo.
+Autenticidade criptográfica do cursor, se exigida, é hardening do Passo 8.
+
+**Limites e segurança.** `pageSize` do cliente é normalizado (clamp `[1, 100]`) server-side; `TOP
+(pageSize + 1)` decide `HasMore` sem contagem total. Prefixos usam `LIKE ESCAPE N'\'` com escaping literal
+(curingas são dados); o parâmetro `NVARCHAR` é dimensionado pelo pior caso do escaping (`rawMax*2+1` —
+SitePrefix `201`, UsernamePrefix `401`), nunca truncando o padrão no boundary. Sem ordenação dinâmica. Índices
+de seek na migration **aditiva** `0017`
+(`IX_evd_scope_completed`; `IX_portal_sign_in_events_tenant_time_event`; a trilha operacional já tinha
+índice alinhado). Nenhuma navegação de leitura gera evento de auditoria (sem recursão). O threat-model delta
+está em `docs/security/threat-model-slice-04a.md`.
+
 ## Fora do escopo desta fatia
 
 Execução de `Export-EVArchive`; geração de PST; Purview; Microsoft Graph; AzCopy; ingestão no Microsoft

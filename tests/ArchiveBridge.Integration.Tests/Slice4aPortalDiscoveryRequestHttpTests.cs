@@ -596,5 +596,9 @@ public sealed class Slice4aPortalDiscoveryRequestHttpTests(SqlServerFixture fixt
 
         public Task<IReadOnlyList<PortalOperationalAuditEvent>> RecentAsync(TenantScope scope, int max, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("Falha deliberada de auditoria operacional (teste).");
+
+        public Task<KeysetPage<PortalOperationalAuditEvent, AuditSeekPosition>> SearchAsync(
+            TenantScope scope, PortalOperationalAuditFilter filter, int pageSize, AuditSeekPosition? after, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Falha deliberada de auditoria operacional (teste).");
     }
 }

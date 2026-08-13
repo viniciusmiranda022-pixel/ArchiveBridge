@@ -1,4 +1,5 @@
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 
 namespace ArchiveBridge.Contracts.ControlPlane;
 
@@ -102,6 +103,37 @@ public sealed record EvEvidenceDownloadMetadata(
     long EvidenceSizeBytes);
 
 /// <summary>
+/// Filtros do HISTÓRICO de evidências de descoberta. Todos opcionais; valores textuais são normalizados
+/// (trim/tamanho) e nunca viram sintaxe SQL. O tenant/projeto NÃO fazem parte do filtro — são resolvidos
+/// server-side a partir do principal. <see cref="ResultStatus"/> é um enum fechado do domínio.
+/// </summary>
+public sealed record EvEvidenceFilter(
+    string? SitePrefix,
+    Guid? EnvironmentId,
+    EvDiscoveryStatus? ResultStatus,
+    DateTimeOffset? FromUtc,
+    DateTimeOffset? ToUtc);
+
+/// <summary>
+/// Item do HISTÓRICO de evidências (uma linha por execução de descoberta madura). Só metadados — nunca bytes
+/// de <c>evidence.json</c>, stdout/stderr ou credenciais. <see cref="LifecycleStatus"/> distingue o ciclo de
+/// vida (inclusive <c>Superseded</c>) de <see cref="ResultStatus"/>.
+/// </summary>
+public sealed record EvEvidenceListItem(
+    Guid EnvironmentId,
+    string SiteName,
+    int DiscoveryVersion,
+    string LifecycleStatus,
+    string ResultStatus,
+    string ResultCode,
+    string ConfigurationHash,
+    string EvidenceHash,
+    string ContentSha256,
+    string EvidencePath,
+    long EvidenceSizeBytes,
+    DateTimeOffset CompletedAtUtc);
+
+/// <summary>
 /// Read-model do plano de controle: consultas de LEITURA que sustentam o portal operacional. Toda consulta
 /// carrega o <see cref="TenantScope"/> do usuário autenticado, executa sob a RLS por tenant e filtra o projeto
 /// explicitamente. Expõe apenas projeções leves de governança/observabilidade — jamais segredo, SAS, token,
@@ -135,5 +167,19 @@ public interface IControlPlaneQueries
         TenantScope scope,
         Guid environmentId,
         int discoveryVersion,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// HISTÓRICO paginado (keyset/seek) de evidências de descoberta do escopo autenticado — execuções maduras
+    /// (<c>status NOT IN (Pending, Discovering)</c>), inclusive <c>Superseded</c>. Ordem determinística
+    /// <c>completed_at_utc</c> DESC, <c>environment_id</c> DESC, <c>discovery_version</c> DESC. Sob RLS por
+    /// tenant + filtro explícito por projeto (também no JOIN com <c>ev_environments</c>). O
+    /// <paramref name="after"/> é a posição de seek já validada; nunca carrega escopo.
+    /// </summary>
+    Task<KeysetPage<EvEvidenceListItem, EvidenceSeekPosition>> SearchEvEvidencePageAsync(
+        TenantScope scope,
+        EvEvidenceFilter filter,
+        int pageSize,
+        EvidenceSeekPosition? after,
         CancellationToken cancellationToken);
 }

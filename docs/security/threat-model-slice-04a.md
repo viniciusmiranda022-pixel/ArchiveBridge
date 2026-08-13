@@ -26,6 +26,44 @@ leitura) e a **identidade do portal**. Não há execução de exportação nem i
 | Exposição de segredo em repositório | Sem senha versionada: strings de conexão on-premises usam *Integrated Security* (sem senha); bootstrap exige senha injetada pelo ambiente (vazia ⇒ desabilitado). |
 | Simulação enganosa de capacidade | Telas de capacidades ausentes (exportação/disparo/download/gestão de usuários) declaram indisponibilidade honesta; nenhum botão executa mock. |
 
+## Delta — Passo 5: paginação keyset e filtros (histórico de evidências e auditoria)
+
+Superfícies **somente leitura** que passam a aceitar novas entradas não confiáveis do navegador: `cursor`,
+`pageSize`, prefixo de site, prefixo de usuário, `ActionCode`, `Reason`, `CorrelationId`, intervalo de datas,
+`EnvironmentId` e filtros de status.
+
+| Ameaça | Controle |
+| --- | --- |
+| SQL injection via filtro | SQL **estático** com predicados opcionais parametrizados (`@x IS NULL OR col = @x`); todo valor é `SqlParameter`. Zero concatenação de entrada do usuário. Sem ordenação dinâmica (`?orderBy` não existe). |
+| Abuso de curinga (`%` `_` `[`) | Prefixos usam `LIKE @p ESCAPE N'\'` com escaping literal server-side; o curinga de prefixo é anexado pelo servidor. Curingas do usuário são DADOS, nunca sintaxe. Teste com `%`, `_`, `[`, `\`, `' OR 1=1 --`. |
+| Truncamento do padrão escapado reintroduzindo curinga | O escaping pode dobrar cada metacaractere (`\ % _ [` ⇒ 2 chars) e o servidor anexa `%`, logo o pior caso é `rawMax*2+1`. O parâmetro `NVARCHAR` é dimensionado por `SqlLikePattern.MaxEscapedPrefixLength(rawMax)` (SitePrefix `201`; UsernamePrefix `401`) — **nunca** `NVARCHAR(rawMax)` — para que o padrão jamais trunque no boundary e o escaping permaneça literal. Teste de boundary com prefixo no comprimento máximo saturado de metacaracteres. |
+| Cursor oversized / fora do alfabeto / Base64/JSON malformado | Cursor é envelope **versionado**, URL-safe **estrito**, decodificado com fail-closed: acima do teto de tamanho (`2048`, checado ANTES de qualquer alocação), qualquer caractere fora de `A–Z a–z 0–9 - _` (padding `=` e `+`/`/` recusados), Base64/JSON inválido, versão desconhecida ou posição malformada ⇒ `400` (nunca `500`, nenhuma query com valor parcial). |
+| Reuso de cursor com filtros divergentes | O cursor carrega o **fingerprint** canônico dos filtros; mismatch ⇒ `400`. É consistência, não autenticidade: o fingerprint **não é MAC** e um cliente deliberado pode forjar cursor+fingerprint — o que NÃO concede autoridade (ver linha seguinte). |
+| Cursor forjado tentando trocar escopo | O cursor **não** carrega tenant/projeto e **não é autorização**. Uma posição de seek fabricada só desloca o ponto de ordenação DENTRO do resultado já autorizado; tenant/projeto são sempre re-resolvidos do principal (RLS + `project_id = @project`). Teste explícito: cursor bem-formado construído a partir de dados de A/P2 ou B, usado por um principal de A/P1, nunca revela A/P2 nem B. |
+| Bypass de escopo por tenant/projeto | O cursor **não** carrega escopo. Tenant/projeto são sempre re-resolvidos do principal. Evidência e auditoria operacional: RLS por tenant **+** `project_id = @project` explícito (inclusive no JOIN). |
+| Vazamento cross-tenant na autenticação | `portal_sign_in_events` está fora da RLS; a busca aplica `tenant_id = @tenant` obrigatório (tenant nunca vem do cliente). Eventos com `tenant_id` nulo (usuário inexistente) não aparecem. |
+| Exaustão de recursos por page size | `pageSize` do cliente nunca controla o `TOP` sem limite: clamp determinístico para `[1, 100]` server-side; `TOP (@pageSize + 1)` (a linha extra só decide `HasMore`, sem `COUNT(*)`). |
+| Duplicatas/lacunas sob inserção concorrente | Paginação **keyset/seek** com ordenação fixa e desempate determinístico (`event_id`; `environment_id`+`discovery_version`). Sem `OFFSET`. Teste de inserção entre páginas: nenhuma linha reaparece. |
+| Recursão de auditoria | Visualizar/filtrar/paginar auditoria é read-only e **não** gera evento operacional. |
+
+**Controles:** parsing tipado; comprimentos limitados; parâmetro `LIKE` dimensionado pelo pior caso do escaping
+(sem truncamento no boundary); SQL parametrizado; keyset pagination; ordenação fixa server-side; teto de page
+size; teto de tamanho do cursor + alfabeto Base64Url estrito (recusa antes de alocar); filter fingerprint (de
+consistência, não de autenticidade); escopo derivado do principal; RLS + filtro de projeto explícito; filtro de
+tenant explícito na autenticação; desempates determinísticos; índices de seek (migration `0017`, aditiva);
+`HTTP 400` fail-closed. O **download verificado** de `evidence.json` permanece inalterado — o Passo 5 só melhora
+a listagem.
+
+**Cursor (documentação):** o cursor é **entrada NÃO confiável**. Base64Url **não é assinatura** e o fingerprint
+**não é MAC** — um cliente deliberado pode fabricar um cursor bem-formado com qualquer posição de seek. Isso é
+aceitável e **não concede autoridade**: o cursor **não contém** tenant/projeto — apenas as chaves de ordenação,
+a versão do schema e o fingerprint dos filtros — e **não é autorização**. O controle de segurança real é a
+cadeia `principal autenticado → re-resolução de tenant/projeto → RLS → filtro de projeto explícito → parâmetros
+SQL → posição de seek apenas dentro desse resultado autorizado`. Uma posição forjada só desloca o ponto
+temporal da consulta já escopada; jamais troca o escopo. Autenticidade criptográfica do cursor (HMAC/Data
+Protection), se decidirmos exigi-la, é **hardening do Passo 8** — exige decisão sobre persistência/rotação de
+chaves, restart e multi-instância — e **não** faz parte deste passo.
+
 ## Fora do escopo (fail-closed por ausência)
 
 Nenhuma execução de `Export-EVArchive`, PST, Purview, Microsoft Graph, AzCopy ou ingestão no Microsoft 365.
