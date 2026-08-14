@@ -24,6 +24,32 @@ internal static class MappingCsvParser
     public static IReadOnlyList<IReadOnlyList<string>> Parse(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
+        return ParseCore(text, int.MaxValue, out _);
+    }
+
+    /// <summary>
+    /// Analisa o texto em registros, LIMITADO a <paramref name="maxRecords"/>. Assim que o parser forma o
+    /// registro de número <paramref name="maxRecords"/> (o registro-sentinela), interrompe imediatamente e
+    /// devolve <paramref name="exceeded"/> = <see langword="true"/> — sem continuar consumindo/materializando
+    /// um texto arbitrariamente grande. Isto é a defesa contra amplificação do parser para entrada externa
+    /// não confiável (upload): com o cabeçalho + <c>MaxDataRows</c> + 1 registros basta decidir
+    /// deterministicamente "linhas excedidas".
+    /// </summary>
+    /// <exception cref="MappingCsvFormatException">Quando o texto é estruturalmente malformado.</exception>
+    public static IReadOnlyList<IReadOnlyList<string>> Parse(string text, int maxRecords, out bool exceeded)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        if (maxRecords < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxRecords), maxRecords, "maxRecords deve ser >= 1.");
+        }
+
+        return ParseCore(text, maxRecords, out exceeded);
+    }
+
+    private static List<IReadOnlyList<string>> ParseCore(string text, int maxRecords, out bool exceeded)
+    {
+        exceeded = false;
         var records = new List<IReadOnlyList<string>>();
         var fields = new List<string>();
         var field = new StringBuilder();
@@ -131,6 +157,14 @@ internal static class MappingCsvParser
                 default:
                     throw new InvalidOperationException("Estado de parser inválido.");
             }
+
+            // Bound de amplificação: assim que o registro-sentinela (maxRecords) é formado, interrompe sem
+            // continuar consumindo o resto do texto. Para maxRecords = int.MaxValue este ramo nunca dispara.
+            if (records.Count >= maxRecords)
+            {
+                exceeded = true;
+                return records;
+            }
         }
 
         if (state == State.InQuoted)
@@ -142,6 +176,10 @@ internal static class MappingCsvParser
         {
             fields.Add(field.ToString());
             records.Add(fields);
+            if (records.Count >= maxRecords)
+            {
+                exceeded = true;
+            }
         }
 
         return records;
