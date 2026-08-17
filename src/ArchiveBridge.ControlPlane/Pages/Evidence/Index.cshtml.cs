@@ -14,12 +14,18 @@ namespace ArchiveBridge.ControlPlane.Pages.Evidence;
 /// nunca troca tenant/projeto. O download verificado de <c>evidence.json</c> permanece inalterado (link por
 /// ambiente/versão para <c>/Evidence/Download</c>).
 /// </summary>
-public sealed class IndexModel(IControlPlaneQueries queries, IPortalScopeAccessor scopeAccessor) : PageModel
+public sealed class IndexModel(
+    IControlPlaneQueries queries,
+    IPortalScopeAccessor scopeAccessor,
+    Composition.PresentationModeOptions presentation,
+    Presentation.IPresentationDataProvider presentationData) : PageModel
 {
     private const int SitePrefixMaxLength = 100;
 
     private readonly IControlPlaneQueries _queries = queries;
     private readonly IPortalScopeAccessor _scopeAccessor = scopeAccessor;
+    private readonly Composition.PresentationModeOptions _presentation = presentation;
+    private readonly Presentation.IPresentationDataProvider _presentationData = presentationData;
 
     /// <summary>Itens da fatia atual do histórico.</summary>
     public IReadOnlyList<EvEvidenceListItem> Items { get; private set; } = [];
@@ -55,6 +61,14 @@ public sealed class IndexModel(IControlPlaneQueries queries, IPortalScopeAccesso
     /// <summary>Renderiza a fatia do histórico correspondente aos filtros/cursor. 400 fail-closed em entrada inválida.</summary>
     public async Task<IActionResult> OnGetAsync(CancellationToken cancellationToken)
     {
+        // Modo de demonstração: histórico sintético em memória, sem SQL, sem cursor.
+        if (_presentation.Enabled)
+        {
+            Items = _presentationData.GetEvidence();
+            HasMore = false;
+            return Page();
+        }
+
         var scope = _scopeAccessor.Resolve(User);
         var query = Request.Query;
 

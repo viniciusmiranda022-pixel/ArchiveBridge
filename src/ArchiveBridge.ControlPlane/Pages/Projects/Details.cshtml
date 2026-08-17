@@ -1,0 +1,189 @@
+@page
+@inject PresentationModeOptions Presentation
+@inject IPresentationDataProvider Demo
+@inject IControlPlaneQueries Queries
+@inject IPortalScopeAccessor ScopeAccessor
+@{
+    ViewData["Title"] = "Projeto";
+    var ct = HttpContext.RequestAborted;
+    Guid.TryParse(Request.Query["projectId"].ToString(), out var projectId);
+
+    ProjectOverview? overview;
+    if (Presentation.Enabled)
+    {
+        overview = projectId == Guid.Empty ? null : Demo.GetProject(projectId);
+    }
+    else
+    {
+        var scope = ScopeAccessor.Resolve(User);
+        var project = (await Queries.ListProjectsAsync(scope, ct)).FirstOrDefault(p => p.ProjectId == projectId);
+        if (project is null)
+        {
+            overview = null;
+        }
+        else
+        {
+            var waves = (await Queries.ListWavesAsync(scope, 200, ct)).Where(w => w.ProjectId == projectId).ToList();
+            var jobs = (await Queries.ListJobsAsync(scope, 200, ct)).Where(j => j.ProjectId == projectId).ToList();
+            var environments = await Queries.ListEvEnvironmentsAsync(scope, ct);
+            overview = new ProjectOverview(
+                project.ProjectId, project.Name, project.Status, project.TargetTenant, "Retenção padrão",
+                project.ConfigurationVersion, string.Empty, project.UpdatedAtUtc, waves, environments, jobs);
+        }
+    }
+}
+
+<p><a class="btn sm ghost" asp-page="/Projects/Index">@Icons.Svg("arrow-left") Projetos</a></p>
+
+@if (overview is null)
+{
+    var empty = new EmptyStateModel(
+        "Projeto não encontrado",
+        "O projeto solicitado não existe neste escopo ou você não tem permissão para visualizá-lo.",
+        "projects");
+    <partial name="_EmptyState" model="empty" />
+}
+else
+{
+    <div class="page-head">
+        <div class="titles">
+            <h1>@overview.Name</h1>
+            <p class="sub">Projeto de migração · tenant de destino <span class="mono">@overview.TargetTenant</span></p>
+        </div>
+        <div class="head-actions"><partial name="_StatusBadge" model="overview.Status" /></div>
+    </div>
+
+    <div data-tabs>
+        <div class="tabs" role="tablist">
+            <button class="tab active" data-tab="overview" type="button">Visão Geral</button>
+            <button class="tab" data-tab="waves" type="button">Ondas</button>
+            <button class="tab" data-tab="vault" type="button">Enterprise Vault</button>
+            <button class="tab" data-tab="jobs" type="button">Jobs</button>
+            <button class="tab" data-tab="governance" type="button">Governança</button>
+        </div>
+
+        <div class="tabpanel active" data-panel="overview">
+            <div class="card">
+                <div class="card-body">
+                    <div class="kv">
+                        <div><div class="k">Tenant de destino</div><div class="v mono">@overview.TargetTenant</div></div>
+                        <div><div class="k">Política de archive</div><div class="v">@overview.ArchivePolicy</div></div>
+                        <div><div class="k">Versão de configuração</div><div class="v">v@(overview.ConfigurationVersion)</div></div>
+                        <div><div class="k">Última atualização</div><div class="v mono">@DisplayFormat.Utc(overview.UpdatedAtUtc)</div></div>
+                        <div><div class="k">Ondas</div><div class="v">@overview.Waves.Count</div></div>
+                        <div><div class="k">Ambientes EV</div><div class="v">@overview.Environments.Count</div></div>
+                    </div>
+                    @if (!string.IsNullOrEmpty(overview.ConfigurationHash))
+                    {
+                        <details class="tech">
+                            <summary>Detalhes técnicos</summary>
+                            <div class="tech-body">
+                                <div class="kv">
+                                    <div><div class="k">Configuration hash</div><div class="v"><partial name="_HashDisplay" model="@(new HashModel(overview.ConfigurationHash, 16))" /></div></div>
+                                    <div><div class="k">Project ID</div><div class="v mono">@overview.ProjectId</div></div>
+                                </div>
+                            </div>
+                        </details>
+                    }
+                </div>
+            </div>
+        </div>
+
+        <div class="tabpanel" data-panel="waves">
+            @if (overview.Waves.Count == 0)
+            {
+                var e = new EmptyStateModel("Nenhuma onda", "Este projeto ainda não possui ondas de migração planejadas.", "waves");
+                <partial name="_EmptyState" model="e" />
+            }
+            else
+            {
+                <div class="tablewrap">
+                    <table class="data">
+                        <thead><tr><th>Onda</th><th>Versão</th><th>Status</th><th>Volume</th><th>Itens</th><th></th></tr></thead>
+                        <tbody>
+                            @foreach (var wave in overview.Waves)
+                            {
+                                <tr>
+                                    <td><b>@wave.Name</b></td>
+                                    <td>v@(wave.WaveVersion)</td>
+                                    <td><partial name="_StatusBadge" model="wave.Status" /></td>
+                                    <td class="num">@DisplayFormat.HumanBytes(wave.PlannedBytes)</td>
+                                    <td class="num">@wave.PlannedItems.ToString("N0")</td>
+                                    <td class="nowrap"><a class="btn sm" asp-page="/Waves/Details" asp-route-waveId="@wave.WaveId">Detalhes</a></td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </div>
+
+        <div class="tabpanel" data-panel="vault">
+            @if (overview.Environments.Count == 0)
+            {
+                var e = new EmptyStateModel("Nenhum ambiente", "Nenhum ambiente Enterprise Vault associado a este projeto.", "vault");
+                <partial name="_EmptyState" model="e" />
+            }
+            else
+            {
+                <div class="tablewrap">
+                    <table class="data">
+                        <thead><tr><th>Site</th><th>Directory Server</th><th>Resultado</th><th>Versão</th></tr></thead>
+                        <tbody>
+                            @foreach (var env in overview.Environments)
+                            {
+                                <tr>
+                                    <td><b>@env.SiteName</b></td>
+                                    <td class="mono">@env.DirectoryServer</td>
+                                    <td>@if (env.LatestDiscovery is { } d) { <partial name="_StatusBadge" model="d.ResultStatus" /> } else { <span class="badge neutral"><span class="dot"></span>Sem descoberta</span> }</td>
+                                    <td>@(env.LatestDiscovery is { } dv ? $"v{dv.DiscoveryVersion}" : "—")</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </div>
+
+        <div class="tabpanel" data-panel="jobs">
+            @if (overview.Jobs.Count == 0)
+            {
+                var e = new EmptyStateModel("Nenhum job", "Nenhum job durável associado a este projeto.", "jobs");
+                <partial name="_EmptyState" model="e" />
+            }
+            else
+            {
+                <div class="tablewrap">
+                    <table class="data">
+                        <thead><tr><th>Job</th><th>Workload</th><th>Estado</th><th>Tentativa</th><th>Atualizado</th></tr></thead>
+                        <tbody>
+                            @foreach (var job in overview.Jobs)
+                            {
+                                <tr>
+                                    <td><a asp-page="/Jobs/Details" asp-route-jobId="@job.JobId" class="mono">@job.JobId.ToString()[..8]</a></td>
+                                    <td>@job.Workload</td>
+                                    <td><partial name="_StatusBadge" model="job.State" /></td>
+                                    <td>@job.AttemptCount</td>
+                                    <td class="mono nowrap">@DisplayFormat.Utc(job.UpdatedAtUtc)</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </div>
+
+        <div class="tabpanel" data-panel="governance">
+            <div class="card">
+                <div class="card-body">
+                    <p class="muted mt0">A cadeia de custódia e a trilha de auditoria deste projeto ficam nas áreas dedicadas de Governança.</p>
+                    <div class="row">
+                        <a class="btn" asp-page="/Evidence/Index">@Icons.Svg("evidence") Evidências</a>
+                        <a class="btn" asp-page="/Mapping/Index">@Icons.Svg("mapping") Mapping</a>
+                        <a class="btn" asp-page="/Audit/Index">@Icons.Svg("audit") Auditoria</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+}

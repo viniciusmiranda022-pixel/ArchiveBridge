@@ -2,19 +2,17 @@
 @model ArchiveBridge.ControlPlane.Pages.Evidence.IndexModel
 @{
     ViewData["Title"] = "Evidências";
+    var header = new PageHeaderModel("Evidências", "Histórico imutável dos artefatos e resultados produzidos pela plataforma. Cada linha é sustentada por hashes autoritativos e um download verificado byte a byte.");
 }
-<h1>Evidências de descoberta — histórico</h1>
-<p class="lead">
-    Histórico navegável dos metadados do artefato imutável de evidência (<span class="mono">evidence.json</span>):
-    hashes autoritativos, caminho lógico e tamanho por versão de descoberta. O read-model nunca expõe a
-    evidência bruta; a paginação é keyset (estável sob inserções concorrentes), sem alterar o download verificado.
-</p>
 
-<div class="notice">
-    <strong>Download verificado habilitado.</strong> Antes de entregar <span class="mono">evidence.json</span>,
-    o portal resolve a evidência no tenant/projeto autenticado, valida o bundle imutável, confere caminho lógico,
-    tamanho e SHA-256 dos bytes contra o SQL e registra a leitura na trilha operacional. Qualquer divergência
-    bloqueia o download; os bytes do JSON nunca são reserializados.
+<partial name="_PageHeader" model="header" />
+
+<div class="alert info">
+    <span class="a-ico">@Icons.Svg("shield")</span>
+    <div class="a-body">
+        <strong>Download verificado.</strong>
+        Antes de entregar o artefato, o portal resolve a evidência no tenant/projeto autenticado, confere caminho lógico, tamanho e SHA-256 contra o registro e audita a leitura. Qualquer divergência bloqueia o download.
+    </div>
 </div>
 
 <form method="get" class="filters">
@@ -29,7 +27,7 @@
     <div class="field">
         <label for="result">Resultado</label>
         <select id="result" name="result">
-            <option value="">(todos)</option>
+            <option value="">Todos</option>
             @foreach (var status in new[] { "Ready", "Blocked", "Unsupported", "Failed" })
             {
                 if (Model.ResultStatusFilter == status)
@@ -68,52 +66,55 @@
         </select>
     </div>
     <div class="field actions">
-        <button type="submit" class="btn primary">Filtrar</button>
-        <a class="btn" asp-page="/Evidence/Index">Limpar filtros</a>
+        <button type="submit" class="btn primary">@Icons.Svg("search") Filtrar</button>
+        <a class="btn" asp-page="/Evidence/Index">Limpar</a>
     </div>
 </form>
 
 @if (Model.Items.Count == 0)
 {
-    <p class="empty">Nenhuma evidência histórica para os filtros selecionados neste projeto.</p>
+    var empty = new EmptyStateModel(
+        "Nenhuma evidência disponível",
+        "Cada execução madura de descoberta produz um artefato de evidência imutável. Quando houver evidências neste projeto, elas aparecerão aqui com hash e download verificado.",
+        "evidence");
+    <partial name="_EmptyState" model="empty" />
 }
 else
 {
     <div class="tablewrap">
-        <table>
+        <table class="data">
             <thead>
                 <tr>
-                    <th>Site</th><th>Versão</th><th>Ciclo de vida</th><th>Resultado</th><th>Config. hash</th>
-                    <th>Hash semântico</th><th>SHA-256 do arquivo</th><th>Caminho lógico</th><th>Tamanho</th><th>Concluída (UTC)</th><th>Ação</th>
+                    <th>Data (UTC)</th><th>Origem</th><th>Versão</th><th>Resultado</th><th>Ciclo de vida</th>
+                    <th>SHA-256</th><th>Tamanho</th><th>Ação</th>
                 </tr>
             </thead>
             <tbody>
                 @foreach (var item in Model.Items)
                 {
                     <tr>
-                        <td>@item.SiteName</td>
-                        <td>v@item.DiscoveryVersion</td>
-                        <td><span class="pill">@item.LifecycleStatus</span></td>
-                        <td>@item.ResultStatus</td>
-                        <td class="mono">@item.ConfigurationHash[..Math.Min(16, item.ConfigurationHash.Length)]…</td>
-                        <td class="mono">@item.EvidenceHash</td>
-                        <td class="mono">@item.ContentSha256</td>
-                        <td class="mono">@item.EvidencePath</td>
-                        <td>@item.EvidenceSizeBytes.ToString("N0") B</td>
-                        <td class="mono">@item.CompletedAtUtc.ToString("u")</td>
-                        <td>
-                            <a asp-page="/Evidence/Download"
+                        <td class="mono nowrap">@DisplayFormat.Utc(item.CompletedAtUtc)</td>
+                        <td><b>@item.SiteName</b></td>
+                        <td>v@(item.DiscoveryVersion)</td>
+                        <td><partial name="_StatusBadge" model="item.ResultStatus" /></td>
+                        <td><partial name="_StatusBadge" model="item.LifecycleStatus" /></td>
+                        <td><partial name="_HashDisplay" model="@(new HashModel(item.ContentSha256, 10))" /></td>
+                        <td class="num">@DisplayFormat.HumanBytes(item.EvidenceSizeBytes)</td>
+                        <td class="nowrap">
+                            <a class="btn sm" asp-page="/Evidence/Download"
                                asp-route-environmentId="@item.EnvironmentId"
-                               asp-route-version="@item.DiscoveryVersion">Baixar evidence.json</a>
+                               asp-route-version="@item.DiscoveryVersion">@Icons.Svg("download") Baixar Evidência</a>
                         </td>
                     </tr>
                 }
             </tbody>
         </table>
     </div>
-    <p class="empty">Mostrando até @Model.PageSize registros.</p>
-    @if (Model.HasMore)
-    {
-        <p><a class="btn" asp-page="/Evidence/Index" asp-all-route-data="@Model.NextPageRoute">Próxima →</a></p>
-    }
+    <div class="pager">
+        <span class="count">Mostrando até @Model.PageSize registros.</span>
+        @if (Model.HasMore)
+        {
+            <a class="btn sm" asp-page="/Evidence/Index" asp-all-route-data="@Model.NextPageRoute">Próxima →</a>
+        }
+    </div>
 }

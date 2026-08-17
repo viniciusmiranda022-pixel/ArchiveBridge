@@ -11,6 +11,7 @@ using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
 using ArchiveBridge.ControlPlane.Composition;
+using ArchiveBridge.ControlPlane.Presentation;
 using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 using ArchiveBridge.Infrastructure.ControlPlane;
 using ArchiveBridge.Infrastructure.EnterpriseVault.Discovery;
@@ -53,6 +54,16 @@ var discoveryPortalOptions =
     builder.Configuration.GetSection(EnterpriseVaultDiscoveryPortalOptions.SectionName)
         .Get<EnterpriseVaultDiscoveryPortalOptions>() ?? new EnterpriseVaultDiscoveryPortalOptions();
 builder.Services.AddSingleton(discoveryPortalOptions);
+
+// Modo de Demonstração (concern EXCLUSIVO de UI): dataset 100% sintético para telas quando não há dados reais.
+// Fail-closed no startup: habilitá-lo fora de Development/Staging aborta o processo (nunca dados simulados em
+// produção). O provedor é somente leitura e em memória — não escreve em SQL, não enfileira Job, não chama Worker.
+var presentationOptions =
+    builder.Configuration.GetSection(PresentationModeOptions.SectionName)
+        .Get<PresentationModeOptions>() ?? new PresentationModeOptions();
+presentationOptions.EnsureAllowedOrThrow(builder.Environment);
+builder.Services.AddSingleton(presentationOptions);
+builder.Services.AddSingleton<IPresentationDataProvider, SyntheticPresentationDataProvider>();
 
 // Caso de uso de SOLICITAÇÃO de descoberta READ-ONLY: resolve o contexto autoritativo server-side (site/
 // directory, versão/hash de configuração do projeto, versão da política) e ENFILEIRA de forma durável e
@@ -100,10 +111,17 @@ builder.Services.AddAuthorization(authorization =>
         "EvDiscoveryOperators", policy => policy.RequireRole(PortalRoles.Operator, PortalRoles.Administrator));
 });
 
+// Codificação HTML: permite letras acentuadas (Latin) como UTF-8 literal em vez de entidades numéricas
+// (&#xE3;). Os caracteres significativos para HTML (< > & " ') CONTINUAM sempre codificados — a proteção
+// contra XSS é preservada; apenas a acentuação passa a renderizar corretamente (a página declara UTF-8).
+builder.Services.Configure<Microsoft.Extensions.WebEncoders.WebEncoderOptions>(options =>
+    options.TextEncoderSettings = new System.Text.Encodings.Web.TextEncoderSettings(System.Text.Unicode.UnicodeRanges.All));
+
 builder.Services.AddRazorPages(razor =>
 {
     razor.Conventions.AllowAnonymousToPage("/Account/Login");
     razor.Conventions.AllowAnonymousToPage("/Account/Denied");
+    razor.Conventions.AllowAnonymousToPage("/Error");
     razor.Conventions.AuthorizeFolder("/Admin", "Administrator");
     razor.Conventions.AuthorizeFolder("/Audit", "AuditReaders");
 });
@@ -113,8 +131,12 @@ var app = builder.Build();
 await BootstrapAsync(app, options).ConfigureAwait(false);
 
 // Fora de desenvolvimento, TLS é obrigatório: HSTS + redirecionamento HTTP→HTTPS (fail-closed em produção).
+// Erros não tratados renderizam uma página amigável (/Error) em vez de vazar detalhes internos. Em dev,
+// mantém-se a página de exceção do desenvolvedor. Isto NÃO altera as respostas fail-closed dos handlers
+// (403/404/409 continuam sendo StatusCode explícito) — só cobre exceções não tratadas (500).
 if (!app.Environment.IsDevelopment())
 {
+    app.UseExceptionHandler("/Error");
     app.UseHsts();
     app.UseHttpsRedirection();
 }

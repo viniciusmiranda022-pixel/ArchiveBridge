@@ -1,25 +1,27 @@
 @page
 @{
     ViewData["Title"] = "Exportação";
+    var header = new PageHeaderModel("Exportação do Enterprise Vault", "Preparação e execução da exportação controlada — planejada para uma etapa futura.");
 }
-<h1>Exportação do Enterprise Vault</h1>
 
-<div class="notice">
-    <strong>Status: indisponível.</strong><br />
-    Motivo: o Slice 4B (Exportação Controlada do Enterprise Vault) ainda não foi implementado.
+<partial name="_PageHeader" model="header" />
+
+<div class="alert warning">
+    <span class="a-ico">@Icons.Svg("clock")</span>
+    <div class="a-body"><strong>Planejado — não disponível nesta versão.</strong>Esta área é intencionalmente inoperante: o portal não simula funcionalidades inexistentes.</div>
 </div>
 
-<p class="lead">
-    Esta tela é intencionalmente inoperante: o portal não simula funcionalidades inexistentes. Quando o
-    Slice 4B entrar, esta área permitirá selecionar archives, preparar jobs de exportação e acompanhar a
-    execução — tudo sustentado por evidência, com a homologação contra Enterprise Vault real como etapa
-    posterior.
-</p>
-
-<h2>Fora do escopo desta fatia</h2>
-<ul>
-    <li>Execução de <span class="mono">Export-EVArchive</span></li>
-    <li>Geração de PST e limites de tamanho</li>
-    <li>Purview, Microsoft Graph, AzCopy, ingestão no Microsoft 365</li>
-    <li>Reconciliação final e homologação real contra Enterprise Vault</li>
-</ul>
+<div class="card-grid">
+    <div class="card">
+        <div class="card-head"><h3>Exportação de arquivos</h3><span class="badge warning"><span class="dot"></span>Planejado</span></div>
+        <div class="card-body"><p class="muted mt0">Seleção de arquivos, preparação de lotes e acompanhamento de execução — sustentados por evidência.</p></div>
+    </div>
+    <div class="card">
+        <div class="card-head"><h3>Importação Microsoft 365</h3><span class="badge neutral"><span class="dot"></span>Não disponível</span></div>
+        <div class="card-body"><p class="muted mt0">Ingestão nos arquivos online do Microsoft 365 — etapa posterior do roteiro.</p></div>
+    </div>
+    <div class="card">
+        <div class="card-head"><h3>Reconciliação</h3><span class="badge warning"><span class="dot"></span>Planejado</span></div>
+        <div class="card-body"><p class="muted mt0">Reconciliação final e homologação contra o ambiente de origem.</p></div>
+    </div>
+</div>

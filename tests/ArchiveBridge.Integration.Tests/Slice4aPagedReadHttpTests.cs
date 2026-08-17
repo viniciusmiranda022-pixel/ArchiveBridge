@@ -295,7 +295,9 @@ public sealed class Slice4aPagedReadHttpTests : IDisposable
     // separadas pelo cabeçalho "<h2>Autenticação</h2>". Cada link resolve para /Audit (Index é a página padrão).
     private static (string? OpNext, string? AuthNext) ExtractAuditNextLinks(string html)
     {
-        var split = html.IndexOf("<h2>Autenticação</h2>", StringComparison.Ordinal);
+        // O portal enterprise separa as duas trilhas em abas; a de autenticação é o painel data-panel="auth".
+        // (Ambos os painéis estão presentes no HTML — a aba inativa é apenas ocultada por CSS.)
+        var split = html.IndexOf("data-panel=\"auth\"", StringComparison.Ordinal);
         var opSection = split >= 0 ? html[..split] : html;
         var authSection = split >= 0 ? html[split..] : string.Empty;
         return (ExtractAuditHref(opSection), ExtractAuditHref(authSection));

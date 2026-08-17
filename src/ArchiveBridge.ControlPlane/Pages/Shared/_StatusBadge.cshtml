@@ -1,0 +1,3 @@
+@model string
+@{ var (variant, label) = StatusBadge.Resolve(Model); }
+<span class="badge @variant"><span class="dot"></span>@label</span>

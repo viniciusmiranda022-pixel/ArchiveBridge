@@ -1,50 +1,140 @@
+@inject ArchiveBridge.ControlPlane.Composition.PresentationModeOptions Presentation
+@inject ArchiveBridge.ControlPlane.Presentation.IPresentationDataProvider Demo
+@{
+    var authed = User.Identity?.IsAuthenticated == true;
+    var demo = Presentation.Enabled;
+    var currentPage = ViewContext.RouteData.Values["page"]?.ToString() ?? string.Empty;
+    var title = ViewData["Title"]?.ToString() ?? "ArchiveBridge";
+
+    string NavClass(string prefix) =>
+        currentPage.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ? "nav-item active" : "nav-item";
+
+    string tenantLabel;
+    string projectLabel;
+    if (demo)
+    {
+        tenantLabel = Demo.Scope.TenantLabel;
+        projectLabel = Demo.Scope.ProjectLabel;
+    }
+    else
+    {
+        tenantLabel = ShortId(User.FindFirstValue(PortalClaims.TenantId));
+        projectLabel = ShortId(User.FindFirstValue(PortalClaims.ProjectId));
+    }
+
+    var displayName = User.FindFirst(PortalClaims.DisplayName)?.Value ?? User.Identity?.Name ?? "—";
+}
+@functions {
+    static string ShortId(string? value) =>
+        string.IsNullOrEmpty(value) ? "—" : (value.Length > 8 ? value[..8] + "…" : value);
+
+    static string Initials(string name)
+    {
+        var parts = name.Split([' ', '.', '_'], StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0) { return "?"; }
+        if (parts.Length == 1) { return parts[0][..1].ToUpperInvariant(); }
+        return (parts[0][..1] + parts[^1][..1]).ToUpperInvariant();
+    }
+
+    string PrimaryRole()
+    {
+        foreach (var role in new[] { PortalRoles.Administrator, PortalRoles.Auditor, PortalRoles.Approver, PortalRoles.Operator, PortalRoles.Viewer })
+        {
+            if (User.IsInRole(role)) { return role; }
+        }
+        return "—";
+    }
+}
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>@ViewData["Title"] · ArchiveBridge</title>
+    <title>@title · ArchiveBridge</title>
     <link rel="stylesheet" href="~/css/site.css" asp-append-version="true" />
 </head>
 <body>
-    <header class="topbar">
-        <a class="brand" asp-page="/Index">ArchiveBridge</a>
-        <span class="badge">Control Plane · Slice 4A</span>
-        @if (User.Identity?.IsAuthenticated == true)
+@if (authed)
+{
+    <div class="app @(demo ? "has-demo" : null)">
+        @if (demo)
         {
-            <span class="spacer"></span>
-            <span class="user">@(User.FindFirst(PortalClaims.DisplayName)?.Value) (@User.Identity!.Name)</span>
-            <form class="logout" asp-page="/Account/Logout" method="post">
-                <button type="submit">Sair</button>
-            </form>
+            <div class="demo-banner">
+                @Icons.Svg("info")
+                <span><b>Modo demonstração</b> — os dados exibidos nesta sessão são simulados (dataset sintético). Nenhuma operação real é executada.</span>
+            </div>
         }
-    </header>
+        <a class="brand" asp-page="/Index">
+            <span class="mark">@Icons.Svg("bridge")</span>
+            <span class="name"><b>ArchiveBridge</b><span>Enterprise Archive Migration</span></span>
+        </a>
 
-    @if (User.Identity?.IsAuthenticated == true)
-    {
-        <nav class="sidenav">
-            <a asp-page="/Index">Painel</a>
-            <a asp-page="/Projects/Index">Projetos</a>
-            <a asp-page="/Waves/Index">Ondas</a>
-            <a asp-page="/Jobs/Index">Jobs</a>
-            <a asp-page="/EnterpriseVault/Index">Enterprise Vault</a>
-            <a asp-page="/Evidence/Index">Evidências</a>
-            <a asp-page="/Audit/Index">Auditoria</a>
-            <a asp-page="/Export/Index">Exportação</a>
+        <header class="topbar">
+            <button type="button" class="nav-toggle" data-nav-toggle aria-label="Alternar menu">@Icons.Svg("menu")</button>
+            <nav class="crumbs" aria-label="Trilha">
+                <span>ArchiveBridge</span><span class="sep">/</span><span class="here">@title</span>
+            </nav>
+            <span class="grow"></span>
+            <div class="scope">
+                <span class="scope-chip"><small>Tenant</small><b title="@tenantLabel">@tenantLabel</b></span>
+                <span class="scope-chip"><small>Projeto</small><b title="@projectLabel">@projectLabel</b></span>
+            </div>
+            <div class="usermenu">
+                <span class="avatar" aria-hidden="true">@Initials(displayName)</span>
+                <span class="who"><b>@displayName</b><small>@PrimaryRole()</small></span>
+                <form class="logout" asp-page="/Account/Logout" method="post" data-guard>
+                    <button type="submit" class="btn sm" title="Encerrar sessão">@Icons.Svg("logout")</button>
+                </form>
+            </div>
+        </header>
+
+        <nav class="sidebar" aria-label="Navegação principal">
+            <a class="@NavClass("/Index")" asp-page="/Index"><span class="ico">@Icons.Svg("dashboard")</span>Dashboard</a>
+
+            <div class="nav-group">
+                <div class="label">Operação</div>
+                <a class="@NavClass("/Projects")" asp-page="/Projects/Index"><span class="ico">@Icons.Svg("projects")</span>Projetos</a>
+                <a class="@NavClass("/Waves")" asp-page="/Waves/Index"><span class="ico">@Icons.Svg("waves")</span>Ondas de Migração</a>
+                <a class="@NavClass("/EnterpriseVault")" asp-page="/EnterpriseVault/Index"><span class="ico">@Icons.Svg("vault")</span>Enterprise Vault</a>
+                <a class="@NavClass("/Mapping")" asp-page="/Mapping/Index"><span class="ico">@Icons.Svg("mapping")</span>Mapping</a>
+            </div>
+
+            <div class="nav-group">
+                <div class="label">Governança</div>
+                <a class="@NavClass("/Evidence")" asp-page="/Evidence/Index"><span class="ico">@Icons.Svg("evidence")</span>Evidências</a>
+                <a class="@NavClass("/Audit")" asp-page="/Audit/Index"><span class="ico">@Icons.Svg("audit")</span>Auditoria</a>
+                <a class="@NavClass("/Jobs")" asp-page="/Jobs/Index"><span class="ico">@Icons.Svg("jobs")</span>Jobs</a>
+            </div>
+
             @if (User.IsInRole(PortalRoles.Administrator))
             {
-                <a asp-page="/Admin/Index">Administração</a>
+                <div class="nav-group">
+                    <div class="label">Administração</div>
+                    <a class="@NavClass("/Admin")" asp-page="/Admin/Index"><span class="ico">@Icons.Svg("settings")</span>Configurações</a>
+                </div>
             }
         </nav>
-    }
 
-    <main class="content">
+        <div class="scrim"></div>
+
+        <div class="work">
+            <div class="work-inner">
+                @RenderBody()
+            </div>
+            <footer class="foot">
+                <span class="ver">@Icons.Svg("bridge") <b>ArchiveBridge</b> <span class="tag">Preview · 0.x</span></span>
+                <span class="grow"></span>
+                <span>A descoberta do Enterprise Vault é somente leitura — nenhum dado é exportado. Exportação de arquivos e importação para o Microsoft 365 são etapas planejadas e ainda não disponíveis nesta versão.</span>
+            </footer>
+        </div>
+    </div>
+}
+else
+{
+    <main class="anon-main">
         @RenderBody()
     </main>
-
-    <footer class="footer">
-        ArchiveBridge Control Plane — operação on-premises. A descoberta Enterprise Vault disponível nesta
-        fatia é READ-ONLY; a exportação Enterprise Vault (Slice 4B) permanece indisponível.
-    </footer>
+}
+<script src="~/js/site.js" asp-append-version="true"></script>
 </body>
 </html>

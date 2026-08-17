@@ -1,44 +1,91 @@
 @page
+@inject PresentationModeOptions Presentation
+@inject IPresentationDataProvider Demo
 @inject IControlPlaneQueries Queries
 @inject IPortalScopeAccessor ScopeAccessor
 @{
     ViewData["Title"] = "Job";
-    var scope = ScopeAccessor.Resolve(User);
-    var jobIdText = Request.Query["jobId"].ToString();
-    Guid.TryParse(jobIdText, out var jobId);
-    var transitions = jobId == Guid.Empty
-        ? Array.Empty<JobTransitionView>()
-        : await Queries.ListJobTransitionsAsync(scope, jobId, HttpContext.RequestAborted);
-}
-<h1>Job @(jobId == Guid.Empty ? "(inválido)" : jobIdText[..8])</h1>
-<p class="lead">Trilha de auditoria imutável das transições de estado (ordem cronológica).</p>
-<p><a class="btn" asp-page="/Jobs/Index">← Voltar aos jobs</a></p>
+    var ct = HttpContext.RequestAborted;
+    Guid.TryParse(Request.Query["jobId"].ToString(), out var jobId);
 
-@if (transitions.Count == 0)
+    JobSummary? job;
+    IReadOnlyList<JobTransitionView> transitions;
+    if (Presentation.Enabled)
+    {
+        job = jobId == Guid.Empty ? null : Demo.GetJobs().FirstOrDefault(j => j.JobId == jobId);
+        transitions = jobId == Guid.Empty ? [] : Demo.GetJobTransitions(jobId);
+    }
+    else
+    {
+        var scope = ScopeAccessor.Resolve(User);
+        job = jobId == Guid.Empty ? null : (await Queries.ListJobsAsync(scope, 200, ct)).FirstOrDefault(j => j.JobId == jobId);
+        transitions = jobId == Guid.Empty ? [] : await Queries.ListJobTransitionsAsync(scope, jobId, ct);
+    }
+
+    var latestLease = transitions.Count > 0 ? transitions[^1].LeaseEpoch.ToString(System.Globalization.CultureInfo.InvariantCulture) : "—";
+}
+
+<p><a class="btn sm ghost" asp-page="/Jobs/Index">@Icons.Svg("arrow-left") Jobs</a></p>
+
+@if (job is null && transitions.Count == 0)
 {
-    <p class="empty">Sem transições visíveis para este job neste tenant.</p>
+    var empty = new EmptyStateModel(
+        "Job não encontrado",
+        "O job solicitado não existe neste escopo ou você não tem permissão para visualizá-lo.",
+        "jobs");
+    <partial name="_EmptyState" model="empty" />
 }
 else
 {
-    <div class="tablewrap">
-        <table>
-            <thead>
-                <tr><th>#</th><th>De</th><th>Para</th><th>Motivo</th><th>Época do lease</th><th>Worker</th><th>Quando (UTC)</th></tr>
-            </thead>
-            <tbody>
-                @foreach (var t in transitions)
+    <div class="page-head">
+        <div class="titles">
+            <h1>Job @(jobId.ToString()[..8])</h1>
+            <p class="sub">Fila durável · trilha imutável de transições de estado (ordem cronológica).</p>
+        </div>
+        @if (job is not null)
+        {
+            <div class="head-actions"><partial name="_StatusBadge" model="job.State" /></div>
+        }
+    </div>
+
+    <div class="grid-2">
+        <div class="card">
+            <div class="card-head"><h3>Resumo</h3></div>
+            <div class="card-body">
+                <div class="kv">
+                    <div><div class="k">Job ID</div><div class="v mono">@jobId</div></div>
+                    <div><div class="k">Workload</div><div class="v">@(job?.Workload ?? "—")</div></div>
+                    <div><div class="k">Estado</div><div class="v">@if (job is not null) { <partial name="_StatusBadge" model="job.State" /> } else { <span>—</span> }</div></div>
+                    <div><div class="k">Tentativa</div><div class="v">@(job?.AttemptCount.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "—")</div></div>
+                    <div><div class="k">Época do lease</div><div class="v mono">@latestLease</div></div>
+                    <div><div class="k">Último erro</div><div class="v">@(job?.LastErrorCode ?? "—")</div></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-head"><h3>Linha do tempo</h3></div>
+            <div class="card-body">
+                @if (transitions.Count == 0)
                 {
-                    <tr>
-                        <td>@t.TransitionId</td>
-                        <td>@(t.FromState ?? "—")</td>
-                        <td><span class="pill">@t.ToState</span></td>
-                        <td>@t.ReasonCode</td>
-                        <td>@t.LeaseEpoch</td>
-                        <td class="mono">@(t.WorkerId ?? "—")</td>
-                        <td class="mono">@t.OccurredAtUtc.ToString("u")</td>
-                    </tr>
+                    <p class="muted mt0">Sem transições visíveis para este job neste escopo.</p>
                 }
-            </tbody>
-        </table>
+                else
+                {
+                    <ul class="timeline">
+                        @for (var i = 0; i < transitions.Count; i++)
+                        {
+                            var t = transitions[i];
+                            var cls = i == transitions.Count - 1 ? "active" : "done";
+                            <li class="@cls">
+                                <span class="tdot"></span>
+                                <div class="tname">@t.ToState</div>
+                                <div class="tmeta">@t.ReasonCode · @DisplayFormat.Utc(t.OccurredAtUtc)@(t.WorkerId is null ? "" : $" · {t.WorkerId}")</div>
+                            </li>
+                        }
+                    </ul>
+                }
+            </div>
+        </div>
     </div>
 }
