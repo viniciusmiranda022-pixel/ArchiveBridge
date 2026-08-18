@@ -1,32 +1,36 @@
 @page
+@inject PresentationModeOptions Presentation
 @inject IPortalUserStore Users
 @{
-    ViewData["Title"] = "Administração";
-    var userCount = await Users.CountAsync(HttpContext.RequestAborted);
+    ViewData["Title"] = "Configurações";
+    var userCount = Presentation.Enabled ? 5 : await Users.CountAsync(HttpContext.RequestAborted);
+    var header = new PageHeaderModel("Administração do portal", "Área restrita ao papel Administrator (RBAC reforçado por política e por autorização de pasta).");
 }
-<h1>Administração do portal</h1>
-<p class="lead">Área restrita ao papel <strong>Administrator</strong> (RBAC reforçado por política e por autorização de pasta).</p>
 
-<div class="cards">
-    <div class="card"><div class="n">@userCount</div><div class="l">Usuários do portal</div></div>
+<partial name="_PageHeader" model="header" />
+
+<div class="metrics">
+    <div class="metric">
+        <div class="top"><span class="label">Usuários do portal</span><span class="chip-ico">@Icons.Svg("shield")</span></div>
+        <div class="value">@userCount</div>
+    </div>
 </div>
 
-<h2>Modelo de papéis (RBAC)</h2>
+<h2 class="section">Modelo de papéis (RBAC)</h2>
 <div class="tablewrap">
-    <table>
+    <table class="data">
         <thead><tr><th>Papel</th><th>Finalidade</th></tr></thead>
         <tbody>
-            <tr><td><span class="pill">Viewer</span></td><td>Consulta somente leitura (dashboard, projetos, ondas, jobs, evidências autorizadas).</td></tr>
-            <tr><td><span class="pill">Operator</span></td><td>Operação do dia a dia (leitura de projetos, ondas, jobs, descoberta e evidências).</td></tr>
-            <tr><td><span class="pill">Approver</span></td><td>Aprovação/bloqueio de projetos e ondas (ações de escrita entram em rodada posterior).</td></tr>
-            <tr><td><span class="pill">Auditor</span></td><td>Somente leitura para auditoria e observabilidade.</td></tr>
-            <tr><td><span class="pill">Administrator</span></td><td>Administração do portal (usuários/papéis) além de todo o acesso de leitura.</td></tr>
+            <tr><td><span class="badge neutral"><span class="dot"></span>Viewer</span></td><td>Consulta somente leitura (dashboard, projetos, ondas, jobs, evidências autorizadas).</td></tr>
+            <tr><td><span class="badge neutral"><span class="dot"></span>Operator</span></td><td>Operação do dia a dia (leitura + descoberta somente leitura autorizada).</td></tr>
+            <tr><td><span class="badge neutral"><span class="dot"></span>Approver</span></td><td>Aprovação/bloqueio de projetos e ondas.</td></tr>
+            <tr><td><span class="badge neutral"><span class="dot"></span>Auditor</span></td><td>Somente leitura para auditoria e observabilidade.</td></tr>
+            <tr><td><span class="badge neutral"><span class="dot"></span>Administrator</span></td><td>Administração do portal (usuários/papéis) além de todo o acesso de leitura.</td></tr>
         </tbody>
     </table>
 </div>
 
-<div class="notice">
-    <strong>Gestão de usuários pelo portal: próxima rodada.</strong> Criar/editar usuários e papéis é uma
-    ação de escrita; nesta fatia o provisionamento ocorre no bootstrap on-premises. A tela evita simular
-    ações ainda não implementadas.
+<div class="alert neutral">
+    <span class="a-ico">@Icons.Svg("info")</span>
+    <div class="a-body"><strong>Gestão de usuários pelo portal: etapa futura.</strong>Criar/editar usuários e papéis é uma ação de escrita; nesta versão o provisionamento ocorre no bootstrap on-premises. A tela evita simular ações ainda não implementadas.</div>
 </div>

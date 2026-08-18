@@ -2,7 +2,11 @@
 @{
     ViewData["Title"] = "Acesso negado";
 }
-<h1>Acesso negado</h1>
-<p class="lead">Seu perfil não tem permissão para acessar este recurso.</p>
-<p>Se você acredita que isto é um engano, contate o administrador do portal.</p>
-<a class="btn" asp-page="/Index">Voltar ao painel</a>
+<div class="centered">
+    <div class="notice-card warn">
+        <span class="nc-ico">@Icons.Svg("block")</span>
+        <h1>Acesso negado</h1>
+        <p>Seu perfil não possui permissão para acessar este recurso. Se você acredita que isto é um engano, contate o administrador do portal.</p>
+        <a class="btn primary" asp-page="/Index">Voltar ao início</a>
+    </div>
+</div>

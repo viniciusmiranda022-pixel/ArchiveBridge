@@ -1,34 +1,123 @@
 @page
+@inject PresentationModeOptions Presentation
+@inject IPresentationDataProvider Demo
 @inject IControlPlaneQueries Queries
+@inject IPortalOperationalAudit OperationalAudit
 @inject IPortalScopeAccessor ScopeAccessor
 @{
-    ViewData["Title"] = "Painel";
-    var scope = ScopeAccessor.Resolve(User);
-    var d = await Queries.GetDashboardAsync(scope, HttpContext.RequestAborted);
+    ViewData["Title"] = "Visão Geral";
+    var ct = HttpContext.RequestAborted;
+    DashboardViewModel vm;
+    if (Presentation.Enabled)
+    {
+        vm = Demo.GetDashboard();
+    }
+    else
+    {
+        var scope = ScopeAccessor.Resolve(User);
+        var summary = await Queries.GetDashboardAsync(scope, ct);
+        var recent = await OperationalAudit.RecentAsync(scope, 8, ct);
+        vm = RealDashboardComposer.Build(summary, recent);
+    }
+
+    string MetricIcon(string key) => key switch
+    {
+        "projects" => "projects",
+        "waves" => "waves",
+        "environments" => "vault",
+        "jobs" => "jobs",
+        "evidence" => "evidence",
+        "validations" => "clipboard-check",
+        _ => "layers",
+    };
+
+    var header = new PageHeaderModel("Visão Geral", "Acompanhe o estado operacional da migração e os principais indicadores do projeto.");
 }
-<h1>Painel operacional</h1>
-<p class="lead">Visão consolidada do tenant (somente leitura). Todos os números respeitam o isolamento por tenant.</p>
 
-<h2>Migração</h2>
-<div class="cards">
-    <div class="card"><div class="n">@d.Projects</div><div class="l">Projetos</div></div>
-    <div class="card"><div class="n">@d.Waves</div><div class="l">Ondas</div></div>
-    <div class="card"><div class="n">@d.Jobs</div><div class="l">Jobs</div></div>
-    <div class="card"><div class="n">@d.JobsPending</div><div class="l">Jobs pendentes</div></div>
-    <div class="card"><div class="n">@d.JobsProcessing</div><div class="l">Jobs em execução</div></div>
-    <div class="card"><div class="n">@d.JobsFailed</div><div class="l">Jobs com falha</div></div>
+<partial name="_PageHeader" model="header" />
+
+<div class="metrics">
+    @foreach (var metric in vm.Metrics)
+    {
+        <div class="metric">
+            <div class="top">
+                <span class="label">@metric.Label</span>
+                <span class="chip-ico">@Icons.Svg(MetricIcon(metric.Key))</span>
+            </div>
+            <div class="value @(metric.Available ? null : "muted")">@metric.Value</div>
+            @if (!metric.Available)
+            {
+                <span class="hint">Sem contagem nesta versão</span>
+            }
+        </div>
+    }
 </div>
 
-<h2>Enterprise Vault — descoberta de capacidades (READ-ONLY)</h2>
-<div class="cards">
-    <div class="card"><div class="n">@d.EvEnvironments</div><div class="l">Ambientes</div></div>
-    <div class="card"><div class="n">@d.EvReady</div><div class="l">Ready</div></div>
-    <div class="card"><div class="n">@d.EvBlocked</div><div class="l">Blocked</div></div>
-    <div class="card"><div class="n">@d.EvUnsupported</div><div class="l">Unsupported</div></div>
-</div>
+<h2 class="section">Pipeline de Migração</h2>
+<partial name="_Pipeline" model="vm.Pipeline" />
 
-<div class="notice">
-    <strong>Exportação indisponível.</strong> A execução de exportação do Enterprise Vault
-    (<span class="mono">Export-EVArchive</span>, PST, staging) chega no <strong>Slice 4B</strong>.
-    Esta fatia observa a plataforma; não dispara execução.
+<div class="grid-status-activity">
+    <div class="card">
+        <div class="card-head"><h3>Status da Plataforma</h3></div>
+        <div class="card-body">
+            <div class="statuslist">
+                @foreach (var component in vm.Platform)
+                {
+                    <div class="statusrow">
+                        <div class="sname">@component.Name<small>@component.Detail</small></div>
+                        <span class="badge @component.BadgeVariant"><span class="dot"></span>@component.Label</span>
+                    </div>
+                }
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-head"><h3>Atividade recente</h3></div>
+        <div class="card-body flush">
+            @if (vm.Activity.Count == 0)
+            {
+                var emptyActivity = new EmptyStateModel(
+                    "Sem atividade registrada",
+                    "As ações operacionais realizadas na plataforma aparecerão aqui.",
+                    "clock");
+                <partial name="_EmptyState" model="emptyActivity" />
+            }
+            else
+            {
+                <div class="tablewrap">
+                    <table class="data">
+                        <thead>
+                            <tr><th>Hora (UTC)</th><th>Evento</th><th>Recurso</th><th>Resultado</th><th>Usuário</th></tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var entry in vm.Activity)
+                            {
+                                <tr>
+                                    <td class="mono nowrap">@DisplayFormat.Utc(entry.WhenUtc)</td>
+                                    <td>@entry.Event</td>
+                                    <td class="mono">@entry.Resource</td>
+                                    <td>
+                                        @if (entry.Succeeded == true)
+                                        {
+                                            <span class="badge success"><span class="dot"></span>Sucesso</span>
+                                        }
+                                        else if (entry.Succeeded == false)
+                                        {
+                                            <span class="badge danger"><span class="dot"></span>Negado</span>
+                                        }
+                                        else
+                                        {
+                                            <span class="badge neutral"><span class="dot"></span>—</span>
+                                        }
+                                    </td>
+                                    <td>@entry.Actor</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </div>
+    </div>
 </div>

@@ -190,11 +190,12 @@ public sealed class Slice4aPortalDiscoveryRequestHttpTests(SqlServerFixture fixt
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var html = await response.Content.ReadAsStringAsync();
 
-        // O texto do rodapé quebra em duas linhas no Razor (whitespace preservado); afirmamos por fragmentos
-        // de linha única.
-        Assert.Contains("A descoberta Enterprise Vault disponível nesta", html, StringComparison.Ordinal);
-        Assert.Contains("fatia é READ-ONLY; a exportação Enterprise Vault (Slice 4B) permanece indisponível", html, StringComparison.Ordinal);
-        Assert.DoesNotContain("Slice 4A · READ-ONLY", html, StringComparison.Ordinal);      // badge antigo removido
+        // O rodapé do layout enterprise fala LINGUAGEM DE PRODUTO (sem jargão "Slice"), mas preserva as MESMAS
+        // garantias de honestidade: a descoberta EV é somente leitura e a exportação/importação são etapas
+        // futuras indisponíveis — sem jamais afirmar que a plataforma inteira é somente leitura.
+        Assert.Contains("A descoberta do Enterprise Vault é somente leitura", html, StringComparison.Ordinal);
+        Assert.Contains("Exportação de arquivos e importação para o Microsoft 365 são etapas planejadas e ainda não disponíveis nesta versão", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("Slice 4A", html, StringComparison.Ordinal);                          // sem jargão de engenharia na UI
         Assert.DoesNotContain("Esta fatia (Slice 4A) é somente leitura", html, StringComparison.Ordinal); // claim antigo removido
     }
 

@@ -1,100 +1,119 @@
 @page
 @model ArchiveBridge.ControlPlane.Pages.EnterpriseVault.IndexModel
-@functions {
-    static string PillClass(string? resultStatus) => resultStatus switch
-    {
-        "Ready" => "pill ok",
-        "Blocked" => "pill bad",
-        "Unsupported" => "pill warn",
-        "Failed" => "pill bad",
-        _ => "pill",
-    };
-}
 @{
     ViewData["Title"] = "Enterprise Vault";
+    var header = new PageHeaderModel("Enterprise Vault", "Descoberta de capacidades e preparação do ambiente de origem. A descoberta é uma operação somente leitura — nenhum dado é exportado do Enterprise Vault.");
 }
-<h1>Enterprise Vault — descoberta de capacidades</h1>
-<p class="lead">
-    Resultado <span class="pill ok">Ready</span> / <span class="pill bad">Blocked</span> /
-    <span class="pill warn">Unsupported</span> por ambiente, sempre sustentado por evidência. Descoberta é
-    <strong>READ-ONLY</strong>: nenhuma exportação é executada.
-</p>
 
-@if (!Model.DiscoveryEnabled)
+<partial name="_PageHeader" model="header" />
+
+@if (Model.PresentationMode)
 {
-    <div class="notice">
-        <strong>Discovery indisponível neste deployment.</strong> A solicitação de novas descobertas está
-        desabilitada por configuração; o portal exibe apenas os resultados já registrados.
+    <div class="alert warning">
+        <span class="a-ico">@Icons.Svg("info")</span>
+        <div class="a-body"><strong>Modo demonstração</strong>As ações de descoberta estão desabilitadas: os ambientes abaixo são exemplos sintéticos.</div>
+    </div>
+}
+else if (!Model.DiscoveryEnabled)
+{
+    <div class="alert neutral">
+        <span class="a-ico">@Icons.Svg("info")</span>
+        <div class="a-body"><strong>Descoberta indisponível neste deployment.</strong>A solicitação de novas descobertas está desabilitada por configuração; o portal exibe apenas os resultados já registrados.</div>
     </div>
 }
 else if (!Model.CanRequestDiscovery)
 {
-    <div class="notice">
-        Você tem acesso de <strong>leitura</strong> aos resultados. Solicitar uma nova descoberta requer o
-        papel <strong>Operator</strong> ou <strong>Administrator</strong>.
+    <div class="alert info">
+        <span class="a-ico">@Icons.Svg("shield")</span>
+        <div class="a-body"><strong>Acesso de leitura.</strong>Solicitar uma nova descoberta requer o papel Operator ou Administrator.</div>
     </div>
 }
 else
 {
-    <div class="notice">
-        Solicitar uma descoberta apenas <strong>descobre capacidades</strong> (READ-ONLY) de forma assíncrona:
-        um Job durável é enfileirado e processado depois pelo Worker EV. <strong>Não executa Export-EVArchive
-        e não exporta dados.</strong>
+    <div class="alert info">
+        <span class="a-ico">@Icons.Svg("shield")</span>
+        <div class="a-body"><strong>Operação somente leitura.</strong>Solicitar uma descoberta apenas identifica capacidades do ambiente de origem de forma assíncrona (um job durável é enfileirado e processado depois). Nenhum dado é exportado do Enterprise Vault.</div>
     </div>
 }
 
 @if (Model.Environments.Count == 0)
 {
-    <p class="empty">Nenhum ambiente Enterprise Vault neste tenant.</p>
+    var empty = new EmptyStateModel(
+        "Nenhuma descoberta executada",
+        "Nenhum ambiente Enterprise Vault está associado a este projeto. Ambientes descobertos aparecerão aqui com seu resultado de capacidade e evidência.",
+        "vault");
+    <partial name="_EmptyState" model="empty" />
 }
 else
 {
-    <div class="tablewrap">
-        <table>
-            <thead>
-                <tr><th>Site</th><th>Directory Server</th><th>Resultado</th><th>Versão desc.</th><th>Adapter</th><th>Versão observada</th><th>Evidência (SHA-256)</th><th>Tamanho</th><th>Concluída (UTC)</th>@if (Model.CanRequestDiscovery){<th>Ação</th>}</tr>
-            </thead>
-            <tbody>
-                @foreach (var row in Model.Environments)
-                {
-                    var e = row.Summary;
-                    <tr>
-                        <td>@e.SiteName</td>
-                        <td class="mono">@e.DirectoryServer</td>
-                        @if (e.LatestDiscovery is { } disc)
-                        {
-                            <td><span class="@PillClass(disc.ResultStatus)">@disc.ResultStatus</span></td>
-                            <td>v@disc.DiscoveryVersion</td>
-                            <td>@(disc.SelectedAdapter ?? "—")@(disc.AdapterVersion is { } av ? $" (v{av})" : "")</td>
-                            <td class="mono">@disc.ObservedVersion</td>
-                            <td class="mono">@disc.EvidenceHash[..Math.Min(16, disc.EvidenceHash.Length)]…</td>
-                            <td>@disc.EvidenceSizeBytes.ToString("N0") B</td>
-                            <td class="mono">@disc.CompletedAtUtc.ToString("u")</td>
-                        }
-                        else
-                        {
-                            <td><span class="pill">sem descoberta</span></td>
-                            <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
-                        }
-                        @if (Model.CanRequestDiscovery)
-                        {
-                            <td>
-                                <form method="post" asp-page-handler="RequestDiscovery">
-                                    <input type="hidden" name="EnvironmentId" value="@e.EnvironmentId" />
-                                    <input type="hidden" name="IdempotencyKey" value="@row.IdempotencyKey" />
-                                    <button type="submit" class="btn">Executar discovery READ-ONLY</button>
-                                </form>
-                            </td>
-                        }
-                    </tr>
-                }
-            </tbody>
-        </table>
+    <div class="card-grid">
+        @foreach (var row in Model.Environments)
+        {
+            var e = row.Summary;
+            var disc = e.LatestDiscovery;
+            <div class="card">
+                <div class="card-head">
+                    <div>
+                        <h3>@e.SiteName</h3>
+                        <div class="card-sub mono">@e.DirectoryServer</div>
+                    </div>
+                    @if (disc is not null)
+                    {
+                        <partial name="_StatusBadge" model="disc.ResultStatus" />
+                    }
+                    else
+                    {
+                        <span class="badge neutral"><span class="dot"></span>Sem descoberta</span>
+                    }
+                </div>
+                <div class="card-body">
+                    @if (disc is not null)
+                    {
+                        <div class="kv">
+                            <div><div class="k">Versão observada</div><div class="v mono">@disc.ObservedVersion</div></div>
+                            <div><div class="k">Versão da descoberta</div><div class="v">v@(disc.DiscoveryVersion)</div></div>
+                            <div><div class="k">Capability</div><div class="v">@(disc.SelectedAdapter ?? "—")@(disc.AdapterVersion is { } av ? $" (v{av})" : "")</div></div>
+                            <div><div class="k">Última descoberta</div><div class="v mono">@DisplayFormat.Utc(disc.CompletedAtUtc)</div></div>
+                        </div>
+                        <details class="tech">
+                            <summary>Detalhes técnicos</summary>
+                            <div class="tech-body">
+                                <div class="kv">
+                                    <div><div class="k">Evidência (SHA-256)</div><div class="v"><partial name="_HashDisplay" model="@(new HashModel(disc.ContentSha256, 16))" /></div></div>
+                                    <div><div class="k">Resultado</div><div class="v mono">@disc.ResultCode</div></div>
+                                    <div><div class="k">Tamanho</div><div class="v">@disc.EvidenceSizeBytes.ToString("N0") bytes</div></div>
+                                </div>
+                            </div>
+                        </details>
+                    }
+                    else
+                    {
+                        <p class="muted mt0">Ainda não há descoberta registrada para este ambiente.</p>
+                    }
+                </div>
+                <div class="card-actions">
+                    @if (disc is not null)
+                    {
+                        <a class="btn sm" asp-page="/Evidence/Index">@Icons.Svg("evidence") Ver Evidência</a>
+                    }
+                    @if (Model.CanRequestDiscovery)
+                    {
+                        <form method="post" asp-page-handler="RequestDiscovery" data-guard>
+                            <input type="hidden" name="EnvironmentId" value="@e.EnvironmentId" />
+                            <input type="hidden" name="IdempotencyKey" value="@row.IdempotencyKey" />
+                            <button type="submit" class="btn sm primary" data-busy="Executando…">@Icons.Svg("search") Executar Discovery</button>
+                        </form>
+                    }
+                    else if (Model.PresentationMode)
+                    {
+                        <button type="button" class="btn sm primary" disabled title="Operação desabilitada no modo demonstração">@Icons.Svg("search") Executar Discovery</button>
+                    }
+                </div>
+            </div>
+        }
     </div>
-    @if (Model.CanRequestDiscovery)
+    @if (Model.PresentationMode)
     {
-        <p class="empty">
-            Esta operação apenas descobre capacidades. Não executa Export-EVArchive e não exporta dados.
-        </p>
+        <p class="faint">Operação desabilitada no modo demonstração.</p>
     }
 }

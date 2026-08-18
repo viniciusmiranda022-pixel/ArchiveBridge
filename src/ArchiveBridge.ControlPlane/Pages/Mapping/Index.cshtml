@@ -1,0 +1,123 @@
+@page
+@inject PresentationModeOptions Presentation
+@inject IPresentationDataProvider Demo
+@{
+    ViewData["Title"] = "Mapping";
+    MappingOverview? mapping = Presentation.Enabled ? Demo.GetMapping() : null;
+    var header = new PageHeaderModel("Mapping", "Mapeamento dos PSTs selecionados para o Online Archive correspondente no Microsoft 365.");
+}
+
+<partial name="_PageHeader" model="header" />
+
+<div class="grid-2">
+    <div class="card">
+        <div class="card-head"><h3>Mapping atual</h3></div>
+        <div class="card-body">
+            @if (mapping is { HasCurrent: true })
+            {
+                <div class="kv">
+                    <div><div class="k">Versão</div><div class="v">@mapping.CurrentVersion</div></div>
+                    <div><div class="k">Status</div><div class="v"><partial name="_StatusBadge" model="mapping.Status" /></div></div>
+                    <div><div class="k">Linhas</div><div class="v">@mapping.Rows</div></div>
+                    <div><div class="k">Gerado em</div><div class="v mono">@DisplayFormat.Utc(mapping.GeneratedAtUtc)</div></div>
+                    <div><div class="k">Gerado por</div><div class="v">@mapping.GeneratedBy</div></div>
+                    <div><div class="k">Hash</div><div class="v"><partial name="_HashDisplay" model="@(new HashModel(mapping.Hash, 16))" /></div></div>
+                </div>
+            }
+            else
+            {
+                var empty = new EmptyStateModel(
+                    "Nenhum mapping disponível",
+                    "O mapping é gerado a partir de uma onda aprovada e congela a correspondência entre os PSTs de origem e os arquivos de destino. Quando houver um mapping neste projeto, seus metadados aparecerão aqui.",
+                    "mapping");
+                <partial name="_EmptyState" model="empty" />
+            }
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-head"><h3>Validar Mapping CSV</h3></div>
+        <div class="card-body">
+            <div class="upload-drop">
+                @Icons.Svg("upload")
+                <div><b>Selecionar arquivo .CSV</b></div>
+                <div class="faint">Arraste um arquivo ou use o seletor abaixo</div>
+                <input type="file" accept=".csv" disabled aria-label="Selecionar arquivo CSV" />
+            </div>
+            <div class="kv mt14">
+                <div><div class="k">Formato</div><div class="v">UTF-8 sem BOM</div></div>
+                <div><div class="k">Tamanho máximo</div><div class="v">5 MiB</div></div>
+                <div><div class="k">Schema</div><div class="v">ArchiveBridge Mapping v1</div></div>
+            </div>
+            <div class="row mt14">
+                <button type="button" class="btn primary" disabled>@Icons.Svg("check-circle") Validar CSV</button>
+            </div>
+            <div class="alert neutral">
+                <span class="a-ico">@Icons.Svg("info")</span>
+                <div class="a-body">Validação via Portal será habilitada na próxima etapa.</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<h2 class="section">Histórico de versões</h2>
+@if (mapping is { History.Count: > 0 })
+{
+    <div class="tablewrap">
+        <table class="data">
+            <thead><tr><th>Versão</th><th>Status</th><th>Linhas</th><th>Hash</th><th>Gerado em</th><th>Gerado por</th></tr></thead>
+            <tbody>
+                @foreach (var entry in mapping.History)
+                {
+                    <tr>
+                        <td><b>@entry.Version</b></td>
+                        <td><partial name="_StatusBadge" model="entry.Status" /></td>
+                        <td>@entry.Rows</td>
+                        <td><partial name="_HashDisplay" model="@(new HashModel(entry.Hash, 12))" /></td>
+                        <td class="mono nowrap">@DisplayFormat.Utc(entry.GeneratedAtUtc)</td>
+                        <td>@entry.GeneratedBy</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}
+else
+{
+    var empty = new EmptyStateModel("Nenhuma versão de mapping", "As versões geradas do mapping, com hash e status, formarão o histórico imutável aqui.", "layers");
+    <partial name="_EmptyState" model="empty" />
+}
+
+@if (Presentation.Enabled)
+{
+    <h2 class="section">Resultado da validação (exemplo)</h2>
+    <div class="grid-2">
+        <div class="card">
+            <div class="card-head"><h3>CSV válido</h3><span class="badge success"><span class="dot"></span>Valid</span></div>
+            <div class="card-body">
+                <div class="kv">
+                    <div><div class="k">SHA-256</div><div class="v"><partial name="_HashDisplay" model="@(new HashModel(mapping!.Hash, 16))" /></div></div>
+                    <div><div class="k">Linhas</div><div class="v">412</div></div>
+                    <div><div class="k">Wave</div><div class="v">Wave Executivos</div></div>
+                    <div><div class="k">Validation ID</div><div class="v mono">a91f…c7</div></div>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-head"><h3>CSV inválido</h3><span class="badge danger"><span class="dot"></span>Invalid</span></div>
+            <div class="card-body flush">
+                <div class="tablewrap">
+                    <table class="data">
+                        <thead><tr><th>Linha</th><th>Coluna</th><th>Código</th><th>Descrição</th></tr></thead>
+                        <tbody>
+                            <tr><td>1</td><td>—</td><td class="mono">header.invalid</td><td>Cabeçalho não corresponde ao schema v1.</td></tr>
+                            <tr><td>14</td><td>3</td><td class="mono">formula</td><td>Célula inicia com caractere de fórmula.</td></tr>
+                            <tr><td>27</td><td>2</td><td class="mono">archive.invalid</td><td>Identidade de archive não resolvida.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    <p class="faint">Exemplo ilustrativo exibido apenas no modo demonstração. A validação real de CSV é executada pelo backend seguro em uma etapa posterior.</p>
+}

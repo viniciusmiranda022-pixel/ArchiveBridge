@@ -1,0 +1,15 @@
+@page
+@model ArchiveBridge.ControlPlane.Pages.ErrorModel
+@{
+    ViewData["Title"] = "Erro";
+    var icon = Model.Variant == "danger" ? "alert" : (Model.Variant == "info" ? "info" : "alert");
+}
+<div class="centered">
+    <div class="notice-card @Model.Variant">
+        <span class="nc-ico">@Icons.Svg(icon)</span>
+        <h1>@Model.Heading</h1>
+        <p>@Model.Message</p>
+        <p class="code">HTTP @Model.Code</p>
+        <a class="btn primary" asp-page="/Index">Voltar ao início</a>
+    </div>
+</div>

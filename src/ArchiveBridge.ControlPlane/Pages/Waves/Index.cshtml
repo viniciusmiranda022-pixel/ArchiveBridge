@@ -1,36 +1,46 @@
 @page
+@inject PresentationModeOptions Presentation
+@inject IPresentationDataProvider Demo
 @inject IControlPlaneQueries Queries
 @inject IPortalScopeAccessor ScopeAccessor
 @{
-    ViewData["Title"] = "Ondas";
-    var scope = ScopeAccessor.Resolve(User);
-    var waves = await Queries.ListWavesAsync(scope, 200, HttpContext.RequestAborted);
+    ViewData["Title"] = "Ondas de Migração";
+    var ct = HttpContext.RequestAborted;
+    IReadOnlyList<WaveSummary> waves = Presentation.Enabled
+        ? Demo.GetWaves()
+        : await Queries.ListWavesAsync(ScopeAccessor.Resolve(User), 200, ct);
+    var header = new PageHeaderModel("Ondas de Migração", "Cada onda agrupa os arquivos selecionados, sua capacidade planejada e o fluxo de aprovação e congelamento.");
 }
-<h1>Ondas de migração</h1>
-<p class="lead">Capacidade planejada e situação de aprovação/congelamento (somente leitura).</p>
+
+<partial name="_PageHeader" model="header" />
 
 @if (waves.Count == 0)
 {
-    <p class="empty">Nenhuma onda neste tenant.</p>
+    var empty = new EmptyStateModel(
+        "Nenhuma onda de migração",
+        "Uma onda planeja um lote de arquivos para migração, com volume, itens e destino. As ondas do projeto aparecerão aqui.",
+        "waves");
+    <partial name="_EmptyState" model="empty" />
 }
 else
 {
     <div class="tablewrap">
-        <table>
+        <table class="data">
             <thead>
-                <tr><th>Nome</th><th>Versão</th><th>Status</th><th>Itens planejados</th><th>Bytes planejados</th><th>Aprovada por</th><th>Criada (UTC)</th></tr>
+                <tr><th>Onda</th><th>Versão</th><th>Status</th><th>Volume</th><th>Itens</th><th>Aprovada por</th><th>Criada</th><th></th></tr>
             </thead>
             <tbody>
-                @foreach (var w in waves)
+                @foreach (var wave in waves)
                 {
                     <tr>
-                        <td>@w.Name</td>
-                        <td>v@w.WaveVersion</td>
-                        <td><span class="pill">@w.Status</span></td>
-                        <td>@w.PlannedItems.ToString("N0")</td>
-                        <td>@w.PlannedBytes.ToString("N0")</td>
-                        <td>@(w.ApprovedBy ?? "—")</td>
-                        <td class="mono">@w.CreatedAtUtc.ToString("u")</td>
+                        <td><b>@wave.Name</b></td>
+                        <td>v@(wave.WaveVersion)</td>
+                        <td><partial name="_StatusBadge" model="wave.Status" /></td>
+                        <td class="num">@DisplayFormat.HumanBytes(wave.PlannedBytes)</td>
+                        <td class="num">@wave.PlannedItems.ToString("N0")</td>
+                        <td>@(wave.ApprovedBy ?? "—")</td>
+                        <td class="mono nowrap">@DisplayFormat.Utc(wave.CreatedAtUtc)</td>
+                        <td class="nowrap"><a class="btn sm" asp-page="/Waves/Details" asp-route-waveId="@wave.WaveId">Detalhes</a></td>
                     </tr>
                 }
             </tbody>

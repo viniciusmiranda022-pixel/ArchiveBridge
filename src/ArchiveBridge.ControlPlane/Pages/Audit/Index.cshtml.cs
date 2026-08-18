@@ -15,7 +15,9 @@ namespace ArchiveBridge.ControlPlane.Pages.Audit;
 public sealed class IndexModel(
     IPortalOperationalAudit operationalAudit,
     IPortalSignInAudit signInAudit,
-    IPortalScopeAccessor scopeAccessor) : PageModel
+    IPortalScopeAccessor scopeAccessor,
+    Composition.PresentationModeOptions presentation,
+    Presentation.IPresentationDataProvider presentationData) : PageModel
 {
     private const int ActionCodeMaxLength = 64;
     private const int UsernameMaxLength = 200;
@@ -24,6 +26,8 @@ public sealed class IndexModel(
     private readonly IPortalOperationalAudit _operationalAudit = operationalAudit;
     private readonly IPortalSignInAudit _signInAudit = signInAudit;
     private readonly IPortalScopeAccessor _scopeAccessor = scopeAccessor;
+    private readonly Composition.PresentationModeOptions _presentation = presentation;
+    private readonly Presentation.IPresentationDataProvider _presentationData = presentationData;
 
     // ---- Operacional ----
     public IReadOnlyList<PortalOperationalAuditEvent> Operations { get; private set; } = [];
@@ -53,6 +57,16 @@ public sealed class IndexModel(
     /// <summary>Carrega as duas trilhas independentes. 400 fail-closed em qualquer entrada inválida.</summary>
     public async Task<IActionResult> OnGetAsync(CancellationToken cancellationToken)
     {
+        // Modo de demonstração: trilhas sintéticas em memória, sem SQL, sem cursor.
+        if (_presentation.Enabled)
+        {
+            Operations = _presentationData.GetOperationalAudit();
+            SignIns = _presentationData.GetSignIns();
+            OperationsHasMore = false;
+            SignInsHasMore = false;
+            return Page();
+        }
+
         var scope = _scopeAccessor.Resolve(User);
         var query = Request.Query;
 

@@ -349,7 +349,8 @@ public sealed class Slice4aPortalHttpTests : IDisposable
         using var content = FormContent(username, password, token);
         using var response = await client.PostAsync(new Uri("/Account/Login", UriKind.Relative), content);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.Contains("Painel operacional", await response.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        // Marcador pós-login: o painel enterprise usa "Visão Geral" como título (antes "Painel operacional").
+        Assert.Contains("Visão Geral", await response.Content.ReadAsStringAsync(), StringComparison.Ordinal);
     }
 
     private static async Task<string> GetAntiforgeryTokenAsync(HttpClient client, string path)

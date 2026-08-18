@@ -1,0 +1,5 @@
+@model HashModel
+<span class="hash">
+    <code>@DisplayFormat.ShortHash(Model.Value, Model.Length)</code>
+    <button type="button" class="copy-btn" data-copy="@Model.Value" aria-label="Copiar valor completo" title="@Model.Value">@Icons.Svg("copy")</button>
+</span>
