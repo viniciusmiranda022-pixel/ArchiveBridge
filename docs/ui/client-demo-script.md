@@ -16,8 +16,8 @@ Apontar o **banner de demonstração**: "os dados desta sessão são simulados".
 
 ## 1. Login (30s)
 
-- **Falar:** "Este é o portal operacional do ArchiveBridge — a plataforma que controla toda a migração de
-  arquivos do Enterprise Vault para o Microsoft 365."
+- **Falar:** "Este é o portal operacional do ArchiveBridge — centraliza a governança e o controle do
+  **processo** de migração de arquivos do Enterprise Vault para o Microsoft 365."
 - **Destacar:** identidade de produto (marca, subtítulo "Enterprise Archive Migration Platform"), acesso
   restrito por usuário/senha.
 - **Não prometer:** nada ainda.
@@ -30,7 +30,7 @@ Apontar o **banner de demonstração**: "os dados desta sessão são simulados".
   **em andamento**; e — muito importante — **Exportação/Staging/Importação M365/Reconciliação** aparecem como
   **"Planejado"** e **"Não disponível nesta versão"**. "A plataforma é honesta sobre o que já faz e o que vem
   a seguir."
-- **Destacar Status da Plataforma e Atividade recente** (rastreabilidade em tempo quase real).
+- **Destacar Status da Plataforma e Atividade recente** (atividade recente registrada pela plataforma).
 - **Não prometer:** que as 4 etapas finais já executam. Elas são o roadmap.
 
 ## 3. Projeto (1 min)
@@ -79,7 +79,8 @@ Apontar o **banner de demonstração**: "os dados desta sessão são simulados".
 
 ## 9. Auditoria (1 min)
 
-- **Falar:** "Cada ação e cada login ficam auditados, por tenant e por projeto."
+- **Falar:** "As ações operacionais são auditadas no contexto do projeto, e os eventos de autenticação são
+  rastreados no contexto do tenant."
 - **Destacar:** abas Operacional / Autenticação, badges de resultado (Sucesso/Negado/Falha).
 
 ## 10. Roadmap / Fechamento (1 min)
@@ -87,15 +88,16 @@ Apontar o **banner de demonstração**: "os dados desta sessão são simulados".
 - **Falar:** "O que vem a seguir — exportação controlada, staging, importação para o Microsoft 365 e
   reconciliação — está no roadmap e aparece no pipeline como **planejado**."
 - **Destacar:** o rodapé "ArchiveBridge **Preview**" e a postura honesta da plataforma.
-- **Fechar com:** "Hoje a plataforma já **descobre, planeja, mapeia e valida** com governança e custódia
-  completas; as etapas de execução são as próximas."
+- **Fechar com:** "Hoje a plataforma já cobre **descoberta, planejamento, mapping, evidências, jobs e
+  auditoria** com governança e rastreabilidade. A validação de CSV pelo Portal é a próxima etapa prevista."
 
 ---
 
 ## Perguntas prováveis — respostas seguras
 
 - *"Já migra para o M365?"* → "A importação para o Microsoft 365 é uma **etapa planejada**; nesta versão a
-  plataforma cobre descoberta, planejamento, mapping e validação com custódia."
+  plataforma cobre descoberta, planejamento, mapping, evidências e auditoria com governança. A validação de
+  CSV pelo Portal é a próxima etapa prevista."
 - *"Esses dados são de um cliente?"* → "Não — é um **dataset de demonstração** (Contoso Demo), sinalizado pelo
   banner. Nenhum dado real é usado."
 - *"É seguro?"* → "Sim: autenticação, papéis (RBAC), auditoria, isolamento por tenant/projeto e evidência
