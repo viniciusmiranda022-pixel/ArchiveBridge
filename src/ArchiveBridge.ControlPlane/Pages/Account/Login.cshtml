@@ -3,10 +3,14 @@
 @{
     ViewData["Title"] = "Entrar";
 }
-<div class="login-shell">
+<div class="login-page">
     <div class="login-card">
-        <h1>ArchiveBridge</h1>
-        <p class="lead">Portal Operacional — acesso restrito.</p>
+        <div class="brand-lg">
+            <span class="mark">@Icons.Svg("bridge")</span>
+            <div><b>ArchiveBridge</b><span>Enterprise Archive Migration Platform</span></div>
+        </div>
+        <h1>Portal Operacional</h1>
+        <p class="sub">Acesso restrito. Entre com suas credenciais para continuar.</p>
         <form method="post">
             <div class="field">
                 <label for="Username">Usuário</label>
@@ -16,11 +20,12 @@
                 <label for="Password">Senha</label>
                 <input id="Password" asp-for="Password" type="password" autocomplete="current-password" />
             </div>
-            <button type="submit" class="btn primary">Entrar</button>
+            <button type="submit" class="btn primary block">Entrar</button>
             @if (!string.IsNullOrEmpty(Model.Error))
             {
-                <p class="error">@Model.Error</p>
+                <p class="error">@Icons.Svg("x-circle") @Model.Error</p>
             }
         </form>
+        <div class="login-foot">ArchiveBridge Preview · operação on-premises</div>
     </div>
 </div>

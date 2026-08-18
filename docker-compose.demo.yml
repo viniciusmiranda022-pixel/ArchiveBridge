@@ -1,0 +1,109 @@
+# ArchiveBridge — ambiente de DEMONSTRAÇÃO LOCAL (Docker Desktop).
+#
+# Sobe SQL Server + o Control Plane em Presentation Mode, com dados 100% sintéticos. NÃO conecta a nenhum
+# sistema real (Enterprise Vault / Active Directory / Microsoft 365 / Azure / Purview / Graph / Exchange) e
+# não executa PowerShell/Export-EVArchive/PST/AzCopy. É apenas para VER E NAVEGAR na interface.
+#
+# Portas do HOST: 8180 (ArchiveBridge) e 14335 (SQL, só para troubleshooting). As portas 8080 e 8090 do host
+# NÃO são utilizadas. Segredos vêm exclusivamente do arquivo --env-file .env.demo (não versionado).
+#
+# Subir:  docker compose --env-file .env.demo -f docker-compose.demo.yml up -d --build
+
+name: archivebridge-demo
+
+services:
+  sqlserver-demo:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: archivebridge-sql-demo
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${ARCHIVEBRIDGE_DEMO_SQL_PASSWORD}"
+      MSSQL_PID: "Developer"
+    ports:
+      - "14335:1433"   # publicado só para troubleshooting local; a app usa o hostname interno sqlserver-demo
+    volumes:
+      - archivebridge-demo-sqldata:/var/opt/mssql
+    networks:
+      - archivebridge-demo-network
+    healthcheck:
+      # sqlcmd (tools18) exige -C (trust cert). $$ escapa a variável para o shell DO CONTAINER.
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -No -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  # Passo de provisionamento (equivalente ao "DBA cria o banco vazio" em on-premises): cria o banco
+  # ArchiveBridgeDemo UMA vez, depois que o SQL está saudável. O schema em si (tabelas, RLS, papéis) é
+  # criado pelas migrations da aplicação no startup — este passo apenas garante que o banco exista.
+  # Roda uma vez e sai; a aplicação só inicia após ele concluir com sucesso.
+  sqlserver-demo-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: archivebridge-sql-demo-init
+    depends_on:
+      sqlserver-demo:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: "${ARCHIVEBRIDGE_DEMO_SQL_PASSWORD}"
+    # Comando em UMA linha (evita a dobra do YAML quebrar os argumentos do sqlcmd). $$ escapa a
+    # interpolação do compose; a variável é lida do ambiente DO container de init.
+    entrypoint: ["/bin/bash", "-c", "for i in $$(seq 1 30); do /opt/mssql-tools18/bin/sqlcmd -S sqlserver-demo,1433 -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -No -b -Q \"IF DB_ID('ArchiveBridgeDemo') IS NULL CREATE DATABASE ArchiveBridgeDemo;\" && exit 0; echo \"aguardando SQL para criar o banco... ($$i)\"; sleep 2; done; echo 'falha ao criar o banco ArchiveBridgeDemo'; exit 1"]
+    networks:
+      - archivebridge-demo-network
+    restart: "no"
+
+  archivebridge-demo:
+    build:
+      context: .
+      dockerfile: src/ArchiveBridge.ControlPlane/Dockerfile
+    image: archivebridge-demo:local
+    container_name: archivebridge-demo
+    depends_on:
+      sqlserver-demo:
+        condition: service_healthy
+      # A aplicação só inicia depois que o banco vazio existe (init concluiu com sucesso).
+      sqlserver-demo-init:
+        condition: service_completed_successfully
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Development"
+      ASPNETCORE_URLS: "http://+:8080"
+
+      # Presentation Mode — dados sintéticos, zero operação real.
+      PresentationMode__Enabled: "true"
+
+      # Banco criado/atualizado automaticamente pelo runner de migrations no startup.
+      ControlPlane__RunMigrationsAtStartup: "true"
+      ControlPlane__EvidenceRoot: "/tmp/archivebridge/evidence"
+
+      # Administrador de bootstrap da demo (senha SÓ via .env.demo).
+      ControlPlane__BootstrapAdmin__Username: "admin.demo"
+      ControlPlane__BootstrapAdmin__DisplayName: "Vinicius Miranda"
+      ControlPlane__BootstrapAdmin__Password: "${ARCHIVEBRIDGE_DEMO_ADMIN_PASSWORD}"
+      # GUIDs sintéticos exclusivos da demo (Tenant Demo / Project Demo).
+      ControlPlane__BootstrapAdmin__TenantId: "c0000000-0000-4000-8000-0000000000c1"
+      ControlPlane__BootstrapAdmin__ProjectId: "a1b2c3d4-0000-4000-8000-000000000101"
+
+      # Conexões apontam para o hostname INTERNO da rede Docker (nunca localhost:14335 entre containers).
+      ConnectionStrings__Application: "Server=sqlserver-demo,1433;Database=ArchiveBridgeDemo;User ID=sa;Password=${ARCHIVEBRIDGE_DEMO_SQL_PASSWORD};TrustServerCertificate=True;Encrypt=False;Application Name=ArchiveBridge.Demo.App"
+      ConnectionStrings__Maintenance: "Server=sqlserver-demo,1433;Database=ArchiveBridgeDemo;User ID=sa;Password=${ARCHIVEBRIDGE_DEMO_SQL_PASSWORD};TrustServerCertificate=True;Encrypt=False;Application Name=ArchiveBridge.Demo.Maint"
+      ConnectionStrings__Migrations: "Server=sqlserver-demo,1433;Database=ArchiveBridgeDemo;User ID=sa;Password=${ARCHIVEBRIDGE_DEMO_SQL_PASSWORD};TrustServerCertificate=True;Encrypt=False;Application Name=ArchiveBridge.Demo.Migrations"
+    ports:
+      - "8180:8080"    # HOST 8180 → CONTAINER 8080 (Kestrel). Nunca 8080/8090 no host.
+    networks:
+      - archivebridge-demo-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
+
+networks:
+  archivebridge-demo-network:
+    name: archivebridge-demo-network
+
+volumes:
+  archivebridge-demo-sqldata:
+    name: archivebridge-demo-sqldata

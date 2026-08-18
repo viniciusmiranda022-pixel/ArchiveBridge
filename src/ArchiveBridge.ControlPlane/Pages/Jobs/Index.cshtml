@@ -1,37 +1,81 @@
 @page
+@inject PresentationModeOptions Presentation
+@inject IPresentationDataProvider Demo
 @inject IControlPlaneQueries Queries
 @inject IPortalScopeAccessor ScopeAccessor
 @{
     ViewData["Title"] = "Jobs";
-    var scope = ScopeAccessor.Resolve(User);
-    var jobs = await Queries.ListJobsAsync(scope, 200, HttpContext.RequestAborted);
-}
-<h1>Jobs duráveis</h1>
-<p class="lead">Estado, tentativas, dono e último erro da fila durável (somente leitura).</p>
+    var ct = HttpContext.RequestAborted;
+    IReadOnlyList<JobSummary> jobs = Presentation.Enabled
+        ? Demo.GetJobs()
+        : await Queries.ListJobsAsync(ScopeAccessor.Resolve(User), 200, ct);
 
+    int Count(string state) => jobs.Count(j => string.Equals(j.State, state, StringComparison.OrdinalIgnoreCase));
+    var cards = new (string Label, string State, string Variant)[]
+    {
+        ("Pending", "Pending", "warning"),
+        ("Processing", "Processing", "info"),
+        ("Retry Scheduled", "RetryScheduled", "warning"),
+        ("Completed", "Completed", "success"),
+        ("Failed", "Failed", "danger"),
+    };
+
+    string StateLabel(string state) => state switch
+    {
+        "Processing" => "Em execução",
+        "RetryScheduled" => "Nova tentativa agendada",
+        "Failed" => "Falhou",
+        "Completed" => "Concluído",
+        "Pending" => "Pendente",
+        _ => state,
+    };
+    var header = new PageHeaderModel("Jobs", "Jobs duráveis — fila de trabalho da plataforma. Cada job carrega estado, tentativas e a trilha imutável de transições.");
+}
+
+<partial name="_PageHeader" model="header" />
+
+<div class="metrics">
+    @foreach (var card in cards)
+    {
+        <div class="metric">
+            <div class="top">
+                <span class="label">@card.Label</span>
+                <span class="badge @card.Variant"><span class="dot"></span>@Count(card.State)</span>
+            </div>
+            <div class="value">@Count(card.State)</div>
+        </div>
+    }
+</div>
+
+<h2 class="section">Fila de jobs</h2>
 @if (jobs.Count == 0)
 {
-    <p class="empty">Nenhum job neste tenant.</p>
+    var empty = new EmptyStateModel(
+        "Nenhum Job em execução",
+        "Os jobs duráveis processados pela plataforma (por exemplo, descoberta de capacidades) aparecerão aqui com seu estado e histórico.",
+        "jobs");
+    <partial name="_EmptyState" model="empty" />
 }
 else
 {
     <div class="tablewrap">
-        <table>
+        <table class="data">
             <thead>
-                <tr><th>Job</th><th>Workload</th><th>Estado</th><th>Tentativas</th><th>Prioridade</th><th>Dono</th><th>Último erro</th><th>Atualizado (UTC)</th></tr>
+                <tr><th>Job ID</th><th>Workload</th><th>Estado</th><th>Tentativa</th><th>Criado / Atualizado</th><th></th></tr>
             </thead>
             <tbody>
-                @foreach (var j in jobs)
+                @foreach (var job in jobs)
                 {
                     <tr>
-                        <td><a asp-page="/Jobs/Details" asp-route-jobId="@j.JobId">@j.JobId.ToString()[..8]</a></td>
-                        <td>@j.Workload</td>
-                        <td><span class="pill">@j.State</span></td>
-                        <td>@j.AttemptCount</td>
-                        <td>@j.Priority</td>
-                        <td class="mono">@(j.OwnerWorker ?? "—")</td>
-                        <td>@(j.LastErrorCode ?? "—")</td>
-                        <td class="mono">@j.UpdatedAtUtc.ToString("u")</td>
+                        <td><a asp-page="/Jobs/Details" asp-route-jobId="@job.JobId" class="mono">@job.JobId.ToString()[..8]</a></td>
+                        <td>@job.Workload</td>
+                        <td>
+                            <partial name="_StatusBadge" model="job.State" />
+                            <div class="subtle">@StateLabel(job.State)</div>
+                        </td>
+                        <td>@job.AttemptCount</td>
+                        <td class="mono nowrap">@DisplayFormat.Utc(job.UpdatedAtUtc)</td>
+                        <td class="nowrap"><a class="btn sm" asp-page="/Jobs/Details" asp-route-jobId="@job.JobId">Detalhes</a></td>
                     </tr>
                 }
             </tbody>

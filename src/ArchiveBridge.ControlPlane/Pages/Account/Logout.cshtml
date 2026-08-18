@@ -3,6 +3,11 @@
 @{
     ViewData["Title"] = "Sair";
 }
-<h1>Sessão encerrada</h1>
-<p class="lead">Você saiu do portal.</p>
-<a class="btn" asp-page="/Account/Login">Entrar novamente</a>
+<div class="centered">
+    <div class="notice-card info">
+        <span class="nc-ico">@Icons.Svg("check-circle")</span>
+        <h1>Sessão encerrada</h1>
+        <p>Você saiu do portal com segurança.</p>
+        <a class="btn primary" asp-page="/Account/Login">Entrar novamente</a>
+    </div>
+</div>

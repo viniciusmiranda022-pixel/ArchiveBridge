@@ -113,3 +113,26 @@ não existem nesta fatia e serão modeladas ao serem implementadas.
 Nenhuma senha, hash, cookie ou segredo é registrado. A auditoria de autenticação grava apenas login,
 resultado, motivo curto não sensível, endereço remoto, o escopo quando conhecido
 (tenant/projeto/usuário) e um `correlation_id` por tentativa.
+
+## Delta — Frente UX/UI (Client Demo)
+
+Frente **estritamente visual** (reveste o Portal em linguagem de produto enterprise). **Nenhuma proteção
+existente foi removida ou relaxada**: `[Authorize]`/fallback policy, RBAC, antiforgery, escopo tenant/projeto,
+RLS, idempotência, auditoria, validação de evidência, fail-closed, HTTPS/HSTS/cookie Secure em produção e a
+**CSP restrita** permanecem intactos. Toda a estilização vive em `wwwroot/css/site.css`; o JS mínimo em
+`wwwroot/js/site.js`; ícones são SVG inline — **sem** `style=`/`<style>`/`on*` inline e **sem CDN**, coerente
+com `style-src 'self'; script-src 'self'`.
+
+**Modo de Demonstração (Presentation Mode)** — faceta de UI, `Enabled` default `false`:
+
+- **Fail-closed no startup**: habilitado fora de `Development`/`Staging` **aborta o processo**; Produção nunca
+  serve dados simulados.
+- **Zero escrita de negócio**: provedor em memória, somente leitura, vivendo apenas no `ControlPlane`
+  (verificado por teste de arquitetura). A única ação de escrita do portal (solicitar descoberta EV) é
+  **recusada** (`403`) antes de tocar qualquer store quando o modo está ativo. Não cria SQL, Job, evidência,
+  tentativa de validação; não chama Worker/PowerShell.
+- **Dataset 100% sintético** (Contoso Demo), nunca misturado com dados reais; banner âmbar em todas as telas.
+
+**Encoder HTML**: `WebEncoderOptions` passa a usar `UnicodeRanges.All` — apenas para renderizar letras
+acentuadas como UTF-8 literal em vez de entidades numéricas. Os caracteres significativos para HTML
+(`< > & " '`) **continuam sempre codificados**; a proteção contra XSS não muda.

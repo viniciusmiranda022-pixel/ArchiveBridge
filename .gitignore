@@ -11,6 +11,8 @@
 *.key
 .env
 .env.*
+# ...mas o MODELO da demo (sem segredos) é versionado; o .env.demo real continua ignorado.
+!.env.demo.example
 
 # Dados e artefatos operacionais
 /landing/

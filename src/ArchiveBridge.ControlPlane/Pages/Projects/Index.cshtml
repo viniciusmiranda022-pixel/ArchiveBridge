@@ -1,35 +1,47 @@
 @page
+@inject PresentationModeOptions Presentation
+@inject IPresentationDataProvider Demo
 @inject IControlPlaneQueries Queries
 @inject IPortalScopeAccessor ScopeAccessor
 @{
     ViewData["Title"] = "Projetos";
-    var scope = ScopeAccessor.Resolve(User);
-    var projects = await Queries.ListProjectsAsync(scope, HttpContext.RequestAborted);
+    var ct = HttpContext.RequestAborted;
+    IReadOnlyList<ProjectSummary> projects = Presentation.Enabled
+        ? Demo.GetProjects()
+        : await Queries.ListProjectsAsync(ScopeAccessor.Resolve(User), ct);
+    var header = new PageHeaderModel("Projetos", "Cada projeto reúne a configuração de destino, as ondas de migração e a cadeia de custódia correspondente.");
 }
-<h1>Projetos de migração</h1>
-<p class="lead">Metadados de governança do tenant — sem segredo, sem conteúdo.</p>
+
+<partial name="_PageHeader" model="header" />
 
 @if (projects.Count == 0)
 {
-    <p class="empty">Nenhum projeto neste tenant.</p>
+    var empty = new EmptyStateModel(
+        "Nenhum projeto encontrado",
+        "Um projeto define o tenant de destino, a política de arquivamento e o versionamento de configuração. Quando houver projetos neste escopo, eles aparecerão aqui.",
+        "projects");
+    <partial name="_EmptyState" model="empty" />
 }
 else
 {
     <div class="tablewrap">
-        <table>
+        <table class="data">
             <thead>
-                <tr><th>Nome</th><th>Responsável</th><th>Tenant de destino</th><th>Config.</th><th>Status</th><th>Atualizado (UTC)</th></tr>
+                <tr><th>Nome</th><th>Status</th><th>Tenant de destino</th><th>Política de archive</th><th>Config.</th><th>Última atualização</th><th></th></tr>
             </thead>
             <tbody>
-                @foreach (var p in projects)
+                @foreach (var project in projects)
                 {
                     <tr>
-                        <td>@p.Name</td>
-                        <td>@p.Owner</td>
-                        <td class="mono">@p.TargetTenant</td>
-                        <td>v@p.ConfigurationVersion</td>
-                        <td><span class="pill">@p.Status</span></td>
-                        <td class="mono">@p.UpdatedAtUtc.ToString("u")</td>
+                        <td><b>@project.Name</b><div class="subtle">@project.Owner</div></td>
+                        <td><partial name="_StatusBadge" model="project.Status" /></td>
+                        <td class="mono">@project.TargetTenant</td>
+                        <td class="muted">Retenção padrão</td>
+                        <td>v@(project.ConfigurationVersion)</td>
+                        <td class="mono nowrap">@DisplayFormat.Utc(project.UpdatedAtUtc)</td>
+                        <td class="nowrap">
+                            <a class="btn sm" asp-page="/Projects/Details" asp-route-projectId="@project.ProjectId">Ver Projeto</a>
+                        </td>
                     </tr>
                 }
             </tbody>

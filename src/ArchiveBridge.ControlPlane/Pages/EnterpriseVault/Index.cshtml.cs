@@ -28,6 +28,8 @@ public sealed class IndexModel(
     RequestEvCapabilityDiscoveryUseCase requestDiscovery,
     IPortalOperationalAudit operationalAudit,
     EnterpriseVaultDiscoveryPortalOptions discoveryGate,
+    Composition.PresentationModeOptions presentation,
+    Presentation.IPresentationDataProvider presentationData,
     IClock clock) : PageModel
 {
     /// <summary>Código de ação da trilha operacional para a solicitação de descoberta.</summary>
@@ -41,6 +43,8 @@ public sealed class IndexModel(
     private readonly RequestEvCapabilityDiscoveryUseCase _requestDiscovery = requestDiscovery;
     private readonly IPortalOperationalAudit _operationalAudit = operationalAudit;
     private readonly EnterpriseVaultDiscoveryPortalOptions _discoveryGate = discoveryGate;
+    private readonly Composition.PresentationModeOptions _presentation = presentation;
+    private readonly Presentation.IPresentationDataProvider _presentationData = presentationData;
     private readonly IClock _clock = clock;
 
     /// <summary>Ambientes EV do escopo, cada um com uma chave de idempotência estável para SEU formulário.</summary>
@@ -52,9 +56,23 @@ public sealed class IndexModel(
     /// <summary>Verdadeiro só quando o gate está habilitado E o usuário é Operator/Administrator.</summary>
     public bool CanRequestDiscovery { get; private set; }
 
+    /// <summary>Modo de demonstração ativo: a página exibe dados sintéticos e nenhuma escrita é possível.</summary>
+    public bool PresentationMode { get; private set; }
+
     /// <summary>Renderiza a leitura + (quando permitido) os formulários de solicitação.</summary>
     public async Task<IActionResult> OnGetAsync(CancellationToken cancellationToken)
     {
+        // Modo de demonstração: dados sintéticos em memória, ZERO acesso a SQL e nenhuma ação de escrita.
+        if (_presentation.Enabled)
+        {
+            PresentationMode = true;
+            DiscoveryEnabled = true;
+            CanRequestDiscovery = false;
+            Environments = _presentationData.GetEnvironments()
+                .Select(e => new EvEnvironmentRow(e, Guid.Empty)).ToList();
+            return Page();
+        }
+
         var scope = _scopeAccessor.Resolve(User);
         var environments = await _queries.ListEvEnvironmentsAsync(scope, cancellationToken).ConfigureAwait(false);
 
@@ -78,6 +96,13 @@ public sealed class IndexModel(
     public async Task<IActionResult> OnPostRequestDiscoveryAsync(
         Guid environmentId, Guid idempotencyKey, CancellationToken cancellationToken)
     {
+        // STOP-THE-LINE: no modo de demonstração NENHUMA operação de negócio é executada — nem SQL, nem Job,
+        // nem auditoria. Recusa antes de tocar qualquer store; a demonstração é estritamente somente leitura.
+        if (_presentation.Enabled)
+        {
+            return StatusCode(StatusCodes.Status403Forbidden);
+        }
+
         var correlation = CorrelationId.New();
         var username = User.Identity?.Name ?? string.Empty;
 

@@ -1,0 +1,20 @@
+@model IReadOnlyList<PipelineStage>
+@functions {
+    static string LineClass(PipelineState state) => state switch
+    {
+        PipelineState.Done => "done",
+        PipelineState.Active => "active",
+        PipelineState.Blocked => "active",
+        _ => "pending",
+    };
+}
+<ul class="timeline">
+    @foreach (var stage in Model)
+    {
+        <li class="@LineClass(stage.State)">
+            <span class="tdot"></span>
+            <div class="tname">@stage.Name</div>
+            <div class="tmeta">@stage.StateLabel</div>
+        </li>
+    }
+</ul>

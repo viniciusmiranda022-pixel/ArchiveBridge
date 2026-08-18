@@ -1,0 +1,22 @@
+@model IReadOnlyList<PipelineStage>
+@functions {
+    static string StepClass(PipelineState state) => state switch
+    {
+        PipelineState.Done => "done",
+        PipelineState.Active => "active",
+        PipelineState.Blocked => "blocked",
+        PipelineState.Planned => "planned",
+        PipelineState.Unavailable => "na",
+        _ => "pending",
+    };
+}
+<div class="pipeline">
+    @foreach (var stage in Model)
+    {
+        <div class="pstep @StepClass(stage.State)">
+            <div class="pnum">ETAPA @stage.Number</div>
+            <div class="pname">@stage.Name</div>
+            <div class="pstate"><span class="dot"></span>@stage.StateLabel</div>
+        </div>
+    }
+</div>

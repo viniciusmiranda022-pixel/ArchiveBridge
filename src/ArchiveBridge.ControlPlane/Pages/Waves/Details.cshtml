@@ -1,0 +1,97 @@
+@page
+@inject PresentationModeOptions Presentation
+@inject IPresentationDataProvider Demo
+@inject IControlPlaneQueries Queries
+@inject IPortalScopeAccessor ScopeAccessor
+@{
+    ViewData["Title"] = "Onda";
+    var ct = HttpContext.RequestAborted;
+    Guid.TryParse(Request.Query["waveId"].ToString(), out var waveId);
+
+    string? name = null;
+    string status = string.Empty;
+    var version = 0;
+    long plannedBytes = 0;
+    long plannedItems = 0;
+    string? approvedBy = null;
+    DateTimeOffset createdAt = default;
+    string pstLabel = "—";
+    string targetRoot = "—";
+    string mappingStatus = "—";
+    IReadOnlyList<PipelineStage> lifecycle = [];
+
+    if (Presentation.Enabled)
+    {
+        var detail = waveId == Guid.Empty ? null : Demo.GetWave(waveId);
+        if (detail is not null)
+        {
+            name = detail.Name; status = detail.Status; version = detail.Version;
+            plannedBytes = detail.PlannedBytes; plannedItems = detail.PlannedItems;
+            approvedBy = detail.ApprovedBy; createdAt = detail.CreatedAtUtc;
+            pstLabel = detail.PstCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            targetRoot = detail.TargetRootFolder; mappingStatus = detail.MappingStatus;
+            lifecycle = detail.Lifecycle;
+        }
+    }
+    else
+    {
+        var wave = (await Queries.ListWavesAsync(ScopeAccessor.Resolve(User), 200, ct)).FirstOrDefault(w => w.WaveId == waveId);
+        if (wave is not null)
+        {
+            name = wave.Name; status = wave.Status; version = wave.WaveVersion;
+            plannedBytes = wave.PlannedBytes; plannedItems = wave.PlannedItems;
+            approvedBy = wave.ApprovedBy; createdAt = wave.CreatedAtUtc;
+            lifecycle = WaveLifecycle.Build(wave.Status);
+        }
+    }
+}
+
+<p><a class="btn sm ghost" asp-page="/Waves/Index">@Icons.Svg("arrow-left") Ondas</a></p>
+
+@if (name is null)
+{
+    var empty = new EmptyStateModel(
+        "Onda não encontrada",
+        "A onda solicitada não existe neste escopo ou você não tem permissão para visualizá-la.",
+        "waves");
+    <partial name="_EmptyState" model="empty" />
+}
+else
+{
+    <div class="page-head">
+        <div class="titles">
+            <h1>@name</h1>
+            <p class="sub">Onda de migração · versão v@version · destino <span class="mono">@targetRoot</span></p>
+        </div>
+        <div class="head-actions"><partial name="_StatusBadge" model="status" /></div>
+    </div>
+
+    <div class="metrics">
+        <div class="metric"><div class="top"><span class="label">Volume total</span><span class="chip-ico">@Icons.Svg("database")</span></div><div class="value">@DisplayFormat.HumanBytes(plannedBytes)</div></div>
+        <div class="metric"><div class="top"><span class="label">Total de itens</span><span class="chip-ico">@Icons.Svg("layers")</span></div><div class="value">@plannedItems.ToString("N0")</div></div>
+        <div class="metric"><div class="top"><span class="label">PSTs selecionados</span><span class="chip-ico">@Icons.Svg("file")</span></div><div class="value @(pstLabel == "—" ? "muted" : null)">@pstLabel</div></div>
+        <div class="metric"><div class="top"><span class="label">Mapping</span><span class="chip-ico">@Icons.Svg("mapping")</span></div><div class="value word @(mappingStatus == "—" ? "muted" : null)">@mappingStatus</div></div>
+    </div>
+
+    <div class="grid-2">
+        <div class="card">
+            <div class="card-head"><h3>Ciclo de vida</h3></div>
+            <div class="card-body">
+                <partial name="_Timeline" model="lifecycle" />
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-head"><h3>Detalhes</h3></div>
+            <div class="card-body">
+                <div class="kv">
+                    <div><div class="k">Status</div><div class="v"><partial name="_StatusBadge" model="status" /></div></div>
+                    <div><div class="k">Versão</div><div class="v">v@version</div></div>
+                    <div><div class="k">Aprovada por</div><div class="v">@(approvedBy ?? "—")</div></div>
+                    <div><div class="k">Criada (UTC)</div><div class="v mono">@DisplayFormat.Utc(createdAt)</div></div>
+                    <div><div class="k">Pasta de destino</div><div class="v mono">@targetRoot</div></div>
+                    <div><div class="k">Status do mapping</div><div class="v">@mappingStatus</div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+}
