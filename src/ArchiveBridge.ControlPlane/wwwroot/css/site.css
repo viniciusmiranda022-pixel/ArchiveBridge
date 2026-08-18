@@ -246,7 +246,9 @@ h2.section:first-of-type { margin-top: 8px; }
 /* ============================ SECTION CARD ============================ */
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
-@media (max-width: 1100px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+/* Painel: status da plataforma (coluna fixa mais estreita) + atividade recente (flexível, mais larga). */
+.grid-status-activity { display: grid; grid-template-columns: minmax(320px, 360px) 1fr; gap: 18px; align-items: start; }
+@media (max-width: 1100px) { .grid-2, .grid-3, .grid-status-activity { grid-template-columns: 1fr; } }
 
 .card {
     background: var(--ab-surface); border: 1px solid var(--ab-border);
@@ -346,9 +348,12 @@ table.data td .subtle { color: var(--ab-text-faint); font-size: 12px; }
 .empty-state p { margin: 0; font-size: 13px; max-width: 46ch; }
 
 /* ============================ PIPELINE ============================ */
-.pipeline { display: flex; flex-wrap: wrap; gap: 10px; }
+/* Grade regular (4×2 em telas largas → 2 colunas em médias → 1 em estreitas): evita a quebra irregular
+   de uma última etapa isolada ocupando a linha inteira. */
+.pipeline { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+@media (max-width: 1200px) { .pipeline { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 620px) { .pipeline { grid-template-columns: 1fr; } }
 .pstep {
-    flex: 1 1 150px; min-width: 150px;
     border: 1px solid var(--ab-border); border-radius: var(--ab-radius-sm);
     padding: 12px 14px; background: var(--ab-surface); position: relative;
 }

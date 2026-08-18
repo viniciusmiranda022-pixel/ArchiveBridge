@@ -105,14 +105,21 @@ dotnet run --project src/ArchiveBridge.ControlPlane
 
 ## Telas (1440×900, Modo de Demonstração)
 
-| # | Tela | Arquivo |
-|---|---|---|
-| 1 | Login | [`screenshots/1-login.png`](screenshots/1-login.png) |
-| 2 | Dashboard (Visão Geral) | [`screenshots/2-dashboard.png`](screenshots/2-dashboard.png) |
-| 3 | Projeto | [`screenshots/3-projeto.png`](screenshots/3-projeto.png) |
-| 4 | Onda | [`screenshots/4-wave.png`](screenshots/4-wave.png) |
-| 5 | Enterprise Vault | [`screenshots/5-enterprise-vault.png`](screenshots/5-enterprise-vault.png) |
-| 6 | Evidências | [`screenshots/6-evidencias.png`](screenshots/6-evidencias.png) |
-| 7 | Mapping | [`screenshots/7-mapping.png`](screenshots/7-mapping.png) |
-| 8 | Auditoria | [`screenshots/8-auditoria.png`](screenshots/8-auditoria.png) |
-| 9 | Jobs | [`screenshots/9-jobs.png`](screenshots/9-jobs.png) |
+| # | Tela | O que é | Propósito na demonstração | Arquivo |
+|---|---|---|---|---|
+| 01 | **Login** | Autenticação do portal (`admin`). | Abre a apresentação com cara de produto (marca ArchiveBridge, subtítulo enterprise). | [`screenshots/01-login.png`](screenshots/01-login.png) |
+| 02 | **Dashboard (Visão Geral)** | Indicadores, pipeline de 8 etapas, status da plataforma, atividade recente. | Primeira tela após login: o cliente entende o processo inteiro em ~5s. | [`screenshots/02-dashboard.png`](screenshots/02-dashboard.png) |
+| 03 | **Projeto** | Visão geral do projeto com abas (Ondas, Enterprise Vault, Jobs, Governança). | Mostra que um projeto reúne configuração de destino + ondas + custódia. | [`screenshots/03-project.png`](screenshots/03-project.png) |
+| 04 | **Onda** | Detalhe da onda: volume, itens, PSTs, destino, ciclo de vida. | Explica o lote de migração e seu fluxo de aprovação/congelamento. | [`screenshots/04-wave.png`](screenshots/04-wave.png) |
+| 05 | **Enterprise Vault** | Cards por ambiente (Ready/Blocked), capacidade, evidência. | Tela central: descoberta **somente leitura**, nada é exportado. | [`screenshots/05-enterprise-vault.png`](screenshots/05-enterprise-vault.png) |
+| 06 | **Evidências** | Cadeia de custódia imutável (origem, versão, resultado, SHA-256, download). | Reforça rastreabilidade e governança (download verificado). | [`screenshots/06-evidence.png`](screenshots/06-evidence.png) |
+| 07 | **Mapping** | Mapping atual, histórico de versões e a área futura de validação de CSV (desabilitada). | Mostra o mapeamento PST→M365; a validação via Portal é etapa futura. | [`screenshots/07-mapping.png`](screenshots/07-mapping.png) |
+| 08 | **Auditoria** | Abas Operacional / Autenticação com badges de resultado. | Prova que toda ação e login ficam auditados. | [`screenshots/08-audit.png`](screenshots/08-audit.png) |
+| 09 | **Jobs** | Fila durável com cards por estado (Pending/Processing/Retry/Completed/Failed). | Mostra a operação assíncrona e resiliente da plataforma. | [`screenshots/09-jobs.png`](screenshots/09-jobs.png) |
+| 10 | **Job Details** | Resumo + linha do tempo das transições (detalhes técnicos recolhidos). | Aprofunda um job quando o cliente quiser ver o "como". | [`screenshots/10-job-details.png`](screenshots/10-job-details.png) |
+
+### Ordem recomendada de apresentação
+
+`Login → Dashboard → Projeto → Onda → Enterprise Vault → Mapping → Evidências → Jobs → Auditoria → (roadmap das próximas etapas)`.
+O roteiro detalhado — o que falar, o que destacar e o que **não** prometer — está em
+[`client-demo-script.md`](client-demo-script.md).

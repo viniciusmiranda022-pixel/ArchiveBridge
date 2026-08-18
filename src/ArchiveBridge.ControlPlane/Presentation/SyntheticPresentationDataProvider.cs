@@ -51,13 +51,19 @@ public sealed class SyntheticPresentationDataProvider(IClock clock) : IPresentat
     public DashboardViewModel GetDashboard()
     {
         var now = _clock.UtcNow;
+
+        // Contagens DERIVADAS das coleções sintéticas para que os números se falem entre as telas
+        // (o painel nunca contradiz as listas de Projetos/Ondas/Ambientes/Jobs/Evidências).
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        var jobsRunning = GetJobs().Count(job => string.Equals(job.State, "Processing", StringComparison.Ordinal));
         var metrics = new List<DashboardMetric>
         {
-            new("projects", "Projetos", "3", true),
-            new("waves", "Ondas", "7", true),
-            new("environments", "Ambientes EV", "2", true),
-            new("jobs", "Jobs em execução", "1", true),
-            new("evidence", "Evidências", "34", true),
+            new("projects", "Projetos", GetProjects().Count.ToString(inv), true),
+            new("waves", "Ondas", GetWaves().Count.ToString(inv), true),
+            new("environments", "Ambientes EV", GetEnvironments().Count.ToString(inv), true),
+            new("jobs", "Jobs em execução", jobsRunning.ToString(inv), true),
+            new("evidence", "Evidências", GetEvidence().Count.ToString(inv), true),
+            // Validações de CSV acumuladas — métrica isolada (sem lista correspondente que possa contradizê-la).
             new("validations", "Validações", "12", true),
         };
 

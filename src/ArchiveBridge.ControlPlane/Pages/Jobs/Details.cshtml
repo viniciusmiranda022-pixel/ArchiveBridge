@@ -53,13 +53,20 @@ else
             <div class="card-head"><h3>Resumo</h3></div>
             <div class="card-body">
                 <div class="kv">
-                    <div><div class="k">Job ID</div><div class="v mono">@jobId</div></div>
                     <div><div class="k">Workload</div><div class="v">@(job?.Workload ?? "—")</div></div>
                     <div><div class="k">Estado</div><div class="v">@if (job is not null) { <partial name="_StatusBadge" model="job.State" /> } else { <span>—</span> }</div></div>
                     <div><div class="k">Tentativa</div><div class="v">@(job?.AttemptCount.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "—")</div></div>
-                    <div><div class="k">Época do lease</div><div class="v mono">@latestLease</div></div>
-                    <div><div class="k">Último erro</div><div class="v">@(job?.LastErrorCode ?? "—")</div></div>
+                    <div><div class="k">Último resultado</div><div class="v">@(job?.LastErrorCode ?? "—")</div></div>
                 </div>
+                <details class="tech">
+                    <summary>Detalhes técnicos</summary>
+                    <div class="tech-body">
+                        <div class="kv">
+                            <div><div class="k">Job ID</div><div class="v mono">@jobId</div></div>
+                            <div><div class="k">Época do lease</div><div class="v mono">@latestLease</div></div>
+                        </div>
+                    </div>
+                </details>
             </div>
         </div>
 
