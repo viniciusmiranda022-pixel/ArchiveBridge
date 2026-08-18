@@ -15,6 +15,9 @@ public enum MappingUploadRejectionReason
     /// <summary>Comprimento declarado (preflight) acima do limite efetivo.</summary>
     DeclaredLengthTooLarge,
 
+    /// <summary>Comprimento declarado (preflight) negativo — entrada inválida, rejeitada imediatamente.</summary>
+    InvalidDeclaredLength,
+
     /// <summary>O conteúdo real do stream excede o limite efetivo.</summary>
     ContentTooLarge,
 }

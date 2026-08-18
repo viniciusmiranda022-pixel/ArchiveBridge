@@ -107,4 +107,77 @@ public sealed class Slice6MappingValidationUnitTests
         Assert.True(validation.IssuesTruncated);
         Assert.Equal(1000, validation.Issues.Count);     // persistidos limitados ao teto
     }
+
+    // ===================== §9 cobertura semântica direta do CSV =====================
+    //
+    // Cada cenário parte da fonte AUTORIZADA e diverge em UM aspecto. O validador reporta um problema
+    // estruturado e marca Invalid — NUNCA reescreve o CSV nem "corrige" a entrada.
+
+    // Linha canônica exatamente conforme a fonte (para E(pst, mailbox): FilePath /src/{pst}, folder da onda,
+    // code page 1252). As variações mutam UM único campo.
+    private static string ValidRow(string pst, string mailbox, string folder, string codePage = "1252") =>
+        $"Exchange,/src/{pst},{pst},{mailbox},TRUE,{folder},{codePage},,,";
+
+    private static string Csv(params string[] rows) =>
+        MappingSchema.HeaderLine + "\r\n" + string.Join("\r\n", rows) + "\r\n";
+
+    [Fact]
+    public void DuplicatePstIsInvalidWithPstDuplicate()
+    {
+        var wave = ApprovedWave(E("a.pst", "u@contoso.com"));
+        var folder = wave.TargetRootFolder.Value;
+        var csv = Csv(ValidRow("a.pst", "u@contoso.com", folder), ValidRow("a.pst", "u@contoso.com", folder));
+
+        var validation = MappingCsvValidator.ValidateUpload(csv, wave, CodePage, MappingPolicy.Default, 1000);
+        Assert.False(validation.IsValid);
+        Assert.Contains(validation.Issues, i => i.Code == MappingValidationIssueCode.PstDuplicate);
+    }
+
+    [Fact]
+    public void DivergentMailboxIsInvalidWithRowDivergent()
+    {
+        var wave = ApprovedWave(E("a.pst", "u@contoso.com"));
+        var folder = wave.TargetRootFolder.Value;
+        var csv = Csv(ValidRow("a.pst", "outra@contoso.com", folder)); // mailbox diverge da fonte
+
+        var validation = MappingCsvValidator.ValidateUpload(csv, wave, CodePage, MappingPolicy.Default, 1000);
+        Assert.False(validation.IsValid);
+        Assert.Contains(validation.Issues, i => i.Code == MappingValidationIssueCode.RowDivergent);
+    }
+
+    [Fact]
+    public void DivergentTargetRootFolderIsInvalidWithRowDivergent()
+    {
+        var wave = ApprovedWave(E("a.pst", "u@contoso.com"));
+        var csv = Csv(ValidRow("a.pst", "u@contoso.com", "/ImportedPst_Outro_Folder")); // folder diverge
+
+        var validation = MappingCsvValidator.ValidateUpload(csv, wave, CodePage, MappingPolicy.Default, 1000);
+        Assert.False(validation.IsValid);
+        Assert.Contains(validation.Issues, i => i.Code == MappingValidationIssueCode.RowDivergent);
+    }
+
+    [Fact]
+    public void DivergentContentCodePageIsInvalidWithRowDivergent()
+    {
+        var wave = ApprovedWave(E("a.pst", "u@contoso.com"));
+        var folder = wave.TargetRootFolder.Value;
+        // A fonte é validada com code page 1252, mas a célula do CSV traz 65001 ⇒ divergência de linha.
+        var csv = Csv(ValidRow("a.pst", "u@contoso.com", folder, codePage: "65001"));
+
+        var validation = MappingCsvValidator.ValidateUpload(csv, wave, CodePage, MappingPolicy.Default, 1000);
+        Assert.False(validation.IsValid);
+        Assert.Contains(validation.Issues, i => i.Code == MappingValidationIssueCode.RowDivergent);
+    }
+
+    [Fact]
+    public void MissingAuthorizedRowIsInvalidWithAuthorizedMissing()
+    {
+        var wave = ApprovedWave(E("a.pst", "u@contoso.com"), E("b.pst", "v@contoso.com"));
+        var folder = wave.TargetRootFolder.Value;
+        var csv = Csv(ValidRow("a.pst", "u@contoso.com", folder)); // b.pst autorizada, mas ausente
+
+        var validation = MappingCsvValidator.ValidateUpload(csv, wave, CodePage, MappingPolicy.Default, 1000);
+        Assert.False(validation.IsValid);
+        Assert.Contains(validation.Issues, i => i.Code == MappingValidationIssueCode.AuthorizedMissing);
+    }
 }

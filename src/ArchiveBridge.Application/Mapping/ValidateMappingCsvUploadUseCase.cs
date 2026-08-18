@@ -56,6 +56,7 @@ public sealed class ValidateMappingCsvUploadUseCase(
     IWaveStore waves, IMappingValidationStore store, IClock clock, MappingUploadLimits limits)
 {
     private const int MaxDisplayFileNameLength = 260;
+    private const int MaxRequestedByLength = 200;
     private const string CsvExtension = ".csv";
 
     private readonly IWaveStore _waves = waves;
@@ -80,13 +81,26 @@ public sealed class ValidateMappingCsvUploadUseCase(
             throw new ArgumentException("A chave de idempotência é obrigatória.", nameof(request));
         }
 
+        // (§6) RequestedBy é METADADO OPERACIONAL: validado e normalizado ANTES de qualquer custódia
+        // (fail-closed, zero writes em entrada inválida). O valor normalizado é o que se persiste.
+        var requestedBy = NormalizeRequestedBy(request.RequestedBy);
+
         // (§10-11) Extensão + basename: nome do cliente é DADO não confiável, jamais caminho físico.
         var displayName = NormalizeDisplayFileName(request.FileName);
 
-        // (§8/§48) Preflight pelo comprimento declarado — apenas uma dica; nunca a fonte de verdade.
-        if (request.DeclaredLength is { } declared && declared > _limits.EffectiveMaxUploadBytes)
+        // (§8/§48) Preflight pelo comprimento declarado — apenas uma dica; nunca a fonte de verdade. Um
+        // comprimento NEGATIVO é entrada inválida e é rejeitado imediatamente (stream não lido, zero custódia).
+        if (request.DeclaredLength is { } declared)
         {
-            throw new MappingUploadRejectedException(MappingUploadRejectionReason.DeclaredLengthTooLarge);
+            if (declared < 0)
+            {
+                throw new MappingUploadRejectedException(MappingUploadRejectionReason.InvalidDeclaredLength);
+            }
+
+            if (declared > _limits.EffectiveMaxUploadBytes)
+            {
+                throw new MappingUploadRejectedException(MappingUploadRejectionReason.DeclaredLengthTooLarge);
+            }
         }
 
         // (§8) Leitura LIMITADA pelo conteúdo real (limit + 1). Oversized ⇒ rejeição pré-custódia (§9).
@@ -154,7 +168,7 @@ public sealed class ValidateMappingCsvUploadUseCase(
             truncated,
             displayName,
             request.UserId,
-            request.RequestedBy,
+            requestedBy,
             request.Correlation,
             request.IdempotencyKey,
             _clock.UtcNow,
@@ -162,18 +176,45 @@ public sealed class ValidateMappingCsvUploadUseCase(
 
         var persisted = await _store.PersistAsync(attempt, cancellationToken).ConfigureAwait(false);
 
+        // (§3) A resposta reflete SEMPRE a evidência CANÔNICA persistida (a tentativa original em caso de
+        // replay), nunca o resultado recalculado nesta execução. Em criação, a tentativa canônica é a de
+        // entrada (mesmos bytes/hash/desfecho/problemas), então a semântica é idêntica.
+        var canonical = persisted.Attempt;
         return new MappingUploadValidationOutcome(
-            persisted.ValidationId,
+            canonical.ValidationId,
             persisted.Created,
             persisted.Replayed,
-            outcome == MappingValidationAttemptOutcome.Valid,
-            outcome,
-            contentSha,
-            sizeBytes,
-            rowCount,
-            issueCount,
-            truncated,
-            issues);
+            canonical.Outcome == MappingValidationAttemptOutcome.Valid,
+            canonical.Outcome,
+            canonical.ContentSha256,
+            canonical.SizeBytes,
+            canonical.RowCount,
+            canonical.IssueCount,
+            canonical.IssuesTruncated,
+            canonical.Issues);
+    }
+
+    // (§6) Normaliza e valida o RequestedBy (metadado operacional de identidade, não custódia de conteúdo):
+    // obrigatório, Trim(), não vazio, no máximo 200 caracteres e sem caracteres de controle. Entrada inválida
+    // ⇒ ArgumentException (fail-closed, antes de qualquer escrita). Persiste-se o valor normalizado.
+    private static string NormalizeRequestedBy(string? requestedBy)
+    {
+        var trimmed = (requestedBy ?? string.Empty).Trim();
+        if (trimmed.Length is 0 or > MaxRequestedByLength)
+        {
+            throw new ArgumentException(
+                $"RequestedBy é obrigatório e deve ter entre 1 e {MaxRequestedByLength} caracteres.", nameof(requestedBy));
+        }
+
+        foreach (var character in trimmed)
+        {
+            if (char.IsControl(character))
+            {
+                throw new ArgumentException("RequestedBy não pode conter caracteres de controle.", nameof(requestedBy));
+            }
+        }
+
+        return trimmed;
     }
 
     // Normaliza SOMENTE o basename para metadado de EXIBIÇÃO. Remove componentes de caminho (defesa contra

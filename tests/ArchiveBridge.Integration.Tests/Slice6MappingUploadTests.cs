@@ -112,7 +112,7 @@ public sealed class Slice6MappingUploadTests(SqlServerFixture fixture)
     public async Task ContentAtLimitIsAcceptedAndOverLimitIsRejectedPreCustody()
     {
         var (scope, wave) = await SeedApprovedWaveAsync(Entry("a.pst", "u@contoso.com"));
-        var limits = new MappingUploadLimits(effectiveMaxUploadBytes: 128, hardMaxUploadBytes: 1024);
+        var limits = new MappingUploadLimits(effectiveMaxUploadBytes: 128);
 
         // limit e limit-1: NÃO rejeita por tamanho (conteúdo arbitrário ⇒ Invalid, mas com custódia).
         foreach (var size in new[] { 127, 128 })
@@ -133,7 +133,7 @@ public sealed class Slice6MappingUploadTests(SqlServerFixture fixture)
     public async Task DeclaredLengthOverLimitRejectsWithoutReading()
     {
         var (scope, wave) = await SeedApprovedWaveAsync(Entry("a.pst", "u@contoso.com"));
-        var limits = new MappingUploadLimits(effectiveMaxUploadBytes: 128, hardMaxUploadBytes: 1024);
+        var limits = new MappingUploadLimits(effectiveMaxUploadBytes: 128);
         var counting = new CountingStream(1_000_000);
 
         await Assert.ThrowsAsync<MappingUploadRejectedException>(() => UseCase(limits).ExecuteAsync(
@@ -146,7 +146,7 @@ public sealed class Slice6MappingUploadTests(SqlServerFixture fixture)
     public async Task LyingDeclaredLengthDoesNotBypassBoundedRead()
     {
         var (scope, wave) = await SeedApprovedWaveAsync(Entry("a.pst", "u@contoso.com"));
-        var limits = new MappingUploadLimits(effectiveMaxUploadBytes: 128, hardMaxUploadBytes: 1024);
+        var limits = new MappingUploadLimits(effectiveMaxUploadBytes: 128);
         var counting = new CountingStream(500); // real > limit, mas declara pequeno
 
         await Assert.ThrowsAsync<MappingUploadRejectedException>(() => UseCase(limits).ExecuteAsync(
@@ -179,6 +179,8 @@ public sealed class Slice6MappingUploadTests(SqlServerFixture fixture)
     [InlineData(new byte[] { 0x41, 0xC3, 0x28 })]              // UTF-8 inválido
     [InlineData(new byte[] { 0xFF, 0xFE, 0x41, 0x00 })]        // UTF-16 LE BOM
     [InlineData(new byte[] { 0xFE, 0xFF, 0x00, 0x41 })]        // UTF-16 BE BOM
+    [InlineData(new byte[] { 0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x00, 0x41 })] // UTF-32 BE BOM
+    [InlineData(new byte[] { 0xFF, 0xFE, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00 })] // UTF-32 LE BOM
     public async Task NonUtf8IsRejectedWithoutFallback(byte[] bytes)
     {
         var (scope, wave) = await SeedApprovedWaveAsync(Entry("a.pst", "u@contoso.com"));
@@ -309,10 +311,13 @@ public sealed class Slice6MappingUploadTests(SqlServerFixture fixture)
     }
 
     [Theory]
+    // Matriz COMPLETA dos 8 estados de onda (§7). Apenas Approved/Frozen são fontes autorizadas.
     [InlineData(WaveStatus.Approved, true)]
     [InlineData(WaveStatus.Frozen, true)]
     [InlineData(WaveStatus.Draft, false)]
     [InlineData(WaveStatus.Validating, false)]
+    [InlineData(WaveStatus.Blocked, false)]
+    [InlineData(WaveStatus.ReadyForApproval, false)]
     [InlineData(WaveStatus.Completed, false)]
     [InlineData(WaveStatus.Cancelled, false)]
     public async Task OnlyApprovedOrFrozenWavesAreValidatable(WaveStatus status, bool allowed)
@@ -459,9 +464,151 @@ public sealed class Slice6MappingUploadTests(SqlServerFixture fixture)
         Assert.NotNull(await Store().GetAsync(scopeP1, outcome.ValidationId, CancellationToken.None));
     }
 
+    // ===================== §3 replay canônico =====================
+
+    [Fact]
+    public async Task ReplayReturnsPersistedCanonicalEvidence()
+    {
+        var (scope, wave) = await SeedApprovedWaveAsync(Entry("a.pst", "u@contoso.com"));
+        var csv = ValidCsv(wave);
+        var key = Guid.NewGuid();
+
+        // Persiste diretamente a tentativa A com desfecho/rowCount/problema "canônicos" que DIVERGEM do que
+        // uma revalidação dos mesmos bytes produziria (o CSV é válido ⇒ Valid/rowCount=1/0 issues), mas com
+        // os MESMOS campos de equivalência de idempotência (onda/versão/hashes/esquema/política/code page/SHA).
+        var canonicalIssue = new MappingValidationIssue(
+            MappingValidationIssueCode.RowDivergent, 2, null, "divergência (evidência histórica).");
+        var attemptA = new MappingValidationAttempt(
+            Guid.NewGuid(), scope, wave.Id, wave.Version.Value, wave.ConfigurationHash, wave.SelectionHash,
+            MappingSchema.Version, MappingPolicy.Default.Version, CodePage, DeterministicHash.ComputeBytes(csv),
+            csv.Length, 999, MappingValidationAttemptOutcome.Invalid, 1, false, "historico.csv", Guid.NewGuid(),
+            "operator", CorrelationId.New(), key, Clock.UtcNow, new[] { canonicalIssue });
+        var created = await Store().PersistAsync(attemptA, CancellationToken.None);
+        Assert.True(created.Created);
+
+        // Agora o CASO DE USO é chamado com a MESMA chave e os MESMOS bytes válidos. A revalidação
+        // recalcularia Valid/rowCount=1/0 issues — porém a resposta DEVE refletir a tentativa persistida A.
+        var replay = await UseCase().ExecuteAsync(
+            Request(scope, wave.Id, csv, key: key), MappingPolicy.Default, CancellationToken.None);
+
+        Assert.True(replay.Replayed);
+        Assert.False(replay.Created);
+        Assert.Equal(attemptA.ValidationId, replay.ValidationId);              // mesmo id histórico
+        Assert.Equal(MappingValidationAttemptOutcome.Invalid, replay.Outcome); // desfecho da A (não recalculado)
+        Assert.False(replay.IsValid);
+        Assert.Equal(999, replay.RowCount);                                    // rowCount da A
+        Assert.Equal(1, replay.IssueCount);
+        Assert.Single(replay.Issues);
+        Assert.Equal(MappingValidationIssueCode.RowDivergent, replay.Issues[0].Code); // problema persistido da A
+        Assert.Equal(1, await CountAttemptsAsync(scope));                      // nenhuma nova tentativa
+    }
+
+    // ===================== §5 store — identidade/idempotência, zero writes =====================
+
+    [Fact]
+    public async Task StorePersistWithEmptyIdempotencyKeyThrowsWithZeroWrites()
+    {
+        var (scope, wave) = await SeedApprovedWaveAsync(Entry("a.pst", "u@contoso.com"));
+        var attempt = BuildValidAttempt(scope, wave, ValidCsv(wave)) with { IdempotencyKey = Guid.Empty };
+        await Assert.ThrowsAsync<ArgumentException>(() => Store().PersistAsync(attempt, CancellationToken.None));
+        Assert.Equal(0, await CountAttemptsAsync(scope));
+    }
+
+    [Fact]
+    public async Task StorePersistWithEmptyUserIdThrowsWithZeroWrites()
+    {
+        var (scope, wave) = await SeedApprovedWaveAsync(Entry("a.pst", "u@contoso.com"));
+        var attempt = BuildValidAttempt(scope, wave, ValidCsv(wave)) with { UserId = Guid.Empty };
+        await Assert.ThrowsAsync<ArgumentException>(() => Store().PersistAsync(attempt, CancellationToken.None));
+        Assert.Equal(0, await CountAttemptsAsync(scope));
+    }
+
+    // ===================== §6 RequestedBy normalizado e persistido =====================
+
+    [Fact]
+    public async Task RequestedByIsTrimmedAndPersistedNormalized()
+    {
+        var (scope, wave) = await SeedApprovedWaveAsync(Entry("a.pst", "u@contoso.com"));
+        var request = new MappingCsvUploadRequest(
+            scope, wave.Id, CodePage, new MemoryStream(ValidCsv(wave)), "mapping.csv", null,
+            Guid.NewGuid(), "  Vinicius Miranda  ", Guid.NewGuid(), CorrelationId.New());
+
+        var outcome = await UseCase().ExecuteAsync(request, MappingPolicy.Default, CancellationToken.None);
+
+        var stored = await Store().GetAsync(scope, outcome.ValidationId, CancellationToken.None);
+        Assert.Equal("Vinicius Miranda", stored!.RequestedBy); // Trim() aplicado e o valor normalizado persistido
+    }
+
+    // ===================== §8 conflito de idempotência por ContentCodePage =====================
+
+    [Fact]
+    public async Task SameKeySameBytesDifferentContentCodePageConflicts()
+    {
+        var (scope, wave) = await SeedApprovedWaveAsync(Entry("a.pst", "u@contoso.com"));
+        var csv = ValidCsv(wave);
+        var key = Guid.NewGuid();
+
+        // 1ª tentativa: ContentCodePage 1252.
+        await UseCase().ExecuteAsync(
+            RequestWithCodePage(scope, wave.Id, csv, new ContentCodePage(1252), key), MappingPolicy.Default, CancellationToken.None);
+
+        // 2ª: MESMOS bytes (mesmo SHA) e MESMA chave, apenas ContentCodePage 65001 ⇒ conflito de idempotência
+        // (não replay), porque o code page faz parte da equivalência semântica.
+        await Assert.ThrowsAsync<MappingValidationConflictException>(() => UseCase().ExecuteAsync(
+            RequestWithCodePage(scope, wave.Id, csv, new ContentCodePage(65001), key), MappingPolicy.Default, CancellationToken.None));
+
+        Assert.Equal(1, await CountAttemptsAsync(scope)); // nenhuma segunda tentativa
+    }
+
+    // ===================== §10 cross-tenant GetAsync =====================
+
+    [Fact]
+    public async Task GetAsyncFromAnotherTenantReturnsNull()
+    {
+        var (scopeA, waveA) = await SeedApprovedWaveAsync(Entry("a.pst", "u@contoso.com"));
+        var outcome = await UseCase().ExecuteAsync(
+            Request(scopeA, waveA.Id, ValidCsv(waveA)), MappingPolicy.Default, CancellationToken.None);
+
+        // Outro TENANT (tenant e projeto distintos): a mesma ValidationId não é visível.
+        var (scopeB, _) = await SeedApprovedWaveAsync(Entry("b.pst", "v@contoso.com"));
+        Assert.NotEqual(scopeA.Tenant, scopeB.Tenant);
+        Assert.Null(await Store().GetAsync(scopeB, outcome.ValidationId, CancellationToken.None));
+        Assert.NotNull(await Store().GetAsync(scopeA, outcome.ValidationId, CancellationToken.None));
+    }
+
+    // ===================== §11 grants/denials da identidade de manutenção =====================
+
+    [Fact]
+    public async Task MaintenanceIdentityHasNoSelectUpdateDeleteOnValidationTables()
+    {
+        var statements = new[]
+        {
+            "SELECT TOP 1 validation_id FROM dbo.mapping_validation_attempts;",
+            "UPDATE dbo.mapping_validation_attempts SET size_bytes = 0;",
+            "DELETE FROM dbo.mapping_validation_attempts;",
+            "SELECT TOP 1 validation_id FROM dbo.mapping_validation_issues;",
+            "UPDATE dbo.mapping_validation_issues SET message = 'x';",
+            "DELETE FROM dbo.mapping_validation_issues;",
+        };
+
+        foreach (var sql in statements)
+        {
+            await using var connection = new SqlConnection(_fixture.MaintenanceConnectionString);
+            await connection.OpenAsync();
+            await using var command = new SqlCommand(sql, connection);
+            await Assert.ThrowsAsync<SqlException>(() => command.ExecuteNonQueryAsync());
+        }
+    }
+
     // ===================== helpers =====================
 
     private SqlMappingValidationStore Store() => new(_fixture.Factory);
+
+    private static MappingCsvUploadRequest RequestWithCodePage(
+        TenantScope scope, WaveId waveId, byte[] content, ContentCodePage codePage, Guid key) =>
+        new(
+            scope, waveId, codePage, new MemoryStream(content), "mapping.csv", content.Length,
+            Guid.NewGuid(), "operator", key, CorrelationId.New());
 
     private ValidateMappingCsvUploadUseCase UseCase(MappingUploadLimits? limits = null) =>
         new(Slice2Support.WaveStore(_fixture), Store(), Clock, limits ?? MappingUploadLimits.Default);
@@ -543,6 +690,14 @@ public sealed class Slice6MappingUploadTests(SqlServerFixture fixture)
                 break;
             case WaveStatus.Validating:
                 wave.StartValidation();
+                break;
+            case WaveStatus.Blocked:
+                wave.StartValidation();
+                wave.Block();
+                break;
+            case WaveStatus.ReadyForApproval:
+                wave.StartValidation();
+                wave.MarkReadyForApproval();
                 break;
             case WaveStatus.Cancelled:
                 wave.Cancel();

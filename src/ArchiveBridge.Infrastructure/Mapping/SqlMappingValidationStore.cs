@@ -110,8 +110,13 @@ public sealed class SqlMappingValidationStore(TenantConnectionFactory connection
             if (existing is not null)
             {
                 EnsureSameRequest(existing.Value, attempt);
+                // Devolve a EVIDÊNCIA CANÔNICA PERSISTIDA (a tentativa original), lida na mesma transação —
+                // nunca a recalculada nesta requisição.
+                var canonical = await ReadAttemptAsync(
+                    connection.Connection, transaction, scope, existing.Value.ValidationId, cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("Tentativa idempotente encontrada mas não legível na mesma transação.");
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                return new MappingValidationPersistResult(existing.Value.ValidationId, Created: false, Replayed: true);
+                return new MappingValidationPersistResult(canonical, Created: false, Replayed: true);
             }
 
             await RevalidateWaveAsync(connection.Connection, transaction, attempt, cancellationToken).ConfigureAwait(false);
@@ -131,12 +136,16 @@ public sealed class SqlMappingValidationStore(TenantConnectionFactory connection
                 }
 
                 EnsureSameRequest(raced.Value, attempt);
+                var canonical = await ReadAttemptAsync(
+                    connection.Connection, transaction, scope, raced.Value.ValidationId, cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("Tentativa idempotente encontrada mas não legível na mesma transação.");
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                return new MappingValidationPersistResult(raced.Value.ValidationId, Created: false, Replayed: true);
+                return new MappingValidationPersistResult(canonical, Created: false, Replayed: true);
             }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return new MappingValidationPersistResult(attempt.ValidationId, Created: true, Replayed: false);
+            // Recém-criada: a tentativa persistida é EXATAMENTE a de entrada (mesmos bytes/hash/desfecho/problemas).
+            return new MappingValidationPersistResult(attempt, Created: true, Replayed: false);
         }
         catch
         {
@@ -150,9 +159,17 @@ public sealed class SqlMappingValidationStore(TenantConnectionFactory connection
         TenantScope scope, Guid validationId, CancellationToken cancellationToken)
     {
         await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        return await ReadAttemptAsync(connection.Connection, transaction: null, scope, validationId, cancellationToken).ConfigureAwait(false);
+    }
 
+    // Lê a tentativa CANÔNICA persistida (com seus problemas) por identificador, no escopo informado. Aceita
+    // uma transação opcional para permitir a leitura na MESMA transação do replay (evidência consistente sob
+    // lock). Escopo aplicado sempre por project_id (RLS + filtro explícito): id de outro tenant/projeto ⇒ null.
+    private static async Task<MappingValidationAttempt?> ReadAttemptAsync(
+        SqlConnection connection, SqlTransaction? transaction, TenantScope scope, Guid validationId, CancellationToken cancellationToken)
+    {
         MappingValidationAttempt? attempt = null;
-        await using (var command = new SqlCommand(GetAttemptSql, connection.Connection))
+        await using (var command = new SqlCommand(GetAttemptSql, connection, transaction))
         {
             command.Parameters.Add(new SqlParameter("@validationId", SqlDbType.UniqueIdentifier) { Value = validationId });
             command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
@@ -191,7 +208,7 @@ public sealed class SqlMappingValidationStore(TenantConnectionFactory connection
         }
 
         var issues = new List<MappingValidationIssue>();
-        await using (var command = new SqlCommand(GetIssuesSql, connection.Connection))
+        await using (var command = new SqlCommand(GetIssuesSql, connection, transaction))
         {
             command.Parameters.Add(new SqlParameter("@validationId", SqlDbType.UniqueIdentifier) { Value = validationId });
             command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
