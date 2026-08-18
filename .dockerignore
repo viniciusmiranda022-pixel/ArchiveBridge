@@ -1,0 +1,44 @@
+# Contexto de build enxuto para a imagem de demonstração.
+# Mantém o código-fonte e os arquivos de projeto/lock necessários ao restore/publish; remove o resto.
+
+# Controle de versão / CI
+.git
+.github
+.gitignore
+.gitattributes
+.gitleaks.toml
+
+# Saídas de build e testes
+**/bin
+**/obj
+**/TestResults
+tests
+artifacts
+sbom
+*.trx
+
+# Segredos e ambiente local (NUNCA no contexto de build)
+.env
+.env.*
+
+# Docker (não precisa no contexto)
+**/Dockerfile
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentação e mídia não usada em runtime
+docs
+scripts
+poc
+README.md
+SECURITY.md
+CONTRIBUTING.md
+
+# IDE / SO
+.vs
+.vscode
+.idea
+*.user
+*.suo
+.DS_Store
