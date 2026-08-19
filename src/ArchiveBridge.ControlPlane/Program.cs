@@ -7,17 +7,22 @@
 // é READ-ONLY contra o Enterprise Vault. Tudo sob autenticação e RBAC; nenhuma capacidade do Slice 4B
 // (exportação, PST, Purview, Graph, AzCopy) é executada nem simulada.
 using ArchiveBridge.Application.EnterpriseVault.Discovery;
+using ArchiveBridge.Application.Mapping;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
+using ArchiveBridge.Contracts.Mapping;
+using ArchiveBridge.Contracts.Waves;
 using ArchiveBridge.ControlPlane.Composition;
 using ArchiveBridge.ControlPlane.Presentation;
 using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 using ArchiveBridge.Infrastructure.ControlPlane;
 using ArchiveBridge.Infrastructure.EnterpriseVault.Discovery;
+using ArchiveBridge.Infrastructure.Mapping;
 using ArchiveBridge.Infrastructure.Persistence;
 using ArchiveBridge.Infrastructure.Projects;
 using ArchiveBridge.Infrastructure.Time;
+using ArchiveBridge.Infrastructure.Waves;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.Data.SqlClient;
@@ -54,6 +59,30 @@ var discoveryPortalOptions =
     builder.Configuration.GetSection(EnterpriseVaultDiscoveryPortalOptions.SectionName)
         .Get<EnterpriseVaultDiscoveryPortalOptions>() ?? new EnterpriseVaultDiscoveryPortalOptions();
 builder.Services.AddSingleton(discoveryPortalOptions);
+
+// Feature gate LOCAL do Portal para a superfície de UPLOAD/VALIDAÇÃO de Mapping CSV (Passo 6B; default
+// fail-closed = false). O backend seguro (ValidateMappingCsvUploadUseCase, Passo 6A) não conhece este gate
+// nem ASP.NET — permanece a autoridade final de tamanho/validação independentemente dele.
+var mappingUploadSection = builder.Configuration.GetSection(MappingUploadPortalOptions.SectionName);
+var mappingUploadPortalOptions = mappingUploadSection.Get<MappingUploadPortalOptions>() ?? new MappingUploadPortalOptions();
+builder.Services.AddSingleton(mappingUploadPortalOptions);
+
+// Limites de recepção do backend 6A: o limite EFETIVO é configurável (default 5 MiB); o teto ABSOLUTO
+// (50 MiB, MappingUploadLimits.AbsoluteMaxUploadBytes) é uma constante estrutural e NUNCA lido de configuração
+// — construído explicitamente (sem binder genérico) para preservar essa garantia.
+var mappingUploadLimits = new MappingUploadLimits(
+    mappingUploadSection.GetValue<long?>("EffectiveMaxUploadBytes") ?? MappingUploadLimits.Default.EffectiveMaxUploadBytes,
+    mappingUploadSection.GetValue<int?>("MaxPersistedValidationIssues") ?? MappingUploadLimits.Default.MaxPersistedValidationIssues);
+builder.Services.AddSingleton(mappingUploadLimits);
+
+builder.Services.AddScoped<IWaveStore>(serviceProvider =>
+    new SqlWaveStore(connectionFactory, serviceProvider.GetRequiredService<IClock>()));
+builder.Services.AddScoped<IMappingValidationStore>(_ => new SqlMappingValidationStore(connectionFactory));
+builder.Services.AddScoped(serviceProvider => new ValidateMappingCsvUploadUseCase(
+    serviceProvider.GetRequiredService<IWaveStore>(),
+    serviceProvider.GetRequiredService<IMappingValidationStore>(),
+    serviceProvider.GetRequiredService<IClock>(),
+    mappingUploadLimits));
 
 // Modo de Demonstração (concern EXCLUSIVO de UI): dataset 100% sintético para telas quando não há dados reais.
 // Fail-closed no startup: habilitá-lo fora de Development/Staging aborta o processo (nunca dados simulados em
@@ -109,6 +138,11 @@ builder.Services.AddAuthorization(authorization =>
     // server-side via IAuthorizationService, para que uma tentativa negada seja bloqueada E auditada.
     authorization.AddPolicy(
         "EvDiscoveryOperators", policy => policy.RequireRole(PortalRoles.Operator, PortalRoles.Administrator));
+    // Ação de ESCRITA (submeter Mapping CSV para validação): apenas Operator/Administrator. Não protege a
+    // PÁGINA /Mapping (que continua legível pelos papéis de leitura) — protege o handler POST, autorizado
+    // server-side via IAuthorizationService, para que uma tentativa negada seja bloqueada E auditada.
+    authorization.AddPolicy(
+        "MappingValidationOperators", policy => policy.RequireRole(PortalRoles.Operator, PortalRoles.Administrator));
 });
 
 // Codificação HTML: permite letras acentuadas (Latin) como UTF-8 literal em vez de entidades numéricas

@@ -41,4 +41,18 @@ public sealed partial class MappingUploadBoundaryTests
 
         Assert.Empty(forbidden);
     }
+
+    [Fact]
+    public void InfrastructureAssemblyHasNoWebVendorOrExecutionDependency()
+    {
+        // A persistência (incluindo SqlMappingValidationStore, custódia da validação do Passo 6A) é adaptador
+        // de saída: nunca conhece ASP.NET. A superfície HTTP do Passo 6B vive EXCLUSIVAMENTE no ControlPlane.
+        var forbidden = typeof(ArchiveBridge.Infrastructure.AssemblyMarker).Assembly
+            .GetReferencedAssemblies()
+            .Select(reference => reference.Name ?? string.Empty)
+            .Where(name => ForbiddenReferencePattern().IsMatch(name))
+            .ToList();
+
+        Assert.Empty(forbidden);
+    }
 }

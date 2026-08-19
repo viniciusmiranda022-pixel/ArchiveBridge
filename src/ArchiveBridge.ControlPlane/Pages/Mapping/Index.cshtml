@@ -1,13 +1,46 @@
 @page
-@inject PresentationModeOptions Presentation
-@inject IPresentationDataProvider Demo
+@model ArchiveBridge.ControlPlane.Pages.Mapping.IndexModel
 @{
     ViewData["Title"] = "Mapping";
-    MappingOverview? mapping = Presentation.Enabled ? Demo.GetMapping() : null;
     var header = new PageHeaderModel("Mapping", "Mapeamento dos PSTs selecionados para o Online Archive correspondente no Microsoft 365.");
+    var mapping = Model.Mapping;
+    var policy = ArchiveBridge.Domain.Mapping.MappingPolicy.Default;
 }
 
 <partial name="_PageHeader" model="header" />
+
+@if (Model.PresentationMode)
+{
+    <div class="alert warning">
+        <span class="a-ico">@Icons.Svg("info")</span>
+        <div class="a-body"><strong>Modo demonstração</strong>A validação de Mapping CSV está desabilitada: o resultado abaixo é um exemplo sintético.</div>
+    </div>
+}
+else if (!Model.IsUploadOperator)
+{
+    @* Usuário sem RBAC (Operator/Administrator): a mensagem é SEMPRE esta, com o gate ligado ou desligado.
+       Nunca ramificar em Model.UploadEnabled aqui — faria o GET vazar o estado do feature gate para um
+       principal sem mandato (information disclosure). *@
+    <div class="alert info">
+        <span class="a-ico">@Icons.Svg("shield")</span>
+        <div class="a-body"><strong>Acesso de leitura.</strong>Submeter um Mapping CSV para validação requer o papel Operator ou Administrator.</div>
+    </div>
+}
+else if (!Model.UploadEnabled)
+{
+    @* Somente usuários JÁ autorizados (Operator/Administrator) podem ver que o gate está desligado. *@
+    <div class="alert neutral">
+        <span class="a-ico">@Icons.Svg("info")</span>
+        <div class="a-body"><strong>Validação de upload indisponível neste deployment.</strong>A submissão de Mapping CSV está desabilitada por configuração; o portal exibe apenas resultados já registrados.</div>
+    </div>
+}
+else
+{
+    <div class="alert info">
+        <span class="a-ico">@Icons.Svg("shield")</span>
+        <div class="a-body"><strong>Validação de recepção.</strong>O CSV é recebido e validado contra a onda selecionada (Approved/Frozen); os bytes brutos não são retidos pela aplicação — apenas o SHA-256, os metadados e o desfecho.</div>
+    </div>
+}
 
 <div class="grid-2">
     <div class="card">
@@ -38,27 +71,132 @@
     <div class="card">
         <div class="card-head"><h3>Validar Mapping CSV</h3></div>
         <div class="card-body">
-            <div class="upload-drop">
-                @Icons.Svg("upload")
-                <div><b>Selecionar arquivo .CSV</b></div>
-                <div class="faint">Arraste um arquivo ou use o seletor abaixo</div>
-                <input type="file" accept=".csv" disabled aria-label="Selecionar arquivo CSV" />
-            </div>
-            <div class="kv mt14">
-                <div><div class="k">Formato</div><div class="v">UTF-8 sem BOM</div></div>
-                <div><div class="k">Tamanho máximo</div><div class="v">5 MiB</div></div>
-                <div><div class="k">Schema</div><div class="v">ArchiveBridge Mapping v1</div></div>
-            </div>
-            <div class="row mt14">
-                <button type="button" class="btn primary" disabled>@Icons.Svg("check-circle") Validar CSV</button>
-            </div>
-            <div class="alert neutral">
-                <span class="a-ico">@Icons.Svg("info")</span>
-                <div class="a-body">Validação via Portal será habilitada na próxima etapa.</div>
-            </div>
+            @if (Model.CanUploadMapping)
+            {
+                @if (Model.EligibleWaves.Count == 0)
+                {
+                    <p class="muted mt0">Nenhuma onda Approved/Frozen disponível neste projeto para validação.</p>
+                }
+                else
+                {
+                    <form method="post" asp-page-handler="ValidateCsv" enctype="multipart/form-data" data-guard>
+                        <div class="field">
+                            <label for="mapping-wave">Onda</label>
+                            <select id="mapping-wave" name="waveId" required>
+                                @foreach (var wave in Model.EligibleWaves)
+                                {
+                                    <option value="@wave.WaveId">@wave.Name (@wave.Status)</option>
+                                }
+                            </select>
+                        </div>
+                        <div class="field mt14">
+                            <label for="mapping-codepage">Content code page</label>
+                            <select id="mapping-codepage" name="contentCodePage" required>
+                                @foreach (var codePage in policy.AllowedContentCodePages)
+                                {
+                                    <option value="@codePage" selected="@(codePage == policy.DefaultContentCodePage.Value ? "selected" : null)">@codePage</option>
+                                }
+                            </select>
+                        </div>
+                        <input type="hidden" name="idempotencyKey" value="@Model.IdempotencyKey" />
+                        <div class="upload-drop mt14">
+                            @Icons.Svg("upload")
+                            <div><b>Selecionar arquivo .CSV</b></div>
+                            <div class="faint">Arraste um arquivo ou use o seletor abaixo</div>
+                            <input type="file" name="file" accept=".csv" required aria-label="Selecionar arquivo CSV" />
+                        </div>
+                        <div class="kv mt14">
+                            <div><div class="k">Formato</div><div class="v">UTF-8 sem BOM</div></div>
+                            <div><div class="k">Tamanho máximo</div><div class="v">@((Model.EffectiveMaxUploadBytes / (1024 * 1024)).ToString("N0")) MiB</div></div>
+                            <div><div class="k">Schema</div><div class="v">ArchiveBridge Mapping v1</div></div>
+                        </div>
+                        <div class="row mt14">
+                            <button type="submit" class="btn primary" data-busy="Validando…">@Icons.Svg("check-circle") Validar CSV</button>
+                        </div>
+                    </form>
+                }
+            }
+            else
+            {
+                <div class="upload-drop">
+                    @Icons.Svg("upload")
+                    <div><b>Selecionar arquivo .CSV</b></div>
+                    <div class="faint">Arraste um arquivo ou use o seletor abaixo</div>
+                    <input type="file" accept=".csv" disabled aria-label="Selecionar arquivo CSV" />
+                </div>
+                <div class="kv mt14">
+                    <div><div class="k">Formato</div><div class="v">UTF-8 sem BOM</div></div>
+                    <div><div class="k">Tamanho máximo</div><div class="v">@((Model.EffectiveMaxUploadBytes / (1024 * 1024)).ToString("N0")) MiB</div></div>
+                    <div><div class="k">Schema</div><div class="v">ArchiveBridge Mapping v1</div></div>
+                </div>
+                <div class="row mt14">
+                    <button type="button" class="btn primary" disabled>@Icons.Svg("check-circle") Validar CSV</button>
+                </div>
+                @if (Model.PresentationMode)
+                {
+                    <p class="faint">Operação desabilitada no modo demonstração.</p>
+                }
+                else if (!Model.IsUploadOperator)
+                {
+                    @* Idêntica com o gate ligado ou desligado — nunca revela Model.UploadEnabled a quem não tem RBAC. *@
+                    <p class="faint">Requer o papel Operator ou Administrator.</p>
+                }
+                else
+                {
+                    @* Só alcançável por quem já É Operator/Administrator: o gate está desligado. *@
+                    <p class="faint">Validação de upload indisponível neste deployment.</p>
+                }
+            }
         </div>
     </div>
 </div>
+
+@if (Model.ValidationResult is { } result)
+{
+    <h2 class="section">Resultado da validação</h2>
+    <div class="grid-2">
+        <div class="card">
+            <div class="card-head"><h3>Recepção do CSV</h3><partial name="_StatusBadge" model="result.Outcome.ToString()" /></div>
+            <div class="card-body">
+                <div class="kv">
+                    <div><div class="k">Validation ID</div><div class="v mono">@result.ValidationId</div></div>
+                    <div><div class="k">SHA-256</div><div class="v"><partial name="_HashDisplay" model="@(new HashModel(result.ContentSha256.Value, 16))" /></div></div>
+                    <div><div class="k">Tamanho</div><div class="v">@result.SizeBytes.ToString("N0") bytes</div></div>
+                    <div><div class="k">Linhas</div><div class="v">@(result.RowCount?.ToString("N0") ?? "—")</div></div>
+                    <div><div class="k">Problemas</div><div class="v">@result.IssueCount@(result.IssuesTruncated ? " (truncado)" : "")</div></div>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-head"><h3>Problemas encontrados</h3></div>
+            <div class="card-body flush">
+                @if (result.Issues.Count == 0)
+                {
+                    <p class="muted mt0">Nenhum problema encontrado.</p>
+                }
+                else
+                {
+                    <div class="tablewrap">
+                        <table class="data">
+                            <thead><tr><th>Linha</th><th>Coluna</th><th>Código</th><th>Descrição</th></tr></thead>
+                            <tbody>
+                                @foreach (var issue in result.Issues)
+                                {
+                                    <tr>
+                                        <td>@(issue.LineNumber?.ToString() ?? "—")</td>
+                                        <td>@(issue.ColumnIndex?.ToString() ?? "—")</td>
+                                        <td class="mono">@issue.Code</td>
+                                        <td>@issue.Message</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+            </div>
+        </div>
+    </div>
+}
 
 <h2 class="section">Histórico de versões</h2>
 @if (mapping is { History.Count: > 0 })
@@ -88,7 +226,7 @@ else
     <partial name="_EmptyState" model="empty" />
 }
 
-@if (Presentation.Enabled)
+@if (Model.PresentationMode)
 {
     <h2 class="section">Resultado da validação (exemplo)</h2>
     <div class="grid-2">
@@ -119,5 +257,5 @@ else
             </div>
         </div>
     </div>
-    <p class="faint">Exemplo ilustrativo exibido apenas no modo demonstração. A validação real de CSV é executada pelo backend seguro em uma etapa posterior.</p>
+    <p class="faint">Exemplo ilustrativo exibido apenas no modo demonstração. A validação real de CSV é executada pelo backend seguro.</p>
 }
