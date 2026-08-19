@@ -162,8 +162,11 @@ public sealed class IndexModel(
         var correlation = CorrelationId.New();
         var username = User.Identity?.Name ?? string.Empty;
 
-        // Identidade do principal (fail-closed): sem UserId válido não há como responsabilizar — 403.
-        if (!Guid.TryParse(User.FindFirstValue(PortalClaims.UserId), out var userId))
+        // Identidade do principal (fail-closed): sem UserId UTILIZÁVEL não há como responsabilizar — 403.
+        // Ausente, malformada ou Guid.Empty são tratadas igualmente: recusa ANTES de qualquer store/auditoria
+        // de negócio (o backend 6A também rejeita Guid.Empty, mas com uma exceção de argumento — a decisão de
+        // autorização é desta camada e deve ser observável como 403, nunca como erro do servidor).
+        if (!Guid.TryParse(User.FindFirstValue(PortalClaims.UserId), out var userId) || userId == Guid.Empty)
         {
             return StatusCode(StatusCodes.Status403Forbidden);
         }
