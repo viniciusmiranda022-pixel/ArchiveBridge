@@ -240,6 +240,33 @@ de seek na migration **aditiva** `0017`
 índice alinhado). Nenhuma navegação de leitura gera evento de auditoria (sem recursão). O threat-model delta
 está em `docs/security/threat-model-slice-04a.md`.
 
+## Passo 6A — Backend seguro de recebimento e validação de CSV de mapping
+
+Núcleo **somente backend** (sem página de upload, sem POST, sem multipart, sem endpoint) que recebe um CSV
+de mapping enviado pelo operador e o valida contra a fonte autorizada. **Não importa nada para o Microsoft
+365** e **não retém os bytes brutos** — a custódia guarda o SHA-256 e os metadados.
+
+**Pipeline** (`ValidateMappingCsvUploadUseCase`, sem qualquer dependência de ASP.NET):
+`stream não confiável → preflight (extensão .csv, basename, declared length) → leitura BOUNDED (limit+1) →
+SHA-256 dos BYTES EXATOS → UTF-8 estrito SEM BOM → validação (reutiliza MappingSchema/MappingCsvParser/
+MappingCsvValidator/MappingPolicy existentes) → onda Approved/Frozen resolvida server-side → custódia durável
+idempotente`. Resultado: **Valid**/**Invalid** (ou **Rejected** para encoding/BOM), com evidência persistida.
+
+**Reúso, sem duplicação.** O esquema (10 colunas, `MaxDataRows = 500`), o parser RFC 4180 e o validator são
+os do Slice 2 — o parser ganhou apenas uma **capacidade bounded** (overload) e o validator um caminho de
+**problemas estruturados** (código/linha/coluna), mantendo `MappingValidationResult.Errors` como projeção.
+
+**Custódia** (`IMappingValidationStore` / `SqlMappingValidationStore`, migration **`0018`** aditiva/append-only):
+`mapping_validation_attempts` (SHA dos bytes exatos, snapshot da onda versão/hashes, esquema/política/code page,
+desfecho, contagem/truncamento de problemas, metadados) + `mapping_validation_issues` (append-only). Apenas
+`SELECT/INSERT` para a aplicação; **manutenção sem grant**; RLS por tenant + filtro de projeto; FK composta à
+versão imutável da onda; idempotência por `(tenant, projeto, chave)` com backstop de índice único e revalidação
+TOCTOU da onda na mesma transação. Detalhes e ameaças em `docs/security/threat-model-slice-04a.md`.
+
+**Conceito distinto de `IMappingStore`** (versões GERADAS/artefatos): aqui persiste-se a **RECEPÇÃO**, não uma
+versão utilizável. Nenhum byte bruto é gravado; nenhum artefato é criado; um CSV `Valid` **não** significa
+importação aprovada — o único efeito é a evidência de validação.
+
 ## Fora do escopo desta fatia
 
 Execução de `Export-EVArchive`; geração de PST; Purview; Microsoft Graph; AzCopy; ingestão no Microsoft

@@ -64,11 +64,57 @@ temporal da consulta já escopada; jamais troca o escopo. Autenticidade criptogr
 Protection), se decidirmos exigi-la, é **hardening do Passo 8** — exige decisão sobre persistência/rotação de
 chaves, restart e multi-instância — e **não** faz parte deste passo.
 
+## Delta — Passo 6A: backend seguro de recebimento e validação de CSV de mapping
+
+Novo backend **somente de recepção/validação** (sem endpoint HTTP ainda). Recebe um `Stream` externo não
+confiável, calcula custódia e valida contra a onda autorizada; **não importa nada para o Microsoft 365** e
+**não retém os bytes brutos**.
+
+**Ativos:** o CSV enviado (transitório, não persistido), o **SHA-256 dos bytes exatos**, o `ValidationId`, o
+snapshot da onda (versão/hashes), os problemas de validação e os metadados de custódia.
+
+**Classificação de dados (custódia).** A tentativa persistida **contém metadados operacionais de identidade** —
+`UserId`, `RequestedBy` (normalizado: `Trim`, 1..200, sem controle) e `DisplayFileName` (basename sanitizado) —
+além de hashes e contagens; portanto **não é "zero PII"**, é evidência operacional atribuível. O que ela **não**
+contém: os bytes brutos do CSV, mailbox, caminho físico, nome de PST ou qualquer valor de célula do mapping.
+
+**Entradas não confiáveis:** bytes do `Stream`, `DeclaredLength`, nome de arquivo do cliente, `WaveId`,
+`ContentCodePage`, chave de idempotência.
+
+| Ameaça | Controle |
+| --- | --- |
+| Upload gigante / exaustão de memória | Leitura **bounded** pelo conteúdo real (`limit + 1`); teto **absoluto e constante** de 50 MiB (`AbsoluteMaxUploadBytes`), **não parametrizável** — o limite efetivo é sempre validado `0 < efetivo <= 50 MiB` no construtor, nenhum chamador pode elevá-lo; nunca confia no `Content-Length` — `DeclaredLength` é só preflight (negativo ⇒ rejeição imediata). Oversized ⇒ rejeição **pré-custódia** (zero tentativa). |
+| Amplificação do parser | O parser materializa no máximo `cabeçalho + MaxDataRows + 1` registros; entrada com milhões de linhas produz deterministicamente `rows-exceeded` sem explodir memória/contagem de problemas. |
+| CSV malformado / confusão de encoding / BOM | Decodificação **UTF-8 estrita SEM BOM** (`throwOnInvalidBytes`); qualquer BOM (UTF-8/16/32) e bytes inválidos ⇒ **Rejected** (custodiado, sem fallback 1252, sem "correção"). CSV estruturalmente inválido ⇒ fail-closed. |
+| CSV/formula injection | Preserva a regra existente: primeiro caractere `= + - @` TAB CR ⇒ inválido; **nunca** reescreve/sanitiza o valor autorizado; os seis gatilhos são testados. |
+| Path traversal via nome de arquivo | O nome do cliente é DADO: apenas o **basename normalizado** (sem componentes de caminho, sem controle, ≤ 260) vira metadado de exibição; jamais caminho físico nem chave de autorização. |
+| IDOR cross-project / cross-tenant na onda | A onda é resolvida **server-side** por `IWaveStore` (RLS + `project_id = @project`); onda de outro projeto/tenant ⇒ NotFound (indistinguível), zero tentativa. FK composta `(wave_id, wave_version, tenant_id, project_id)` reforça o escopo fisicamente. |
+| Fonte mutável | Validação só contra onda **Approved/Frozen** (fonte imutável). Outros estados ⇒ precondição pré-custódia, zero tentativa. |
+| TOCTOU da onda | O store **revalida** a onda (versão/hashes/estado) na MESMA transação da inserção; divergência ⇒ *stale/concurrency*, zero tentativa. `Approved → Frozen` (versão/hashes intactos) permanece válido. |
+| Replay / colisão de idempotência | Chave obrigatória e não nula; busca sob lock de range + índice único como backstop. Mesma chave + mesmo conteúdo/contexto ⇒ replay: o resultado é montado a partir da **evidência canônica persistida** (a tentativa ORIGINAL, relida na mesma transação) — **nunca** do valor recalculado nesta execução, de modo que o `ValidationId` histórico é imune à evolução posterior do validador. Qualquer divergência (bytes/onda/versão/hash/code page) ⇒ conflito, uma única tentativa. `Guid.Empty` recusado no use case E no store. |
+| Vazamento de PII nos erros | Problemas persistidos carregam apenas código/linha/coluna/mensagem genérica — nunca mailbox, caminho, PST, valor de célula bruto ou nome do cliente. |
+| Amplificação da lista de erros | Teto `MaxPersistedValidationIssues` (default 1000); acima dele a lista é truncada deterministicamente (`IssuesTruncated`), nunca explodindo tabela/memória. |
+| Normalização antes do hash | O SHA-256 é sobre os **bytes exatos recebidos** — nunca sobre texto reserializado/normalizado; alterar um byte irrelevante muda o hash. |
+
+**Custódia append-only:** `mapping_validation_attempts` + `mapping_validation_issues` recebem apenas
+`SELECT/INSERT` para a aplicação (sem `UPDATE`/`DELETE`); a identidade de **manutenção não tem grant algum**.
+RLS por tenant (FILTER + BLOCK AFTER INSERT) e filtro explícito por projeto. Migration `0018` aditiva/append-only
+(`0001–0017` intocadas).
+
+**Risco residual:** os **bytes brutos do upload NÃO são retidos** neste sub-incremento — a custódia guarda o
+SHA-256 e os metadados de validação. A retenção de bytes para eventual importação é decisão posterior e **não**
+autoriza importação no Microsoft 365. Nenhum endpoint de upload foi exposto ainda (o hardening HTTP/multipart/
+antiforgery é do incremento seguinte).
+
 ## Fora do escopo (fail-closed por ausência)
 
 Nenhuma execução de `Export-EVArchive`, PST, Purview, Microsoft Graph, AzCopy ou ingestão no Microsoft 365.
-As ações de escrita (aprovações, upload/validação de CSV, disparo de descoberta, administração de usuários)
-não existem nesta fatia e serão modeladas ao serem implementadas.
+
+O backend de **recepção/validação de CSV (Passo 6A) já existe** nas camadas Application/Infrastructure e
+persiste tentativas de validação (custódia append-only). O que **ainda não existe** é a **superfície HTTP/Portal
+de upload** — endpoint `POST`, `IFormFile`/multipart, antiforgery e rate-limit específicos de upload — que
+pertence ao incremento seguinte (6B) e será modelada ao ser implementada. As demais ações de escrita
+(aprovações, disparo de descoberta, administração de usuários) também ainda não têm superfície web nesta fatia.
 
 ## Higiene de logs
 

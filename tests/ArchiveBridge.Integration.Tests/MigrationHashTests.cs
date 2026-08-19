@@ -34,6 +34,30 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Migration0018AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0017 tivesse divergido, isto lançaria. Um re-apply limpo prova que os hashes anteriores
+        // permanecem estáveis; em seguida confirmamos a 0018 e as duas tabelas de custódia de validação.
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 18;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using var tables = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.tables WHERE name IN ('mapping_validation_attempts', 'mapping_validation_issues');",
+            connection);
+        Assert.Equal(2, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
         var original = await ReadHashAsync(1);
