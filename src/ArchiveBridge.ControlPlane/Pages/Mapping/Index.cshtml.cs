@@ -69,6 +69,13 @@ public sealed class IndexModel(
     /// <summary>Gate do deployment: o Portal pode aceitar upload/validação de Mapping CSV?</summary>
     public bool UploadEnabled { get; private set; }
 
+    /// <summary>
+    /// Autorização RBAC (Operator/Administrator) calculada INDEPENDENTEMENTE do estado do gate. Um principal
+    /// sem este mandato NUNCA deve receber, via renderização, qualquer indicação de <see cref="UploadEnabled"/>
+    /// — a UI para não autorizados deve ser idêntica com o gate ligado ou desligado.
+    /// </summary>
+    public bool IsUploadOperator { get; private set; }
+
     /// <summary>Verdadeiro só quando o gate está habilitado E o usuário é Operator/Administrator.</summary>
     public bool CanUploadMapping { get; private set; }
 
@@ -101,8 +108,10 @@ public sealed class IndexModel(
         var scope = _scopeAccessor.Resolve(User);
 
         UploadEnabled = _uploadGate.Enabled;
-        CanUploadMapping = UploadEnabled
-            && (await _authorization.AuthorizeAsync(User, MappingValidationOperatorsPolicy).ConfigureAwait(false)).Succeeded;
+        // Calculada ANTES e INDEPENDENTEMENTE do gate: um usuário sem este mandato nunca deve conseguir
+        // distinguir, pela resposta do GET, se o gate está ligado ou desligado (ver IsUploadOperator).
+        IsUploadOperator = (await _authorization.AuthorizeAsync(User, MappingValidationOperatorsPolicy).ConfigureAwait(false)).Succeeded;
+        CanUploadMapping = UploadEnabled && IsUploadOperator;
         EffectiveMaxUploadBytes = _uploadLimits.EffectiveMaxUploadBytes;
 
         // Apenas ondas em estado imutável (Approved/Frozen) são fonte autorizada de validação. A filtragem

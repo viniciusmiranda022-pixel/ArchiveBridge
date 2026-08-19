@@ -16,18 +16,22 @@
         <div class="a-body"><strong>Modo demonstração</strong>A validação de Mapping CSV está desabilitada: o resultado abaixo é um exemplo sintético.</div>
     </div>
 }
-else if (!Model.UploadEnabled)
+else if (!Model.IsUploadOperator)
 {
-    <div class="alert neutral">
-        <span class="a-ico">@Icons.Svg("info")</span>
-        <div class="a-body"><strong>Validação de upload indisponível neste deployment.</strong>A submissão de Mapping CSV está desabilitada por configuração; o portal exibe apenas resultados já registrados.</div>
-    </div>
-}
-else if (!Model.CanUploadMapping)
-{
+    @* Usuário sem RBAC (Operator/Administrator): a mensagem é SEMPRE esta, com o gate ligado ou desligado.
+       Nunca ramificar em Model.UploadEnabled aqui — faria o GET vazar o estado do feature gate para um
+       principal sem mandato (information disclosure). *@
     <div class="alert info">
         <span class="a-ico">@Icons.Svg("shield")</span>
         <div class="a-body"><strong>Acesso de leitura.</strong>Submeter um Mapping CSV para validação requer o papel Operator ou Administrator.</div>
+    </div>
+}
+else if (!Model.UploadEnabled)
+{
+    @* Somente usuários JÁ autorizados (Operator/Administrator) podem ver que o gate está desligado. *@
+    <div class="alert neutral">
+        <span class="a-ico">@Icons.Svg("info")</span>
+        <div class="a-body"><strong>Validação de upload indisponível neste deployment.</strong>A submissão de Mapping CSV está desabilitada por configuração; o portal exibe apenas resultados já registrados.</div>
     </div>
 }
 else
@@ -132,13 +136,15 @@ else
                 {
                     <p class="faint">Operação desabilitada no modo demonstração.</p>
                 }
-                else if (!Model.UploadEnabled)
+                else if (!Model.IsUploadOperator)
                 {
-                    <p class="faint">Validação de upload indisponível neste deployment.</p>
+                    @* Idêntica com o gate ligado ou desligado — nunca revela Model.UploadEnabled a quem não tem RBAC. *@
+                    <p class="faint">Requer o papel Operator ou Administrator.</p>
                 }
                 else
                 {
-                    <p class="faint">Requer o papel Operator ou Administrator.</p>
+                    @* Só alcançável por quem já É Operator/Administrator: o gate está desligado. *@
+                    <p class="faint">Validação de upload indisponível neste deployment.</p>
                 }
             }
         </div>

@@ -166,6 +166,52 @@ public sealed class Slice4aPortalMappingUploadHttpTests(SqlServerFixture fixture
         Assert.Equal(0, await CountAttemptsAsync(scope));
     }
 
+    [Theory]
+    [InlineData(PortalRoles.Viewer)]
+    [InlineData(PortalRoles.Auditor)]
+    [InlineData(PortalRoles.Approver)]
+    public async Task NonOperatorGetPageDoesNotRevealFeatureGateState(string role)
+    {
+        var (scope, _) = await SeedApprovedWaveAsync();
+        var (username, password) = await SeedUserAsync(scope, role);
+
+        HttpStatusCode gateEnabledStatus;
+        string gateEnabledHtml;
+        using (var enabled = CreateFactory(uploadEnabled: true))
+        using (var client = enabled.CreateClient(NoRedirect()))
+        {
+            await LoginAsync(client, username, password);
+            using var page = await client.GetAsync(new Uri("/Mapping/Index", UriKind.Relative));
+            gateEnabledStatus = page.StatusCode;
+            gateEnabledHtml = await page.Content.ReadAsStringAsync();
+        }
+
+        HttpStatusCode gateDisabledStatus;
+        string gateDisabledHtml;
+        using (var disabled = CreateFactory(uploadEnabled: false))
+        using (var client = disabled.CreateClient(NoRedirect()))
+        {
+            await LoginAsync(client, username, password);
+            using var page = await client.GetAsync(new Uri("/Mapping/Index", UriKind.Relative));
+            gateDisabledStatus = page.StatusCode;
+            gateDisabledHtml = await page.Content.ReadAsStringAsync();
+        }
+
+        // O status observável é idêntico com o gate ligado ou desligado.
+        Assert.Equal(HttpStatusCode.OK, gateEnabledStatus);
+        Assert.Equal(gateEnabledStatus, gateDisabledStatus);
+
+        // Um principal sem RBAC nunca vê o texto que revelaria o estado do feature gate, em NENHUM dos dois casos.
+        Assert.DoesNotContain("indisponível neste deployment", gateEnabledHtml, StringComparison.Ordinal);
+        Assert.DoesNotContain("indisponível neste deployment", gateDisabledHtml, StringComparison.Ordinal);
+
+        // A mensagem observada é a MESMA (leitura apenas) nos dois casos — o estado do gate é indistinguível.
+        Assert.Contains("Acesso de leitura", gateEnabledHtml, StringComparison.Ordinal);
+        Assert.Contains("Acesso de leitura", gateDisabledHtml, StringComparison.Ordinal);
+        Assert.Contains("Requer o papel Operator ou Administrator", gateEnabledHtml, StringComparison.Ordinal);
+        Assert.Contains("Requer o papel Operator ou Administrator", gateDisabledHtml, StringComparison.Ordinal);
+    }
+
     // ---- Presentation Mode: zero efeitos, mesmo com gate habilitado e usuário autorizado.
 
     [Fact]
