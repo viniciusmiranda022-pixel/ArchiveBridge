@@ -27,7 +27,7 @@ public static class StatusBadge
                 or "AssessmentRequired" or "idempotent-replay" => "warning",
 
             // Vermelho — falha / bloqueio.
-            "Failed" or "Blocked" or "Invalid" or "falha"
+            "Failed" or "Blocked" or "Invalid" or "Rejected" or "falha"
                 or "forbidden" or "idempotency-conflict" => "danger",
 
             // Neutro — rascunho / substituído / indisponível / não configurado.
