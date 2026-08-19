@@ -28,8 +28,12 @@ public sealed record MappingCsvUploadRequest(
     CorrelationId Correlation);
 
 /// <summary>
-/// Resultado seguro (sem PII, sem bytes brutos) de uma validação de upload: o identificador durável, se
-/// foi criado/replay, o desfecho e os problemas estruturados persistidos.
+/// Resultado de uma validação de upload: o identificador durável, se foi criado/replay, o desfecho e os
+/// problemas estruturados persistidos. NÃO carrega bytes brutos nem valores de células, e os
+/// <see cref="MappingValidationIssue"/> persistidos são livres de PII (código/linha/coluna/mensagem
+/// genérica). A TENTATIVA de custódia associada (<see cref="MappingValidationAttempt"/>), porém, contém
+/// metadados operacionais de identidade (UserId/RequestedBy/DisplayFileName) — evidência atribuível; por
+/// isso este tipo NÃO deve ser descrito genericamente como "sem PII".
 /// </summary>
 public sealed record MappingUploadValidationOutcome(
     Guid ValidationId,
