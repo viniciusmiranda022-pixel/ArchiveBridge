@@ -32,6 +32,12 @@ using Microsoft.Data.SqlClient;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Empacotamento on-premises (Passo 8): permite hospedar como Windows Service (baseline aceita: IIS ou
+// Windows Service/Kestrel). Fora do Windows/fora de execução como serviço, é NO-OP — não afeta `dotnet run`,
+// os testes de integração (WebApplicationFactory) nem a hospedagem via IIS (que usa o módulo ASP.NET Core,
+// não este caminho).
+builder.Host.UseWindowsService();
+
 var options = builder.Configuration.GetSection(ControlPlaneOptions.SectionName).Get<ControlPlaneOptions>()
     ?? new ControlPlaneOptions();
 
@@ -145,6 +151,15 @@ builder.Services
             : CookieSecurePolicy.Always;
     });
 
+// Observabilidade por requisição (Passo 8): correlation ID + log estruturado + métricas de latência/falhas/
+// operações. Ver Composition/RequestObservability.cs.
+builder.Services.AddSingleton<ControlPlaneMetrics>();
+
+// Rate limiting (Passo 8) das quatro operações sensíveis JÁ EXISTENTES — nenhum novo write-path é criado.
+// Ver Composition/RequestObservability.cs (SensitiveOperationRateLimiter/Middleware) para a justificativa de
+// não usar o atributo nativo [EnableRateLimiting] (não observável por handler em Razor Pages).
+builder.Services.AddSingleton<SensitiveOperationRateLimiter>();
+
 builder.Services.AddAuthorization(authorization =>
 {
     // Fail-closed: toda página exige autenticação, exceto as explicitamente anônimas (login/erro/health).
@@ -189,6 +204,11 @@ var app = builder.Build();
 
 await BootstrapAsync(app, options).ConfigureAwait(false);
 
+// Observabilidade por requisição (Passo 8): primeiro middleware do pipeline, para que o correlation ID
+// (cabeçalho de resposta + log estruturado + métricas) cubra TODA requisição, inclusive redirecionamentos
+// HTTPS e a página de erro. Ver Composition/RequestObservability.cs.
+app.UseMiddleware<RequestCorrelationMiddleware>();
+
 // Fora de desenvolvimento, TLS é obrigatório: HSTS + redirecionamento HTTP→HTTPS (fail-closed em produção).
 // Erros não tratados renderizam uma página amigável (/Error) em vez de vazar detalhes internos. Em dev,
 // mantém-se a página de exceção do desenvolvedor. Isto NÃO altera as respostas fail-closed dos handlers
@@ -217,6 +237,9 @@ app.Use(async (context, next) =>
 app.UseStaticFiles();
 app.UseRouting();
 app.UseAuthentication();
+// Depois da autenticação (para que a política "sensitive-write" possa particionar por usuário) e antes da
+// autorização/antiforgery (para que uma requisição limitada nunca chegue a executar um handler).
+app.UseMiddleware<SensitiveOperationRateLimitingMiddleware>();
 app.UseAuthorization();
 app.MapRazorPages();
 

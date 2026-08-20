@@ -115,8 +115,8 @@ por `content_sha256`, que é o valor comparado ao SHA-256 calculado pelo store.
 - Download de evidência: `Cache-Control: no-store`, filename fixo, nenhuma entrada do cliente vira caminho
   físico, validação fail-closed do bundle + fingerprint SQL, logs sem caminho físico/segredo.
 
-> Ainda pendentes de hardening: **rate limiting** de login, gates de **SAST/DAST**, **coverage/mutation** e
-> revisão independente.
+> **Rate limiting fechado no Passo 8** (login e as três operações de escrita). Ainda pendentes: gates de
+> **SAST/DAST**, **coverage/mutation** e revisão independente.
 
 ## Nota sobre o dashboard
 
@@ -266,6 +266,24 @@ TOCTOU da onda na mesma transação. Detalhes e ameaças em `docs/security/threa
 **Conceito distinto de `IMappingStore`** (versões GERADAS/artefatos): aqui persiste-se a **RECEPÇÃO**, não uma
 versão utilizável. Nenhum byte bruto é gravado; nenhum artefato é criado; um CSV `Valid` **não** significa
 importação aprovada — o único efeito é a evidência de validação.
+
+## Passo 8 — Hardening, rate limiting, observabilidade e empacotamento on-premises
+
+Fechamento do Slice 4A (nenhum write-path novo, nenhuma migration, nenhuma tela nova):
+
+- **Rate limiting** nas quatro operações POST sensíveis já existentes (login, solicitar descoberta EV,
+  validar CSV de mapping, retry de job) — middleware dedicado, não o atributo nativo (ver justificativa e
+  tabela de políticas em `docs/security/threat-model-slice-04a.md`).
+- **Correlation ID por requisição** (`X-Correlation-Id`), log estruturado e métricas de latência/falhas/
+  operações (`System.Diagnostics.Metrics`, sem exportador obrigatório) — `RequestCorrelationMiddleware`.
+- **Teste automatizado** para o lado "indisponível" de `/health/ready` (503 quando o SQL Server obrigatório
+  está inacessível) — a rota já existia; o Passo 8 fecha a lacuna de cobertura.
+- **Empacotamento on-premises**: `builder.Host.UseWindowsService()` (pacote
+  `Microsoft.Extensions.Hosting.WindowsServices`) valida o caminho de Windows Service da baseline aprovada
+  (IIS ou Windows Service/Kestrel); NO-OP fora do Windows. Runbook operacional dedicado em
+  `docs/engineering/control-plane-onprem-deployment-runbook.md`.
+
+Detalhe completo (políticas, partições, threat-model delta) em `docs/security/threat-model-slice-04a.md`.
 
 ## Fora do escopo desta fatia
 

@@ -435,6 +435,16 @@ details.tech .tech-body { padding: 14px; }
     padding: 8px 10px; color: var(--ab-text); font-size: 13px; font-family: inherit; min-width: 150px;
 }
 .field input:focus, .field select:focus { outline: none; border-color: var(--ab-primary); box-shadow: 0 0 0 3px var(--ab-primary-soft); }
+
+/* Skip-link (Passo 8, acessibilidade): invisível até receber foco por teclado — permite pular a navegação
+   lateral/topbar e ir direto ao conteúdo principal. Padrão WCAG "Bypass Blocks". */
+.skip-link {
+    position: absolute; left: -9999px; top: 0; z-index: 1000;
+    background: var(--ab-primary); color: #fff; padding: 10px 16px; border-radius: 0 0 var(--ab-radius-sm) 0;
+    font-weight: 600; font-size: 13px; text-decoration: none;
+}
+.skip-link:focus { left: 0; }
+.work-inner:focus, .anon-main:focus { outline: none; }
 .field.actions { flex-direction: row; gap: 8px; align-items: center; }
 .pager { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
 .pager .count { color: var(--ab-text-faint); font-size: 12px; }

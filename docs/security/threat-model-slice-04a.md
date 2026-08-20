@@ -18,7 +18,7 @@ leitura) e a **identidade do portal**. Não há execução de exportação nem i
 | Elevação de privilégio (papel) | RBAC por papel; Administração exige `Administrator` e a trilha de auditoria exige `Auditor`/`Administrator` (política + `AuthorizeFolder`). Catálogo de papéis fechado por FK/CHECK no banco. |
 | Vazamento cross-tenant | As leituras de negócio ocorrem sob `SESSION_CONTEXT('tenant_id')` do usuário (RLS). A auditoria de login **não** está sob RLS (tabela de identidade) e é isolada por **filtro explícito** `tenant_id = @tenant`. Tenant vem da claim, nunca do cliente. Testes comprovam o isolamento (negócio e auditoria). |
 | Vazamento cross-project (IDOR) | Além da RLS por tenant, toda leitura de negócio filtra `project_id = @project` do usuário. Pedir transições de um job de outro projeto do mesmo tenant retorna vazio. Comprovado por teste tenant A/projeto 1 × tenant A/projeto 2. |
-| Roubo/força bruta de senha | PBKDF2-HMAC-SHA256, sal por usuário, 210k iterações, verificação em tempo constante. Usuário inexistente ainda executa uma derivação PBKDF2 dummy (equalização de timing — não revela existência do login). Falhas auditadas; mensagem genérica. Rate limiting: próximo incremento. |
+| Roubo/força bruta de senha | PBKDF2-HMAC-SHA256, sal por usuário, 210k iterações, verificação em tempo constante. Usuário inexistente ainda executa uma derivação PBKDF2 dummy (equalização de timing — não revela existência do login). Falhas auditadas; mensagem genérica. **Rate limiting fechado no Passo 8** (política "login": 5 requisições/minuto por endereço remoto). |
 | Sequestro de sessão | Cookie `HttpOnly`, `SameSite=Lax`; `SecurePolicy=Always` fora de dev. Fora de desenvolvimento, `UseHsts()`+`UseHttpsRedirection()` tornam o HTTPS obrigatório (fail-closed). Expiração deslizante de 8 h. |
 | CSRF | Antiforgery em todos os POST (login/logout). |
 | XSS / injeção de conteúdo externo | Página **autocontida** + **CSP** `default-src 'self'` (sem CDN/script externo); saída Razor codificada por padrão. Cabeçalhos `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. |
@@ -121,6 +121,57 @@ pertence ao incremento seguinte (6B) e será modelada ao ser implementada. As de
 Nenhuma senha, hash, cookie ou segredo é registrado. A auditoria de autenticação grava apenas login,
 resultado, motivo curto não sensível, endereço remoto, o escopo quando conhecido
 (tenant/projeto/usuário) e um `correlation_id` por tentativa.
+
+## Delta — Passo 8: hardening, rate limiting, observabilidade e empacotamento on-premises
+
+Fechamento do Slice 4A: nenhum write-path novo, nenhuma tela nova, nenhuma migration. Endurece a superfície
+HTTP já existente e fecha os itens que o próprio threat model já sinalizava como pendentes.
+
+**Rate limiting.** As quatro operações POST sensíveis do Slice 4A (login, solicitar descoberta EV, validar
+CSV de mapping, solicitar retry de job) passam a ter limite de requisições. Implementado como middleware
+dedicado (`SensitiveOperationRateLimitingMiddleware`) em vez do atributo nativo `[EnableRateLimiting]`: Razor
+Pages resolve o HANDLER específico (`OnPostXxxAsync`) **depois** do roteamento de endpoint, então um atributo
+aplicado a um handler não é observável pelo middleware de rate limiting nativo (que decide a partir dos
+metadados do ENDPOINT — a página inteira, não o handler). O middleware dedicado reconhece as quatro
+rotas/handlers por caminho + verbo + `?handler=`, com a mesma granularidade pretendida:
+
+| Política | Partição | Limite | Rotas |
+| --- | --- | --- | --- |
+| `login` | endereço remoto | 5/min | `POST /Account/Login` |
+| `sensitive-write` | usuário autenticado (`PortalClaims.UserId`) | 20/min | `POST /EnterpriseVault/Index?handler=RequestDiscovery`, `POST /Mapping/Index?handler=ValidateCsv`, `POST /Jobs/Details?handler=Retry` |
+
+Partições em memória (janela fixa, sem enfileiramento — estourar responde `429` imediatamente), consistente
+com a arquitetura de instância única on-premises aprovada — sem persistência, sem nova migration. O rate
+limiter roda ANTES da autorização/antiforgery/handler; uma requisição limitada nunca toca o store.
+
+**Correlation ID por requisição.** `RequestCorrelationMiddleware` é o primeiro middleware do pipeline: atribui
+(ou propaga, se o cliente já enviar `X-Correlation-Id` plausível — nunca usado para autorização/escopo) um
+identificador por requisição, devolvido no cabeçalho de resposta `X-Correlation-Id` e exibido na página de
+erro (`/Error`) para o operador referenciar ao suporte. Cobre toda requisição, inclusive redirecionamentos
+HTTPS e o caminho de exceção não tratada (`UseExceptionHandler`).
+
+**Logs estruturados e métricas.** O mesmo middleware registra uma linha de log estruturada por requisição
+(método, rota, status, duração, correlation ID — nunca corpo, query string, cookie, senha ou segredo) e
+alimenta `ControlPlaneMetrics` (`System.Diagnostics.Metrics`, sem exportador obrigatório): contagem de
+requisições, contagem de falhas (`status >= 400`) e histograma de latência, com tags de método e classe de
+status apenas — nenhuma tag de negócio/identidade.
+
+**Health check de indisponibilidade (verificado por teste).** `/health/ready` já retornava `503` quando o SQL
+Server obrigatório está inacessível (Passo 4A); o Passo 8 acrescenta o teste automatizado que prova esse
+caminho (`Slice4aHealthReadyUnavailableTests`), fechando a lacuna de cobertura — não havia, antes, nenhum
+teste que provasse o lado "indisponível". `/health/live` continua independente do banco.
+
+**Empacotamento on-premises.** `builder.Host.UseWindowsService()` foi adicionado (pacote
+`Microsoft.Extensions.Hosting.WindowsServices`, sem dependência de Azure/SaaS): permite hospedar o Control
+Plane como Windows Service; é NO-OP fora do Windows/fora de execução como serviço — não afeta `dotnet run`,
+`WebApplicationFactory` (testes) nem a hospedagem via IIS (que usa o módulo ASP.NET Core, caminho
+independente). Runbook de implantação em `docs/engineering/control-plane-onprem-deployment-runbook.md`.
+
+**Risco residual.** Autenticidade criptográfica do cursor keyset (HMAC/Data Protection) permanece fora deste
+Passo — como já registrado no delta do Passo 5, é hardening opcional que exige decisão sobre
+persistência/rotação de chaves e comportamento multi-instância; nada no cursor concede autoridade hoje (ver
+delta do Passo 5). Rate limiting é em memória por instância — um deployment futuro com múltiplas instâncias
+atrás de um load balancer precisaria de um backend compartilhado (fora do escopo de instância única aprovado).
 
 ## Delta — Frente UX/UI (Client Demo)
 

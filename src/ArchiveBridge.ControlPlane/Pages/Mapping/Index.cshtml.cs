@@ -148,6 +148,9 @@ public sealed class IndexModel(
     /// server-side. Fail-closed em todo caminho de erro, com auditoria da tentativa e SEM persistir bytes
     /// brutos do CSV em storage da aplicação (o buffer transitório do model binding de <see cref="IFormFile"/>
     /// é do framework, nunca escrito em evidence root/landing/staging).
+    /// Rate limiting (Passo 8): política "sensitive-write" (partição por usuário autenticado), aplicada por
+    /// <see cref="ArchiveBridge.ControlPlane.Composition.SensitiveOperationRateLimitingMiddleware"/> ANTES
+    /// deste handler ser alcançado.
     /// </summary>
     public async Task<IActionResult> OnPostValidateCsvAsync(
         Guid waveId, int contentCodePage, Guid idempotencyKey, IFormFile? file, CancellationToken cancellationToken)

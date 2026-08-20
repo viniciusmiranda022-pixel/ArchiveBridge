@@ -49,7 +49,11 @@ public sealed class LoginModel(
     {
     }
 
-    /// <summary>Processa a tentativa de autenticação.</summary>
+    /// <summary>
+    /// Processa a tentativa de autenticação. Rate limiting (Passo 8): protege contra força bruta —
+    /// aplicado por <see cref="ArchiveBridge.ControlPlane.Composition.SensitiveOperationRateLimitingMiddleware"/>
+    /// (política "login", ANTES deste handler ser alcançado).
+    /// </summary>
     public async Task<IActionResult> OnPostAsync(string? returnUrl, CancellationToken cancellationToken)
     {
         var correlationId = Guid.NewGuid();

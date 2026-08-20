@@ -54,6 +54,7 @@
     <link rel="stylesheet" href="~/css/site.css" asp-append-version="true" />
 </head>
 <body>
+<a class="skip-link" href="#main-content">Pular para o conteúdo principal</a>
 @if (authed)
 {
     <div class="app @(demo ? "has-demo" : null)">
@@ -118,7 +119,7 @@
         <div class="scrim"></div>
 
         <div class="work">
-            <div class="work-inner">
+            <div class="work-inner" id="main-content" tabindex="-1">
                 @RenderBody()
             </div>
             <footer class="foot">
@@ -131,7 +132,7 @@
 }
 else
 {
-    <main class="anon-main">
+    <main class="anon-main" id="main-content" tabindex="-1">
         @RenderBody()
     </main>
 }
