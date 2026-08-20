@@ -92,6 +92,9 @@ public sealed class IndexModel(
     /// <paramref name="environmentId"/> e <paramref name="idempotencyKey"/>; tenant/projeto vêm do principal,
     /// o solicitante é a identidade autenticada e a correlação é criada no servidor. Nenhum outro campo do
     /// formulário é vinculado. Fail-closed em todo caminho de erro, com auditoria da tentativa.
+    /// Rate limiting (Passo 8): política "sensitive-write" (partição por usuário autenticado), aplicada por
+    /// <see cref="ArchiveBridge.ControlPlane.Composition.SensitiveOperationRateLimitingMiddleware"/> ANTES
+    /// deste handler ser alcançado.
     /// </summary>
     public async Task<IActionResult> OnPostRequestDiscoveryAsync(
         Guid environmentId, Guid idempotencyKey, CancellationToken cancellationToken)

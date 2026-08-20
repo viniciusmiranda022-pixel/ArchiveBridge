@@ -128,6 +128,9 @@ public sealed class DetailsModel(
     /// <paramref name="jobId"/> é entrada NÃO CONFIÁVEL — é re-resolvido dentro do escopo autorizado pela
     /// própria consulta/store (cross-tenant/cross-project é indistinguível de inexistente). Fail-closed em
     /// todo caminho de erro, com auditoria da tentativa.
+    /// Rate limiting (Passo 8): política "sensitive-write" (partição por usuário autenticado), aplicada por
+    /// <see cref="ArchiveBridge.ControlPlane.Composition.SensitiveOperationRateLimitingMiddleware"/> ANTES
+    /// deste handler ser alcançado.
     /// </summary>
     public async Task<IActionResult> OnPostRetryAsync(Guid jobId, Guid idempotencyKey, CancellationToken cancellationToken)
     {

@@ -11,4 +11,10 @@
     <ProjectReference Include="..\ArchiveBridge.Infrastructure\ArchiveBridge.Infrastructure.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Empacotamento on-premises (Passo 8): permite hospedar como Windows Service (baseline aceita: IIS ou
+         Windows Service/Kestrel). Pacote da Microsoft, sem dependência de Azure/SaaS; NO-OP fora do Windows. -->
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.0" />
+  </ItemGroup>
+
 </Project>

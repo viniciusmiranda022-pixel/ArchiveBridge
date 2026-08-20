@@ -1,3 +1,4 @@
+using ArchiveBridge.ControlPlane.Composition;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
 
@@ -22,9 +23,17 @@ public sealed class ErrorModel : PageModel
     /// <summary>Variante visual do cartão de aviso.</summary>
     public string Variant { get; private set; } = "danger";
 
+    /// <summary>
+    /// Correlation ID da requisição que originou o erro (Passo 8), atribuído por
+    /// <see cref="RequestCorrelationMiddleware"/>. Não é um detalhe interno — é a referência que o operador
+    /// pode informar ao suporte para localizar a linha correspondente nos logs estruturados do servidor.
+    /// </summary>
+    public string? CorrelationId { get; private set; }
+
     /// <summary>Resolve o estado a partir do código informado (query) ou do status corrente da resposta.</summary>
     public void OnGet()
     {
+        CorrelationId = HttpContext.GetCorrelationId();
         var code = HttpContext.Response.StatusCode;
         var raw = Request.Query["code"].ToString();
         if (int.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var parsed)

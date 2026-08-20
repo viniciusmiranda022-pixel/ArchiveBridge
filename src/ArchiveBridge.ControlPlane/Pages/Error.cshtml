@@ -10,6 +10,10 @@
         <h1>@Model.Heading</h1>
         <p>@Model.Message</p>
         <p class="code">HTTP @Model.Code</p>
+        @if (!string.IsNullOrEmpty(Model.CorrelationId))
+        {
+            <p class="code">Correlação: @Model.CorrelationId</p>
+        }
         <a class="btn primary" asp-page="/Index">Voltar ao início</a>
     </div>
 </div>
