@@ -38,8 +38,18 @@ namespace ArchiveBridge.Infrastructure.PstProcessing;
 /// plataforma) eliminaria a janela por completo, mas exige interop específico de SO sem ADR aceito até
 /// este Passo. Qualquer reparse point detectado em qualquer uma das duas checagens falha fechado como
 /// <see cref="PstStructuralDiagnostic.ReadError"/> — nunca lê nem hasheia o conteúdo.
+///
+/// FRONTEIRA DE <see cref="PstStorageOptions.MaxSizeBytes"/> (corrigida em AB-4B-003): o
+/// <see cref="FileInfo.Length"/> consultado antes de abrir o stream é APENAS um fast-fail — nunca a
+/// fronteira de segurança, porque o arquivo pode crescer/ser substituído entre esse "stat" e a abertura
+/// real (janela TOCTOU stat→open). A fronteira de fato é reforçada DUAS vezes sobre o stream já aberto:
+/// (1) revalidando <c>stream.Length</c> antes de ler qualquer byte, quando o stream suporta expor um
+/// tamanho; e (2), como autoridade FINAL — válida mesmo que a metadata prévia tenha mentido ou o stream não
+/// suporte <c>Length</c> — verificando o total efetivamente lido a CADA chunk do loop de leitura, abortando
+/// imediatamente com <see cref="PstInspectionLimitExceededException"/> assim que exceder o limite, antes de
+/// terminar o hash. Nenhum hash parcial de um artefato acima do limite é jamais observado ou devolvido.
 /// </summary>
-public sealed class HeaderOnlyPstInspectionEngine(IPstCustodyStore custodyStore, PstStorageOptions options) : IPstEngine
+public sealed class HeaderOnlyPstInspectionEngine : IPstEngine
 {
     // MS-PST HEADER (offsets 0x00-0x0B, comuns às variantes ANSI e Unicode):
     //   dwMagic (4 bytes, offset 0)      = 0x21 0x42 0x44 0x4E ("!BDN")
@@ -48,12 +58,37 @@ public sealed class HeaderOnlyPstInspectionEngine(IPstCustodyStore custodyStore,
     //   wVer (2 bytes, offset 10, little-endian): 14/15 = ANSI 97-2002; 23 = Unicode 2003-2010;
     //     36/37 = Unicode 4K (2013+)
     private const int HeaderPrefixLength = 12;
-    private const int StreamBufferSize = 4 * 1024 * 1024;
+
+    // internal (não private): reaproveitado por PhysicalPstArtifactStreamFactory como tamanho de buffer da
+    // abertura real do FileStream — mantém o MESMO valor usado antes de AB-4B-003, uma única fonte de verdade.
+    internal const int StreamBufferSize = 4 * 1024 * 1024;
     private static readonly byte[] ExpectedMagic = [0x21, 0x42, 0x44, 0x4E];
     private static readonly byte[] ExpectedClientMagic = [0x53, 0x4D];
 
-    private readonly IPstCustodyStore _custodyStore = custodyStore;
-    private readonly PstStorageOptions _options = options;
+    private readonly IPstCustodyStore _custodyStore;
+    private readonly PstStorageOptions _options;
+    private readonly IPstArtifactStreamFactory _streamFactory;
+
+    /// <summary>Constrói a engine com a factory física padrão de stream (uso normal em produção/composition root).</summary>
+    public HeaderOnlyPstInspectionEngine(IPstCustodyStore custodyStore, PstStorageOptions options)
+        : this(custodyStore, options, PhysicalPstArtifactStreamFactory.Instance)
+    {
+    }
+
+    /// <summary>
+    /// Construtor com seam de <see cref="IPstArtifactStreamFactory"/> injetável. Visível apenas dentro do
+    /// assembly (mais <c>InternalsVisibleTo</c> para <c>ArchiveBridge.Integration.Tests</c>) — usado SOMENTE
+    /// por testes que provam que <see cref="PstStorageOptions.MaxSizeBytes"/> é reforçado sobre o stream
+    /// EFETIVAMENTE lido, e não apenas sobre a metadata de <see cref="FileInfo"/> consultada antes da
+    /// abertura (AB-4B-003). Nunca usado pelo composition root — a sobrecarga pública acima sempre usa a
+    /// factory física real.
+    /// </summary>
+    internal HeaderOnlyPstInspectionEngine(IPstCustodyStore custodyStore, PstStorageOptions options, IPstArtifactStreamFactory streamFactory)
+    {
+        _custodyStore = custodyStore;
+        _options = options;
+        _streamFactory = streamFactory;
+    }
 
     /// <inheritdoc />
     public string EngineName => "ArchiveBridge.HeaderOnlyPstInspector";
@@ -117,16 +152,13 @@ public sealed class HeaderOnlyPstInspectionEngine(IPstCustodyStore custodyStore,
 
         if (fileInfo.Length > _options.MaxSizeBytes)
         {
+            // Fast-fail apenas: uma otimização para rejeitar cedo sem sequer abrir o stream. NUNCA é a
+            // fronteira de segurança final — ver revalidação sobre o stream efetivamente aberto/lido abaixo
+            // (AB-4B-003: a metadata consultada aqui pode estar desatualizada por uma janela stat→open).
             throw new PstInspectionLimitExceededException("MAX_SIZE_EXCEEDED");
         }
 
-        await using var stream = new FileStream(
-            absolutePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            StreamBufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using var stream = _streamFactory.OpenRead(absolutePath);
 
         // Segunda checagem de contenção/reparse (ver doc da classe): estreita, mas não elimina, a janela
         // TOCTOU entre a checagem original (antes do FileStream acima) e o início da leitura. Qualquer
@@ -141,6 +173,29 @@ public sealed class HeaderOnlyPstInspectionEngine(IPstCustodyStore custodyStore,
             return ReadErrorResult();
         }
 
+        // Revalidação do limite sobre o stream JÁ ABERTO (AB-4B-003), quando o stream suporta expor um
+        // tamanho: reforça a fronteira antes de ler qualquer byte, cobrindo o caso em que o arquivo cresceu
+        // entre o FileInfo.Length acima (fast-fail) e a abertura do FileStream. Streams que não suportam
+        // Length (CanSeek == false) simplesmente pulam esta checagem — o loop de leitura abaixo é a
+        // autoridade final e nunca depende desta revalidação para fechar a fronteira.
+        if (stream.CanSeek)
+        {
+            long revalidatedLength;
+            try
+            {
+                revalidatedLength = stream.Length;
+            }
+            catch (NotSupportedException)
+            {
+                revalidatedLength = -1;
+            }
+
+            if (revalidatedLength > _options.MaxSizeBytes)
+            {
+                throw new PstInspectionLimitExceededException("MAX_SIZE_EXCEEDED");
+            }
+        }
+
         var header = new byte[HeaderPrefixLength];
         var headerLength = 0;
         var buffer = new byte[StreamBufferSize];
@@ -150,8 +205,19 @@ public sealed class HeaderOnlyPstInspectionEngine(IPstCustodyStore custodyStore,
         int read;
         while ((read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
         {
-            sha256.AppendData(buffer.AsSpan(0, read));
             totalRead += read;
+
+            // Autoridade FINAL do limite (AB-4B-003): aplicada sobre os bytes REALMENTE lidos deste stream,
+            // a cada chunk — nunca confia apenas no FileInfo/Length prévios, que podem estar desatualizados
+            // ou (em streams que não suportam Length) simplesmente ausentes. Aborta imediatamente ao exceder,
+            // ANTES de terminar o hash — nenhum hash parcial de um artefato acima do limite é observado ou
+            // devolvido como resultado.
+            if (totalRead > _options.MaxSizeBytes)
+            {
+                throw new PstInspectionLimitExceededException("MAX_SIZE_EXCEEDED");
+            }
+
+            sha256.AppendData(buffer.AsSpan(0, read));
 
             if (headerLength < HeaderPrefixLength)
             {
