@@ -87,10 +87,21 @@ passo 1, reconfere e converge sem reescrever, então persiste o checkpoint 3 que
 
 ## Idempotência, concorrência e órfãos
 
-- **Réplay barato**: uma execução canônica já persistida (checkpoint 3) é devolvida direto pela consulta SQL
-  — o writer NUNCA é reinvocado, nenhum arquivo é reaberto (`IdempotentReplayReturnsTheSameCanonicalExecutionWithoutRewritingTheOutput`).
-  Este é o caminho rápido; a reconferência do passo 1 do protocolo acima só entra em jogo quando o checkpoint
-  3 ainda não existe (crash-recovery), nunca no réplay comum.
+- **Réplay idempotente e SOMENTE LEITURA**: uma execução canônica já persistida (checkpoint 3) é devolvida
+  sem reexecutar o **writer** — nenhuma escrita, nenhum efeito duplicado
+  (`IdempotentReplayReturnsTheSameCanonicalExecutionWithoutRewritingTheOutput`). Mas o registro persistido
+  sozinho NUNCA é prova suficiente de que o bundle físico ainda existe/confere: antes de devolvê-lo, a
+  Application chama `IPartitionPartVerifier.VerifyAsync`, que reabre e reconfere hash/tamanho de `part.pst`,
+  o sidecar `part.sha256` e o conteúdo estrutural de `manifest.json` contra o registro persistido — sem
+  escrever nada. Tampering/corrupção/remoção do output DEPOIS que o checkpoint 3 já existe é detectado aqui
+  e falha fechado com `PartitionExecutionOutputTamperedException`, nunca reconstruído silenciosamente
+  (correção AB-4B-007;
+  `ReplayAfterThePersistedCheckpointDetectsByteAlterationOfThePartFileAndFailsClosed`,
+  `ReplayAfterThePersistedCheckpointDetectsARemovedBundleFileAndFailsClosedWithoutRecreatingIt`,
+  `ReplayAfterThePersistedCheckpointDetectsManifestOnlyTamperingEvenWithAValidPartAndSidecar`). A
+  reconferência do passo 1 do protocolo do writer (acima) é um mecanismo SEPARADO e só entra em jogo quando o
+  checkpoint 3 ainda não existe (crash-recovery) — o verificador é quem cobre o caminho onde o checkpoint SQL
+  já existe.
 - **Concorrência**: 6 execuções simultâneas do mesmo plano convergem para exatamente uma linha canônica e um
   único arquivo final, byte-for-byte idêntico à origem
   (`ConcurrentExecutionOfTheSamePlanConvergesToExactlyOneCanonicalResult`). O perdedor da corrida de INSERT
@@ -116,23 +127,27 @@ Application.PstProcessing
      │
      ├── IPartitionPlanStore.FindByIdAsync(scope, planId)     ─── anti-IDOR: NotFound indistinguível
      ├── EnsureEligible(plan)                                 ─── fail-closed ANTES de qualquer I/O
-     ├── IPartitionExecutionStore.FindCanonicalAsync           ─── réplay idempotente barato
+     ├── IPartitionExecutionStore.FindCanonicalAsync           ─── réplay idempotente (sem I/O de escrita)
+     ├── IPartitionPartVerifier.VerifyAsync(...)               ─── revalida fisicamente ANTES de devolver o réplay (AB-4B-007)
      ├── IPstCustodyStore.FindAsync(scope, artifact)           ─── staleness: custódia atual vs. plano
      ├── IPartitionPartWriter.ExecuteAsync(...)                ─── I/O real, isolado atrás da porta
      └── IPartitionExecutionStore.SaveAsync                    ─── checkpoint 3, append-only
 
 Infrastructure.PstProcessing (adapter substituível)
-  LocalSinglePartExecutionWriter  ── único IPartitionPartWriter deste Passo; stage→verify→publish→reverify
-  SqlPartitionExecutionStore      ── SQL Server, RLS + filtro project_id, INSERT único (toda linha é canônica)
-  TempStagingReconciler           ── manutenção explícita, nunca automática
+  LocalSinglePartExecutionWriter    ── único IPartitionPartWriter deste Passo; stage→verify→publish→reverify
+  LocalSinglePartExecutionVerifier  ── único IPartitionPartVerifier deste Passo; revalida réplay, somente leitura
+  PartitionOutputBundleValidator    ── validador de bundle compartilhado por writer e verifier (mesmas checagens)
+  SqlPartitionExecutionStore        ── SQL Server, RLS + filtro project_id, INSERT único (toda linha é canônica)
+  TempStagingReconciler             ── manutenção explícita, nunca automática
 
 Domain.PstProcessing
   PartitionExecutionId · PartitionExecutorIdentity · PartitionExecutionRecord (Complete/Rehydrate)
 ```
 
-- **Substituibilidade**: `IPartitionPartWriter` é a fronteira, no mesmo espírito de `IPartitionPlanner`
-  (Passo 2) e `IPstEngine` (Passo 1). Quando um split real multi-part for autorizado por ADR, um writer
-  semântico implementa a MESMA porta; nada em Domain/Application muda.
+- **Substituibilidade**: `IPartitionPartWriter` e `IPartitionPartVerifier` são as fronteiras, no mesmo
+  espírito de `IPartitionPlanner` (Passo 2) e `IPstEngine` (Passo 1). Quando um split real multi-part for
+  autorizado por ADR, um writer/verifier semântico implementa as MESMAS portas; nada em Domain/Application
+  muda.
 - Domain/Contracts/Application permanecem independentes de parser/fornecedor e de ASP.NET
   (`DependencyRuleTests`).
 
@@ -216,7 +231,7 @@ origem.
 | 5 | Réplay idempotente do mesmo plano | `IdempotentReplayReturnsTheSameCanonicalExecutionWithoutRewritingTheOutput` |
 | 6 | Concorrência converge para um único resultado | `ConcurrentExecutionOfTheSamePlanConvergesToExactlyOneCanonicalResult` |
 | 7 | Crash-safety em torno dos 3 checkpoints | `ACrashAfterFinalizationButBeforeThePersistCheckpointConvergesWithoutDuplicating`, `TamperingTheExistingOutputIsDetectedOnReadbackAndNeverSilentlyOverwritten` |
-| 8 | Tampering detectado no replay/readback, nunca sobrescrito | `TamperingTheExistingOutputIsDetectedOnReadbackAndNeverSilentlyOverwritten` |
+| 8 | Tampering detectado no replay/readback, nunca sobrescrito — inclusive DEPOIS que o checkpoint SQL já existe (byte alterado, arquivo do bundle removido, ou só o manifesto adulterado) | `TamperingTheExistingOutputIsDetectedOnReadbackAndNeverSilentlyOverwritten`, `ReplayAfterThePersistedCheckpointDetectsByteAlterationOfThePartFileAndFailsClosed`, `ReplayAfterThePersistedCheckpointDetectsARemovedBundleFileAndFailsClosedWithoutRecreatingIt`, `ReplayAfterThePersistedCheckpointDetectsManifestOnlyTamperingEvenWithAValidPartAndSidecar` |
 | 9 | Temp/staging órfão nunca confundido com sucesso; reconciliável | `AnOrphanStagingDirectoryIsNeverConfusedWithACompletedPartAndIsSafelyReconciled` |
 | 10 | Manifesto sem PII/caminho/segredo | `ThePersistedExecutionAndManifestCarryNoPathFileNameOrMailboxIdentifier` |
 | 11 | Domain/Application independentes de parser/vendor/ASP.NET | `DependencyRuleTests` (inalterados, verdes) |

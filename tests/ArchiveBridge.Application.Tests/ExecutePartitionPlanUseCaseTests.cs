@@ -52,8 +52,9 @@ public sealed class ExecutePartitionPlanUseCaseTests
         FakePstCustodyStore custodyStore,
         FakePartitionPlanStore planStore,
         FakePartitionExecutionStore executionStore,
-        FakePartitionPartWriter? writer = null) =>
-        new(custodyStore, planStore, executionStore, writer ?? new FakePartitionPartWriter(), new StubClock(Now));
+        FakePartitionPartWriter? writer = null,
+        FakePartitionPartVerifier? verifier = null) =>
+        new(custodyStore, planStore, executionStore, writer ?? new FakePartitionPartWriter(), verifier ?? new FakePartitionPartVerifier(), new StubClock(Now));
 
     // ---- Elegibilidade: só SinglePartWithinTarget canônico executa ----
 
@@ -228,13 +229,47 @@ public sealed class ExecutePartitionPlanUseCaseTests
         var planStore = new FakePartitionPlanStore(plan);
         var executionStore = new FakePartitionExecutionStore(existing);
         var writer = new FakePartitionPartWriter();
+        var verifier = new FakePartitionPartVerifier();
 
-        var result = await UseCase(custodyStore, planStore, executionStore, writer)
+        var result = await UseCase(custodyStore, planStore, executionStore, writer, verifier)
             .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
 
         Assert.Equal(existing.Id, result.Id);
-        Assert.Equal(0, writer.ExecuteCount); // réplay: nenhum I/O reexecutado.
+        Assert.Equal(0, writer.ExecuteCount); // réplay: nenhum I/O de ESCRITA reexecutado.
         Assert.Equal(0, executionStore.SaveCount);
+        Assert.Equal(1, verifier.VerifyCount); // mas o bundle físico É revalidado (somente leitura) antes do réplay.
+        Assert.Equal(existing.Id, verifier.LastVerified?.Id);
+    }
+
+    [Fact]
+    public async Task TamperedPersistedOutputFailsClosedOnReplayWithoutTheWriterEverRunning()
+    {
+        var scope = NewScope();
+        var hash = Hash("tampered-replay");
+        var custody = Custody(scope, hash, size: 2048);
+        var inspection = Canonical(scope, custody.Id, hash, 2048);
+        var plan = PlannedSinglePart(custody, inspection);
+        var part = plan.Parts[0];
+
+        var existing = PartitionExecutionRecord.Complete(
+            PartitionExecutionId.New(), scope.Tenant, scope.Project, custody.Id, plan.Id, part.Id, plan.PlanHash,
+            part.Sequence, part.PartKey, hash, 2048, hash, 2048, new PartitionExecutorIdentity("Executor", "1.0"),
+            CorrelationId.New(), Now, Now);
+
+        var custodyStore = new FakePstCustodyStore(scope, custody.Id, custody);
+        var planStore = new FakePartitionPlanStore(plan);
+        var executionStore = new FakePartitionExecutionStore(existing);
+        var writer = new FakePartitionPartWriter();
+        // Simula um bundle físico removido/adulterado depois que o checkpoint SQL já existia.
+        var verifier = new FakePartitionPartVerifier(throwsTampered: true);
+
+        await Assert.ThrowsAsync<PartitionExecutionOutputTamperedException>(() =>
+            UseCase(custodyStore, planStore, executionStore, writer, verifier)
+                .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None));
+
+        Assert.Equal(0, writer.ExecuteCount); // fail-closed: nunca tenta reconstruir o output.
+        Assert.Equal(0, executionStore.SaveCount);
+        Assert.Equal(1, verifier.VerifyCount);
     }
 
     [Fact]
@@ -256,12 +291,15 @@ public sealed class ExecutePartitionPlanUseCaseTests
         var planStore = new FakePartitionPlanStore(plan);
         var executionStore = new FakePartitionExecutionStore(canonical: null, canonicalAfterConflict: racedWinner, throwOnFirstSave: true);
         var writer = new FakePartitionPartWriter(new PartitionPartArtifact(hash, 2048));
+        var verifier = new FakePartitionPartVerifier();
 
-        var result = await UseCase(custodyStore, planStore, executionStore, writer)
+        var result = await UseCase(custodyStore, planStore, executionStore, writer, verifier)
             .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
 
         Assert.Equal(racedWinner.Id, result.Id);
         Assert.Equal(1, writer.ExecuteCount); // ainda copiou (idempotente no filesystem) — perdeu só a corrida do INSERT.
+        Assert.Equal(1, verifier.VerifyCount); // o vencedor da corrida também é revalidado antes de ser devolvido.
+        Assert.Equal(racedWinner.Id, verifier.LastVerified?.Id);
     }
 
     [Fact]
@@ -390,6 +428,33 @@ public sealed class ExecutePartitionPlanUseCaseTests
         {
             ExecuteCount++;
             return Task.FromResult(result ?? new PartitionPartArtifact(source.RegisteredHash, source.RegisteredSizeBytes));
+        }
+    }
+
+    /// <summary>
+    /// Duplo de teste do revalidador físico (AB-4B-007). Por padrão "confirma" qualquer execução persistida
+    /// (simula um bundle íntegro); com <see cref="_throwsTampered"/> simula um bundle removido/adulterado
+    /// depois que o checkpoint SQL já existia — exatamente o cenário que a correção precisa recusar fechado.
+    /// </summary>
+    private sealed class FakePartitionPartVerifier(bool throwsTampered = false) : IPartitionPartVerifier
+    {
+        private readonly bool _throwsTampered = throwsTampered;
+
+        public int VerifyCount { get; private set; }
+
+        public PartitionExecutionRecord? LastVerified { get; private set; }
+
+        public Task VerifyAsync(TenantScope scope, PartitionExecutionRecord execution, CancellationToken cancellationToken)
+        {
+            VerifyCount++;
+            LastVerified = execution;
+            if (_throwsTampered)
+            {
+                throw new PartitionExecutionOutputTamperedException(
+                    "Bundle simulado como removido/adulterado depois do checkpoint SQL (duplo de teste).");
+            }
+
+            return Task.CompletedTask;
         }
     }
 }

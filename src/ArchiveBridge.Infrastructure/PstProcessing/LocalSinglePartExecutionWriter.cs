@@ -39,14 +39,7 @@ namespace ArchiveBridge.Infrastructure.PstProcessing;
 /// </summary>
 public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
 {
-    private const string PartFileName = "part.pst";
-    private const string ShaFileName = "part.sha256";
-    private const string ManifestFileName = "manifest.json";
     private const string StagingFolder = ".staging";
-
-    // internal (não private): reaproveitado pelos testes de infraestrutura, mesmo padrão de
-    // HeaderOnlyPstInspectionEngine.StreamBufferSize.
-    internal const int StreamBufferSize = 4 * 1024 * 1024;
 
     private readonly PstStorageOptions _sourceOptions;
     private readonly PartitionExecutionOutputOptions _outputOptions;
@@ -98,6 +91,9 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
         var expectedSize = plan.Source.SourceSizeBytes
             ?? throw new PartitionExecutionNotEligibleException("Plano sem tamanho de origem observado.");
         var expectedHash = plan.Source.SourceHash;
+        var expectedManifest = new PartitionOutputBundleValidator.ExpectedManifest(
+            scope.Tenant.Value, scope.Project.Value, plan.Id.Value, part.Id.Value, plan.PlanHash, part.Sequence,
+            part.PartKey, ExecutorName, ExecutorVersion);
 
         var finalDir = VersionDir(scope, plan, part);
         if (Directory.Exists(finalDir))
@@ -105,7 +101,8 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
             // Réplay idempotente/convergência de concorrência: o output canônico já existe neste caminho
             // determinístico. Reabre e reconfere ANTES de confiar — nunca aceita a mera existência do
             // diretório como prova de sucesso.
-            return await ValidateBundleAsync(finalDir, expectedHash, expectedSize, cancellationToken).ConfigureAwait(false);
+            return await PartitionOutputBundleValidator.ValidateAsync(
+                finalDir, expectedHash, expectedSize, expectedManifest, cancellationToken).ConfigureAwait(false);
         }
 
         EnsurePreflightSpace(expectedSize);
@@ -122,7 +119,7 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
 
         try
         {
-            var stagedPartPath = Path.Combine(stagingDir, PartFileName);
+            var stagedPartPath = Path.Combine(stagingDir, PartitionOutputBundleValidator.PartFileName);
             var (writtenHash, writtenSize) = await CopySourceToStagingAsync(
                 sourcePath, stagedPartPath, expectedSize, timeoutSource.Token).ConfigureAwait(false);
 
@@ -137,7 +134,7 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
             // Checkpoint 1 (crash-safety): reabre o arquivo de STAGING recém-escrito e reconfere de forma
             // totalmente independente do hash calculado durante a escrita — nenhum output segue adiante sem
             // esta confirmação.
-            var (rehash, resize) = await HashFileAsync(stagedPartPath, timeoutSource.Token).ConfigureAwait(false);
+            var (rehash, resize) = await PartitionOutputBundleValidator.HashFileAsync(stagedPartPath, timeoutSource.Token).ConfigureAwait(false);
             if (rehash != expectedHash || resize != expectedSize)
             {
                 throw new PartitionExecutionOutputTamperedException(
@@ -158,14 +155,16 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
             {
                 // Corrida: outra execução concorrente do MESMO plano/parte já publicou primeiro. Converge
                 // para o resultado dela (após reconferir) em vez de duplicar/sobrescrever.
-                var raced = await ValidateBundleAsync(finalDir, expectedHash, expectedSize, cancellationToken).ConfigureAwait(false);
+                var raced = await PartitionOutputBundleValidator.ValidateAsync(
+                    finalDir, expectedHash, expectedSize, expectedManifest, cancellationToken).ConfigureAwait(false);
                 CleanupStagingBestEffort(stagingDir);
                 return raced;
             }
 
             // Reabertura/reinspeção FINAL — só depois desta confirmação a Application publica o checkpoint 3
             // (o manifesto SQL). "PartCreated somente após sucesso" (runbook §20.4).
-            return await ValidateBundleAsync(finalDir, expectedHash, expectedSize, cancellationToken).ConfigureAwait(false);
+            return await PartitionOutputBundleValidator.ValidateAsync(
+                finalDir, expectedHash, expectedSize, expectedManifest, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -244,10 +243,10 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
         }
 
         await using var destination = new FileStream(
-            stagedPartPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, StreamBufferSize, useAsync: true);
+            stagedPartPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, PartitionOutputBundleValidator.StreamBufferSize, useAsync: true);
 
         using var sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        var buffer = new byte[StreamBufferSize];
+        var buffer = new byte[PartitionOutputBundleValidator.StreamBufferSize];
         long total = 0;
 
         int read;
@@ -271,87 +270,19 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
         return (new Sha256Hash(Convert.ToHexStringLower(sha256.GetHashAndReset())), total);
     }
 
-    private static async Task<(Sha256Hash Hash, long Size)> HashFileAsync(string path, CancellationToken cancellationToken)
-    {
-        await using var stream = new FileStream(
-            path, FileMode.Open, FileAccess.Read, FileShare.Read, StreamBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        using var sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        var buffer = new byte[StreamBufferSize];
-        long total = 0;
-
-        int read;
-        while ((read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
-        {
-            total += read;
-            sha256.AppendData(buffer.AsSpan(0, read));
-        }
-
-        return (new Sha256Hash(Convert.ToHexStringLower(sha256.GetHashAndReset())), total);
-    }
-
-    // Validação do CONJUNTO completo de um bundle publicado (fonte única para réplay/convergência e para a
-    // reabertura final antes de devolver sucesso). Exige os três arquivos (e SÓ eles), reconfere hash/
-    // tamanho do part.pst e o sidecar sha256 contra o esperado (o hash/tamanho do PLANO, não o que o
-    // manifesto AFIRMA — o manifesto é evidência, nunca a fonte de verdade da verificação).
-    private static async Task<PartitionPartArtifact> ValidateBundleAsync(
-        string finalDir, Sha256Hash expectedHash, long expectedSize, CancellationToken cancellationToken)
-    {
-        var partPath = Path.Combine(finalDir, PartFileName);
-        var shaPath = Path.Combine(finalDir, ShaFileName);
-        var manifestPath = Path.Combine(finalDir, ManifestFileName);
-        if (!File.Exists(partPath) || !File.Exists(shaPath) || !File.Exists(manifestPath))
-        {
-            throw new PartitionExecutionOutputTamperedException(
-                "Conjunto de output incompleto (arquivos ausentes); recusado (fail-closed).");
-        }
-
-        EnsureNoUnexpectedEntries(finalDir);
-
-        var (hash, size) = await HashFileAsync(partPath, cancellationToken).ConfigureAwait(false);
-        if (hash != expectedHash || size != expectedSize)
-        {
-            throw new PartitionExecutionOutputTamperedException(
-                "Output existente no caminho canônico diverge do esperado; adulteração/corrupção detectada (fail-closed, nunca sobrescrito).");
-        }
-
-        var shaContent = (await File.ReadAllTextAsync(shaPath, cancellationToken).ConfigureAwait(false)).Trim();
-        if (!string.Equals(shaContent, hash.Value, StringComparison.Ordinal))
-        {
-            throw new PartitionExecutionOutputTamperedException(
-                "part.sha256 diverge do conteúdo de part.pst; artefato adulterado (fail-closed).");
-        }
-
-        return new PartitionPartArtifact(hash, size);
-    }
-
-    // O bundle publicado deve conter EXATAMENTE os três arquivos esperados — nenhum arquivo/subdiretório
-    // inesperado (defesa contra material injetado no diretório da versão).
-    private static void EnsureNoUnexpectedEntries(string finalDir)
-    {
-        foreach (var entry in Directory.EnumerateFileSystemEntries(finalDir))
-        {
-            var name = Path.GetFileName(entry);
-            var expected = string.Equals(name, PartFileName, StringComparison.Ordinal)
-                || string.Equals(name, ShaFileName, StringComparison.Ordinal)
-                || string.Equals(name, ManifestFileName, StringComparison.Ordinal);
-            if (!expected || Directory.Exists(entry))
-            {
-                throw new PartitionExecutionOutputTamperedException(
-                    "Bundle de output contém entrada inesperada; recusado (fail-closed).");
-            }
-        }
-    }
-
     private static async Task FlushSidecarsAsync(
         string stagingDir, Sha256Hash hash, long size, TenantScope scope, PartitionPlan plan, PartitionPlanPart part,
         CancellationToken cancellationToken)
     {
-        await FlushToDiskAsync(Path.Combine(stagingDir, ShaFileName), Encoding.UTF8.GetBytes(hash.Value + "\n"), cancellationToken)
+        await FlushToDiskAsync(
+                Path.Combine(stagingDir, PartitionOutputBundleValidator.ShaFileName),
+                Encoding.UTF8.GetBytes(hash.Value + "\n"), cancellationToken)
             .ConfigureAwait(false);
 
         // Manifesto: APENAS IDs opacos, hashes e metadados de execução — nunca caminho, UPN, assunto, corpo,
-        // nome de anexo ou segredo (work order AB-4B-006, item 7).
-        var manifest = new PartitionExecutionManifestJson(
+        // nome de anexo ou segredo (work order AB-4B-006, item 7). Mesma forma serializada usada na
+        // revalidação (writer e verifier, correção AB-4B-007) — ver PartitionOutputBundleValidator.
+        var manifest = new PartitionOutputBundleValidator.PartitionExecutionManifestJson(
             scope.Tenant.Value,
             scope.Project.Value,
             plan.Id.Value,
@@ -363,7 +294,9 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
             size,
             "ArchiveBridge.SinglePartByteCopyExecutor",
             "1.0.0");
-        await FlushToDiskAsync(Path.Combine(stagingDir, ManifestFileName), JsonSerializer.SerializeToUtf8Bytes(manifest), cancellationToken)
+        await FlushToDiskAsync(
+                Path.Combine(stagingDir, PartitionOutputBundleValidator.ManifestFileName),
+                JsonSerializer.SerializeToUtf8Bytes(manifest), cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -396,27 +329,7 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
         }
     }
 
-    private string VersionDir(TenantScope scope, PartitionPlan plan, PartitionPlanPart part)
-    {
-        var combined = Path.Combine(
-            _outputOptions.RootPath,
-            scope.Tenant.Value.ToString("N"),
-            scope.Project.Value.ToString("N"),
-            plan.Id.Value.ToString("N"),
-            part.PartKey.Value);
-        return ArtifactPathContainment.EnsureContained(_outputOptions.RootPath, combined);
-    }
-
-    private sealed record PartitionExecutionManifestJson(
-        Guid Tenant,
-        Guid Project,
-        Guid Plan,
-        Guid Part,
-        string PlanHash,
-        int PartSequence,
-        string PartKey,
-        string OutputHash,
-        long OutputSizeBytes,
-        string ExecutorName,
-        string ExecutorVersion);
+    private string VersionDir(TenantScope scope, PartitionPlan plan, PartitionPlanPart part) =>
+        PartitionOutputBundleValidator.VersionDir(
+            _outputOptions.RootPath, scope.Tenant.Value, scope.Project.Value, plan.Id.Value, part.PartKey.Value);
 }

@@ -134,11 +134,17 @@ public sealed class Slice4bPartitionExecutionTests(SqlServerFixture fixture)
             Slice4bPstProcessingSupport.PartitionOutputRoot(fixture), scope.Tenant.Value.ToString("N"),
             scope.Project.Value.ToString("N"), plan.Id.Value.ToString("N"), plan.Parts[0].PartKey.Value);
         var writeTimeAfterFirst = File.GetLastWriteTimeUtc(Path.Combine(finalDir, "part.pst"));
+        var shaWriteTimeAfterFirst = File.GetLastWriteTimeUtc(Path.Combine(finalDir, "part.sha256"));
+        var manifestWriteTimeAfterFirst = File.GetLastWriteTimeUtc(Path.Combine(finalDir, "manifest.json"));
 
+        // O réplay revalida (somente leitura) o bundle físico contra o registro persistido (AB-4B-007) antes
+        // de devolvê-lo — mas essa revalidação em si nunca escreve nada.
         var second = await useCase.ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
 
         Assert.Equal(first.Id, second.Id);
         Assert.Equal(writeTimeAfterFirst, File.GetLastWriteTimeUtc(Path.Combine(finalDir, "part.pst"))); // nunca reescrito.
+        Assert.Equal(shaWriteTimeAfterFirst, File.GetLastWriteTimeUtc(Path.Combine(finalDir, "part.sha256")));
+        Assert.Equal(manifestWriteTimeAfterFirst, File.GetLastWriteTimeUtc(Path.Combine(finalDir, "manifest.json")));
         Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
     }
 
@@ -336,6 +342,92 @@ public sealed class Slice4bPartitionExecutionTests(SqlServerFixture fixture)
                 .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None));
         Assert.Equal(tampered, File.ReadAllBytes(partPath));
         Assert.Equal(0, await ExecutionRowCountAsync(scope, plan.Id));
+    }
+
+    // ---- Correção AB-4B-007: réplay de um checkpoint JÁ PERSISTIDO revalida o bundle físico ANTES de
+    // reaproveitá-lo — tampering/corrupção/remoção depois que o checkpoint SQL existe nunca é mascarado. ----
+
+    [Fact]
+    public async Task ReplayAfterThePersistedCheckpointDetectsByteAlterationOfThePartFileAndFailsClosed()
+    {
+        var (scope, _, plan, _) = await RegisterInspectAndPlanAsync(
+            Slice4bPstProcessingSupport.ValidUnicodeHeader(), "execute-replay-tamper-bytes.pst");
+        await Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+            .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id)); // checkpoint SQL já existe.
+
+        var partPath = Path.Combine(FinalOutputDir(scope, plan), "part.pst");
+        var tampered = (byte[])File.ReadAllBytes(partPath).Clone();
+        tampered[0] ^= 0xFF; // uma alteração mínima de byte já é suficiente para divergir do hash persistido.
+        File.WriteAllBytes(partPath, tampered);
+
+        await Assert.ThrowsAsync<PartitionExecutionOutputTamperedException>(() =>
+            Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+                .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None));
+
+        // Fail-closed, nunca reconstruído: os bytes adulterados continuam lá e nenhuma linha nova foi gravada.
+        Assert.Equal(tampered, File.ReadAllBytes(partPath));
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
+    }
+
+    [Theory]
+    [InlineData("part.pst")]
+    [InlineData("part.sha256")]
+    [InlineData("manifest.json")]
+    public async Task ReplayAfterThePersistedCheckpointDetectsARemovedBundleFileAndFailsClosedWithoutRecreatingIt(
+        string removedFileName)
+    {
+        var (scope, _, plan, _) = await RegisterInspectAndPlanAsync(
+            Slice4bPstProcessingSupport.ValidUnicodeHeader(), $"execute-replay-missing-{removedFileName}.pst");
+        await Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+            .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
+
+        var finalDir = FinalOutputDir(scope, plan);
+        File.Delete(Path.Combine(finalDir, removedFileName));
+
+        await Assert.ThrowsAsync<PartitionExecutionOutputTamperedException>(() =>
+            Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+                .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None));
+
+        // Nenhuma verificação de réplay recria o arquivo ausente — a revalidação é estritamente somente leitura.
+        Assert.False(File.Exists(Path.Combine(finalDir, removedFileName)));
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id)); // nenhuma linha nova.
+    }
+
+    [Fact]
+    public async Task ReplayAfterThePersistedCheckpointDetectsManifestOnlyTamperingEvenWithAValidPartAndSidecar()
+    {
+        var (scope, _, plan, _) = await RegisterInspectAndPlanAsync(
+            Slice4bPstProcessingSupport.ValidUnicodeHeader(), "execute-replay-tamper-manifest.pst");
+        await Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+            .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
+
+        var finalDir = FinalOutputDir(scope, plan);
+        var partPath = Path.Combine(finalDir, "part.pst");
+        var shaPath = Path.Combine(finalDir, "part.sha256");
+        var manifestPath = Path.Combine(finalDir, "manifest.json");
+        var partBeforeTampering = File.ReadAllBytes(partPath);
+        var shaBeforeTampering = await File.ReadAllTextAsync(shaPath);
+
+        // Adultera SOMENTE o manifesto (troca a sequência da parte persistida) — part.pst e part.sha256
+        // permanecem exatamente como o writer os deixou e continuam consistentes ENTRE si.
+        var manifestJson = await File.ReadAllTextAsync(manifestPath);
+        var tamperedManifest = manifestJson.Replace("\"PartSequence\":1", "\"PartSequence\":2", StringComparison.Ordinal);
+        Assert.NotEqual(manifestJson, tamperedManifest); // pré-condição: a substituição realmente mudou o conteúdo.
+        await File.WriteAllTextAsync(manifestPath, tamperedManifest);
+
+        await Assert.ThrowsAsync<PartitionExecutionOutputTamperedException>(() =>
+            Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+                .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None));
+
+        // part.pst e part.sha256 nunca são tocados por essa checagem; o manifesto adulterado também não é
+        // silenciosamente corrigido — fica exatamente como o atacante/corrupção o deixou.
+        Assert.Equal(partBeforeTampering, File.ReadAllBytes(partPath));
+        Assert.Equal(shaBeforeTampering, await File.ReadAllTextAsync(shaPath));
+        Assert.Equal(tamperedManifest, await File.ReadAllTextAsync(manifestPath));
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
     }
 
     // ---- Órfão de staging: nunca confundido com sucesso; reconciliação segura por idade ----

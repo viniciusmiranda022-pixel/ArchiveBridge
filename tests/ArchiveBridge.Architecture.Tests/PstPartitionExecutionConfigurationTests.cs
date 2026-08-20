@@ -84,6 +84,7 @@ public sealed class PstPartitionExecutionConfigurationTests
 
         Assert.DoesNotContain(builder.Services, service => service.ServiceType == typeof(ExecutePartitionPlanUseCase));
         Assert.DoesNotContain(builder.Services, service => service.ServiceType == typeof(IPartitionPartWriter));
+        Assert.DoesNotContain(builder.Services, service => service.ServiceType == typeof(IPartitionPartVerifier));
         Assert.DoesNotContain(builder.Services, service => service.ServiceType == typeof(IPartitionExecutionStore));
     }
 
@@ -130,9 +131,10 @@ public sealed class PstPartitionExecutionConfigurationTests
             ProjectGraph.RepositoryRoot, "src", "ArchiveBridge.Workers.Pst", "Composition", "PstInspectionComposition.cs"));
 
         Assert.Contains(
-            "new ExecutePartitionPlanUseCase(custodyStore, planStore, executionStore, writer, clock)",
+            "new ExecutePartitionPlanUseCase(custodyStore, planStore, executionStore, writer, verifier, clock)",
             composition, StringComparison.Ordinal);
         Assert.Contains("new SqlPartitionExecutionStore(connectionFactory)", composition, StringComparison.Ordinal);
         Assert.Contains("new LocalSinglePartExecutionWriter(storageOptions, outputOptions)", composition, StringComparison.Ordinal);
+        Assert.Contains("new LocalSinglePartExecutionVerifier(outputOptions)", composition, StringComparison.Ordinal);
     }
 }

@@ -107,13 +107,18 @@ internal static class Slice4bPstProcessingSupport
         SqlServerFixture fixture, PstStorageOptions? sourceOptions = null, PartitionExecutionOutputOptions? outputOptions = null) =>
         new(sourceOptions ?? DefaultOptions(fixture), outputOptions ?? DefaultOutputOptions(fixture));
 
+    public static LocalSinglePartExecutionVerifier Verifier(
+        SqlServerFixture fixture, PartitionExecutionOutputOptions? outputOptions = null) =>
+        new(outputOptions ?? DefaultOutputOptions(fixture));
+
     /// <summary>Caso de uso de EXECUÇÃO — materializa um plano já persistido.</summary>
     public static ExecutePartitionPlanUseCase ExecuteUseCase(
-        SqlServerFixture fixture, PartitionPolicy? policy = null, IClock? clock = null, LocalSinglePartExecutionWriter? writer = null)
+        SqlServerFixture fixture, PartitionPolicy? policy = null, IClock? clock = null,
+        LocalSinglePartExecutionWriter? writer = null, LocalSinglePartExecutionVerifier? verifier = null)
     {
         var effectiveClock = clock ?? DefaultClock;
         return new ExecutePartitionPlanUseCase(
             CustodyStore(fixture, effectiveClock), PlanStore(fixture), ExecutionStore(fixture),
-            writer ?? Writer(fixture), effectiveClock);
+            writer ?? Writer(fixture), verifier ?? Verifier(fixture), effectiveClock);
     }
 }

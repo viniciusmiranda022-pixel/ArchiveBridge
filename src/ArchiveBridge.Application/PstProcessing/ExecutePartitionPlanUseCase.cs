@@ -19,9 +19,12 @@ namespace ArchiveBridge.Application.PstProcessing;
 /// </para>
 /// <para>
 /// <b>Idempotência:</b> uma execução canônica já persistida para o (plano, parte) é devolvida sem
-/// reexecutar o writer ("sem duplicar efeitos"). A origem é revalidada contra o hash registrado em custódia
-/// imediatamente antes de materializar — divergência (origem mudou desde o planejamento) falha fechado
-/// antes de tocar o arquivo.
+/// reexecutar o writer ("sem duplicar efeitos") — mas somente depois de o <see cref="IPartitionPartVerifier"/>
+/// revalidar, em somente leitura, que o bundle físico ainda confere byte-for-byte com o registro persistido
+/// (correção AB-4B-007): tampering/corrupção/remoção do output depois que o checkpoint SQL já existe nunca é
+/// mascarado por um "sucesso" baseado apenas na linha persistida. A origem é revalidada contra o hash
+/// registrado em custódia imediatamente antes de materializar — divergência (origem mudou desde o
+/// planejamento) falha fechado antes de tocar o arquivo.
 /// </para>
 /// </summary>
 public sealed class ExecutePartitionPlanUseCase(
@@ -29,12 +32,14 @@ public sealed class ExecutePartitionPlanUseCase(
     IPartitionPlanStore planStore,
     IPartitionExecutionStore executionStore,
     IPartitionPartWriter writer,
+    IPartitionPartVerifier verifier,
     IClock clock)
 {
     private readonly IPstCustodyStore _custodyStore = custodyStore;
     private readonly IPartitionPlanStore _planStore = planStore;
     private readonly IPartitionExecutionStore _executionStore = executionStore;
     private readonly IPartitionPartWriter _writer = writer;
+    private readonly IPartitionPartVerifier _verifier = verifier;
     private readonly IClock _clock = clock;
 
     /// <summary>Executa (ou reaproveita idempotentemente) a materialização da única parte do plano informado.</summary>
@@ -54,6 +59,10 @@ public sealed class ExecutePartitionPlanUseCase(
     /// <exception cref="PartitionExecutionConflictUnresolvedException">
     /// Conflito de gravação sinalizado, mas nenhuma execução canônica encontrada na releitura (fail-closed).
     /// </exception>
+    /// <exception cref="PartitionExecutionOutputTamperedException">
+    /// Uma execução canônica já persistida existe, mas o <see cref="IPartitionPartVerifier"/> detectou que o
+    /// bundle físico correspondente foi removido, adulterado ou diverge do registro persistido.
+    /// </exception>
     public async Task<PartitionExecutionRecord> ExecuteAsync(
         TenantScope scope, PartitionPlanId planId, CorrelationId correlation, CancellationToken cancellationToken)
     {
@@ -64,10 +73,13 @@ public sealed class ExecutePartitionPlanUseCase(
         var part = plan.Parts[0];
 
         // Réplay idempotente: uma execução canônica já persistida para este (plano, parte) é devolvida sem
-        // reexecutar o writer — nenhum I/O, nenhum efeito duplicado.
+        // reexecutar o writer — nenhum I/O de escrita, nenhum efeito duplicado. Antes de confiar na linha
+        // persistida, revalida (somente leitura) que o bundle físico ainda existe e confere byte-for-byte —
+        // a persistência sozinha nunca é prova suficiente de que o output ainda está lá e intacto.
         var existing = await FindCanonicalExecutionAsync(scope, plan, part, cancellationToken).ConfigureAwait(false);
         if (existing is not null)
         {
+            await _verifier.VerifyAsync(scope, existing, cancellationToken).ConfigureAwait(false);
             return existing;
         }
 
@@ -118,6 +130,9 @@ public sealed class ExecutePartitionPlanUseCase(
                 ?? throw new PartitionExecutionConflictUnresolvedException(
                     "Conflito de gravação detectado (índice único de canonicidade), mas nenhuma execução canônica foi encontrada na releitura.");
 
+            // Mesmo invariante do réplay comum: nunca devolve uma execução persistida como canônica sem
+            // revalidar fisicamente o bundle correspondente primeiro.
+            await _verifier.VerifyAsync(scope, raced, cancellationToken).ConfigureAwait(false);
             return raced;
         }
     }
