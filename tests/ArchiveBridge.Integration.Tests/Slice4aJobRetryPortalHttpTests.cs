@@ -461,6 +461,40 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         Assert.Single(transitions, t => t.Reason == ReasonCode.RetryExpedited);
     }
 
+    // ---- Outcome não reconhecido do store: FALHA FECHADA, nunca falso sucesso nem auditoria 'accepted'.
+
+    [Fact]
+    public async Task UnrecognizedStoreOutcomeFailsClosedWithoutFalseSuccessOrAcceptedAudit()
+    {
+        var clock = new MutableClock(Start);
+        var scope = SqlServerFixture.NewScope();
+        var jobId = await ScheduleRetryAsync(clock, scope, TimeSpan.FromHours(1));
+        var (username, password) = await SeedUserAsync(scope, PortalRoles.Operator);
+
+        using var factory = CreateFactory(
+            retryEnabled: true,
+            clock: clock,
+            configureServices: services =>
+            {
+                services.RemoveAll<IJobStore>();
+                services.AddScoped<IJobStore>(_ => new UnexpectedOutcomeJobStore(_fixture.Store(clock)));
+            });
+        using var client = factory.CreateClient(NoRedirect());
+        await LoginAsync(client, username, password);
+
+        var before = (await _fixture.Store(clock).GetAsync(scope, jobId, CancellationToken.None))!.NextAttemptAtUtc;
+        using var response = await PostRetryAsync(client, jobId.Value, Guid.NewGuid());
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode); // NUNCA promovido a sucesso
+        var after = (await _fixture.Store(clock).GetAsync(scope, jobId, CancellationToken.None))!.NextAttemptAtUtc;
+        Assert.Equal(before, after); // zero mutação — o outcome bogus da infraestrutura não é aplicado
+
+        var events = await AuditAsync(scope);
+        Assert.Contains(events, e => e.Username == username && !e.Succeeded && e.Reason == "unexpected-outcome");
+        Assert.DoesNotContain(events, e => e.Username == username && e.Reason == "accepted");
+        Assert.DoesNotContain(events, e => e.Username == username && e.Reason == "idempotent-replay");
+    }
+
     // ============================ infra de teste ============================
 
     private WebApplicationFactory<Program> CreateFactory(
@@ -611,6 +645,40 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
             html, "name=\"__RequestVerificationToken\"[^>]*value=\"([^\"]+)\"", RegexOptions.CultureInvariant);
         Assert.True(match.Success, $"Token antiforgery não encontrado em {path}.");
         return match.Groups[1].Value;
+    }
+
+    /// <summary>
+    /// Decora um <see cref="IJobStore"/> real, delegando tudo exceto <see cref="RequestManualRetryAsync"/>,
+    /// que devolve um valor de <see cref="JobRetryRequestOutcome"/> FORA do enum (evolução futura/corrupção/
+    /// mapeamento inesperado da infraestrutura) sem tocar o efeito durável real — prova que o handler HTTP
+    /// falha fechado (nunca promove a sucesso) diante de um outcome que ele não reconhece explicitamente.
+    /// </summary>
+    private sealed class UnexpectedOutcomeJobStore(IJobStore inner) : IJobStore
+    {
+        private readonly IJobStore _inner = inner;
+
+        public Task<JobId> CreateAsync(CreateJobCommand command, CancellationToken cancellationToken) =>
+            _inner.CreateAsync(command, cancellationToken);
+
+        public Task<ClaimedJob?> TryClaimNextAsync(ClaimRequest request, CancellationToken cancellationToken) =>
+            _inner.TryClaimNextAsync(request, cancellationToken);
+
+        public Task<JobSnapshot?> GetAsync(TenantScope scope, JobId jobId, CancellationToken cancellationToken) =>
+            _inner.GetAsync(scope, jobId, cancellationToken);
+
+        public Task<JobCommandOutcome> CompleteAsync(LeaseCommand command, CancellationToken cancellationToken) =>
+            _inner.CompleteAsync(command, cancellationToken);
+
+        public Task<JobCommandOutcome> FailAsync(LeaseCommand command, ErrorCode errorCode, CancellationToken cancellationToken) =>
+            _inner.FailAsync(command, errorCode, cancellationToken);
+
+        public Task<JobCommandOutcome> ScheduleRetryAsync(
+            LeaseCommand command, ErrorCode errorCode, DateTimeOffset nextAttemptAtUtc, CancellationToken cancellationToken) =>
+            _inner.ScheduleRetryAsync(command, errorCode, nextAttemptAtUtc, cancellationToken);
+
+        public Task<JobRetryRequestOutcome> RequestManualRetryAsync(
+            TenantScope scope, JobId jobId, Guid idempotencyKey, CorrelationId correlation, CancellationToken cancellationToken) =>
+            Task.FromResult((JobRetryRequestOutcome)(-1));
     }
 
     private sealed class FailingOperationalAudit : IPortalOperationalAudit

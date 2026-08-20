@@ -208,7 +208,6 @@ public sealed class DetailsModel(
 
             case JobRetryRequestOutcome.Applied:
             case JobRetryRequestOutcome.IdempotentReplay:
-            default:
                 // Auditoria de RESULTADO antes do redirect. Se persistir a trilha falhar, a exceção
                 // propaga (HTTP 500): a solicitação já foi aplicada de forma durável e idempotente; um
                 // retry do POST com a MESMA chave devolve o MESMO resultado (idempotência).
@@ -218,6 +217,19 @@ public sealed class DetailsModel(
 
                 // PRG: sucesso/replay redirecionam para o GET canônico (nunca renderiza após POST).
                 return RedirectToPage("/Jobs/Details", new { jobId });
+
+            default:
+                // FAIL-CLOSED: qualquer valor de outcome não reconhecido explicitamente (evolução futura do
+                // enum, mapeamento inesperado da infraestrutura, corrupção) NUNCA é promovido implicitamente
+                // a sucesso. Audita a anomalia como falha (nunca "accepted"/"idempotent-replay") e então
+                // lança — não há StatusCode(500) manual porque o pipeline (sem middleware de exceção em
+                // Development; UseExceptionHandler("/Error") fora de Development) já converte exceção não
+                // tratada em 500 sanitizado, sem vazar detalhes internos ao chamador e sem redirecionar como
+                // se a operação tivesse sido aceita.
+                await AuditAsync(scope, userId, username, jobId, false, "unexpected-outcome", correlation, cancellationToken)
+                    .ConfigureAwait(false);
+                throw new InvalidOperationException(
+                    $"{nameof(JobRetryRequestOutcome)} não reconhecido pelo handler de retry manual do Passo 7.");
         }
     }
 
