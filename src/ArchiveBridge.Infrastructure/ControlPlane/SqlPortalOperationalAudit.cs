@@ -17,8 +17,23 @@ public sealed class SqlPortalOperationalAudit(TenantConnectionFactory connection
     // para nunca truncar o padrão escapado.
     private const int UsernamePrefixRawMaxLength = 200;
 
+    // FK_portal_operational_audit_project exige que (tenant_id, project_id) já exista em dbo.projects.
+    // dbo.projects hoje só é provisionado de forma preguiçosa pela criação de Jobs (SqlJobStore.CreateSql)
+    // — um operador autenticado cujo PRÓPRIO projeto ainda não tem nenhum Job (ex.: primeira ação dele no
+    // Portal sendo uma tentativa de retry em um Job inexistente/cross-tenant/cross-project) não teria linha
+    // em dbo.projects, e a auditoria dessa tentativa (inclusive do caminho seguro NotFound) quebraria a FK
+    // — transformando uma negativa anti-IDOR segura (404) em erro 500. @tenant/@project aqui SEMPRE vêm do
+    // escopo do PRINCIPAL AUTENTICADO (resolvido server-side, nunca do jobId/recurso solicitado pelo
+    // navegador), então garantir essa linha não é "criar projeto fantasma" nem vazar nada sobre um recurso
+    // fora do escopo — é o MESMO padrão IF NOT EXISTS...INSERT já usado em dbo.projects por
+    // SqlJobStore.CreateSql, SqlEvDiscoveryCommandInbox e SqlPlanningCommandInbox, aplicado aqui na
+    // fronteira correta (a própria escrita de auditoria) em vez de espalhado pelas Razor Pages chamadoras.
     private const string InsertSql =
         """
+        SET NOCOUNT ON;
+        IF NOT EXISTS (SELECT 1 FROM dbo.projects WHERE tenant_id = @tenant AND project_id = @project)
+            INSERT INTO dbo.projects (project_id, tenant_id, created_at_utc) VALUES (@project, @tenant, @occurred);
+
         INSERT INTO dbo.portal_operational_audit_events
             (tenant_id, project_id, user_id, username, action_code, resource_type, resource_id,
              succeeded, reason, correlation_id, occurred_at_utc)

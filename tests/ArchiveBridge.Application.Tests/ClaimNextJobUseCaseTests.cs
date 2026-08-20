@@ -28,6 +28,9 @@ public sealed class ClaimNextJobUseCaseTests
 
         public Task<JobCommandOutcome> ScheduleRetryAsync(LeaseCommand command, ErrorCode errorCode, DateTimeOffset nextAttemptAtUtc, CancellationToken cancellationToken) =>
             Task.FromResult(JobCommandOutcome.Applied);
+
+        public Task<JobRetryRequestOutcome> RequestManualRetryAsync(TenantScope scope, JobId jobId, Guid idempotencyKey, CorrelationId correlation, CancellationToken cancellationToken) =>
+            Task.FromResult(JobRetryRequestOutcome.Applied);
     }
 
     private static ClaimRequest Request() =>

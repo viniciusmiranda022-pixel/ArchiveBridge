@@ -21,6 +21,25 @@ public enum JobCommandOutcome
     NotFound,
 }
 
+/// <summary>Resultado estruturado de uma solicitação de retry manual autorizado (idempotência explícita).</summary>
+public enum JobRetryRequestOutcome
+{
+    /// <summary>A solicitação foi aplicada agora (nova chave de idempotência para este Job).</summary>
+    Applied,
+
+    /// <summary>A MESMA chave já havia aplicado este efeito — replay idempotente e seguro.</summary>
+    IdempotentReplay,
+
+    /// <summary>O Job existe, mas não está em estado elegível a retry manual (não é RetryScheduled).</summary>
+    NotEligible,
+
+    /// <summary>Job inexistente no escopo (inclui cross-tenant/cross-project barrado pela RLS/filtro).</summary>
+    NotFound,
+
+    /// <summary>A chave de idempotência já está vinculada a um Job DIFERENTE — conflito determinístico.</summary>
+    IdempotencyConflict,
+}
+
 /// <summary>Comando para criar um Job (sempre carrega escopo de tenant/projeto explícito).</summary>
 public sealed record CreateJobCommand(
     TenantScope Scope,

@@ -222,6 +222,41 @@ public sealed class Job
         return new JobTransition(Id, from, State, ReasonCode.AttemptsExhausted, epoch, previousOwner, now);
     }
 
+    /// <summary>
+    /// Indica se o Job aceita retry manual autorizado NESTE momento. Único estado elegível:
+    /// <see cref="JobState.RetryScheduled"/> — o domínio já decidiu que uma nova tentativa é segura; o
+    /// retry manual apenas adianta o instante. Nunca elegível a partir de um estado terminal
+    /// (<see cref="JobStateMachine.IsTerminal"/>) — retry NUNCA ressuscita um Job concluído ou com falha
+    /// definitiva — nem de Pending (ainda não tentado) ou Processing (já em execução, sob lease de worker).
+    /// </summary>
+    public bool CanRequestManualRetry() => State == JobState.RetryScheduled;
+
+    /// <summary>
+    /// Solicita retry manual autorizado (ação de controle do Portal, não sujeita a fencing por worker —
+    /// em RetryScheduled não há lease ativo). Adianta <c>NextAttemptAtUtc</c> para <paramref name="now"/>
+    /// quando ainda estiver no futuro (NUNCA atrasa uma tentativa já elegível). Não é uma transição de
+    /// estado da <see cref="JobStateMachine"/> (RetryScheduled → RetryScheduled): não introduz nenhuma
+    /// aresta nova no grafo de estados nem altera tentativas/erro/lease. Lança
+    /// <see cref="InvalidJobTransitionException"/> se o Job não estiver em RetryScheduled.
+    /// </summary>
+    public JobTransition RequestManualRetry(DateTimeOffset now)
+    {
+        if (!CanRequestManualRetry())
+        {
+            throw new InvalidJobTransitionException(
+                $"Retry manual não permitido: o job {Id.Value} não está em RetryScheduled.");
+        }
+
+        var from = State;
+        if (NextAttemptAtUtc is null || NextAttemptAtUtc > now)
+        {
+            NextAttemptAtUtc = now;
+        }
+
+        UpdatedAtUtc = now;
+        return new JobTransition(Id, from, State, ReasonCode.RetryExpedited, LeaseEpoch, OwnerWorker, now);
+    }
+
     private void EnsureLeaseHeldBy(WorkerId worker, LeaseEpoch epoch)
     {
         if (State != JobState.Processing || OwnerWorker != worker || LeaseEpoch != epoch)

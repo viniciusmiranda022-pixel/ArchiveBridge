@@ -7,10 +7,12 @@
 // é READ-ONLY contra o Enterprise Vault. Tudo sob autenticação e RBAC; nenhuma capacidade do Slice 4B
 // (exportação, PST, Purview, Graph, AzCopy) é executada nem simulada.
 using ArchiveBridge.Application.EnterpriseVault.Discovery;
+using ArchiveBridge.Application.Jobs;
 using ArchiveBridge.Application.Mapping;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
+using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.Mapping;
 using ArchiveBridge.Contracts.Waves;
 using ArchiveBridge.ControlPlane.Composition;
@@ -18,6 +20,7 @@ using ArchiveBridge.ControlPlane.Presentation;
 using ArchiveBridge.Domain.EnterpriseVault.Discovery;
 using ArchiveBridge.Infrastructure.ControlPlane;
 using ArchiveBridge.Infrastructure.EnterpriseVault.Discovery;
+using ArchiveBridge.Infrastructure.Jobs;
 using ArchiveBridge.Infrastructure.Mapping;
 using ArchiveBridge.Infrastructure.Persistence;
 using ArchiveBridge.Infrastructure.Projects;
@@ -84,6 +87,22 @@ builder.Services.AddScoped(serviceProvider => new ValidateMappingCsvUploadUseCas
     serviceProvider.GetRequiredService<IClock>(),
     mappingUploadLimits));
 
+// Feature gate LOCAL do Portal para a superfície de SOLICITAÇÃO de retry manual autorizado de Jobs
+// (Passo 7; default fail-closed = false). O backend (RequestJobRetryUseCase, IJobStore) não conhece
+// este gate — permanece a autoridade final de elegibilidade/idempotência independentemente dele.
+var jobRetryPortalOptions =
+    builder.Configuration.GetSection(JobRetryPortalOptions.SectionName).Get<JobRetryPortalOptions>()
+        ?? new JobRetryPortalOptions();
+builder.Services.AddSingleton(jobRetryPortalOptions);
+
+// Fila durável de Jobs (Vertical Slice 1): usada aqui SOMENTE pelo caso de uso de retry manual
+// (RequestManualRetryAsync — sem fencing de worker, pois RetryScheduled não tem lease ativo) — o Portal
+// nunca reivindica (TryClaimNextAsync é exclusivo dos Workers). O aging não é exercitado por este
+// caminho; o valor apenas satisfaz o construtor.
+builder.Services.AddScoped<IJobStore>(serviceProvider => new SqlJobStore(
+    connectionFactory, serviceProvider.GetRequiredService<IClock>(), TimeSpan.FromSeconds(30)));
+builder.Services.AddScoped<RequestJobRetryUseCase>();
+
 // Modo de Demonstração (concern EXCLUSIVO de UI): dataset 100% sintético para telas quando não há dados reais.
 // Fail-closed no startup: habilitá-lo fora de Development/Staging aborta o processo (nunca dados simulados em
 // produção). O provedor é somente leitura e em memória — não escreve em SQL, não enfileira Job, não chama Worker.
@@ -143,6 +162,12 @@ builder.Services.AddAuthorization(authorization =>
     // server-side via IAuthorizationService, para que uma tentativa negada seja bloqueada E auditada.
     authorization.AddPolicy(
         "MappingValidationOperators", policy => policy.RequireRole(PortalRoles.Operator, PortalRoles.Administrator));
+    // Ação de ESCRITA (solicitar retry manual autorizado de um job): apenas Operator/Administrator. Não
+    // protege a PÁGINA /Jobs/Details (que continua legível pelos papéis de leitura) — protege o handler
+    // POST, autorizado server-side via IAuthorizationService, para que uma tentativa negada seja bloqueada
+    // E auditada.
+    authorization.AddPolicy(
+        "JobRetryOperators", policy => policy.RequireRole(PortalRoles.Operator, PortalRoles.Administrator));
 });
 
 // Codificação HTML: permite letras acentuadas (Latin) como UTF-8 literal em vez de entidades numéricas

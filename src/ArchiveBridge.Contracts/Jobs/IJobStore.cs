@@ -39,4 +39,22 @@ public interface IJobStore
         ErrorCode errorCode,
         DateTimeOffset nextAttemptAtUtc,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Solicita retry manual autorizado (ação de controle do Portal — Passo 7): elegível SOMENTE quando o
+    /// Job está em <see cref="JobState.RetryScheduled"/>; adianta <c>next_attempt_at_utc</c> para agora,
+    /// sem alterar estado, tentativas, erro ou lease. Sem fencing por worker (não há lease ativo neste
+    /// estado). Idempotente pela <paramref name="idempotencyKey"/> informada: replay da MESMA chave para o
+    /// MESMO Job é <see cref="JobRetryRequestOutcome.IdempotentReplay"/>; a MESMA chave para um Job
+    /// DIFERENTE é <see cref="JobRetryRequestOutcome.IdempotencyConflict"/> (backstop por índice único
+    /// filtrado). Job inexistente/cross-tenant/cross-project no escopo é
+    /// <see cref="JobRetryRequestOutcome.NotFound"/>; existente mas não elegível é
+    /// <see cref="JobRetryRequestOutcome.NotEligible"/>.
+    /// </summary>
+    Task<JobRetryRequestOutcome> RequestManualRetryAsync(
+        TenantScope scope,
+        JobId jobId,
+        Guid idempotencyKey,
+        CorrelationId correlation,
+        CancellationToken cancellationToken);
 }

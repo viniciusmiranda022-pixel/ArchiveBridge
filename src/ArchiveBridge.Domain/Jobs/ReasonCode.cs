@@ -29,4 +29,11 @@ public enum ReasonCode
 
     /// <summary>Tentativas esgotadas ao recuperar lease expirado (Processing → Failed).</summary>
     AttemptsExhausted,
+
+    /// <summary>
+    /// Retry manual autorizado solicitado pelo Portal: adianta a próxima tentativa de um Job já em
+    /// RetryScheduled (RetryScheduled → RetryScheduled). Não é uma transição de estado — apenas
+    /// reagenda; registrado para auditabilidade da solicitação.
+    /// </summary>
+    RetryExpedited,
 }
