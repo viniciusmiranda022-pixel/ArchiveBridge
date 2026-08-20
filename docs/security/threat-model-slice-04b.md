@@ -46,3 +46,52 @@ aparecer na evidência.
 Export-EVArchive, split/partition execution, repair de PST, Outlook automation, upload/AzCopy/Azure
 staging, Purview/Graph/Exchange Online/import job, reconciliação M365. Nenhum destes fluxos existe no
 código deste Passo — não há superfície de ameaça nova a analisar para eles aqui.
+
+---
+
+# Delta — Slice 4B, Passo 2 (Partition Planning)
+
+Escopo adicional: **planejamento** determinístico de particionamento sobre PSTs já canonicamente
+inspecionados. Continua sem execução de split/rewrite/repair, sem PST de saída, sem Export-EVArchive,
+upload/AzCopy, Purview/Graph/EXO e sem importação (ver STOP-THE-LINE em
+[`vertical-slice-04b-partition-planning.md`](../engineering/vertical-slice-04b-partition-planning.md)).
+
+## Ativos adicionais
+
+- **Planos de particionamento** (`dbo.pst_partition_plans`): identidade determinística (`plan_hash`),
+  fingerprint/limites da política, nome/versão de planner e engine, desfecho/motivo sanitizados, correlação
+  e timestamp. Evidência decisória — **não** contém conteúdo de mailbox.
+- **Partes planejadas** (`dbo.pst_partition_plan_parts`): chave opaca derivada do `plan_hash`, sequência e
+  tamanho planejado. É INTENÇÃO: nenhum arquivo de parte existe.
+
+## Classificação de dados
+
+As duas tabelas novas **não guardam caminho físico, nome de arquivo, UPN, assunto, corpo, destinatário ou
+anexo** — não há sequer coluna capaz de carregá-los, e `part_key` é um hash opaco derivado do `plan_hash`
+(runbook §20.1: "nomes não incluem UPN completo; usar IDs opacos"). Comprovado lendo TODAS as colunas
+persistidas em `ThePersistedPlanCarriesNoPathFileNameOrMailboxIdentifier`. O que resta é metadado
+operacional atribuível a um artefato de custódia, na mesma classificação das tabelas do Passo 1.
+
+## Ameaças e mitigações (delta)
+
+| Ameaça | Mitigação |
+| --- | --- |
+| Plano gerado sobre um PST que mudou desde o registro (planejar sobre origem obsoleta) | A inspeção canônica é buscada SEMPRE pelo hash REGISTRADO em custódia; origem alterada não tem canônico para esse hash ⇒ `Blocked / CanonicalInspectionUnavailable`. O Domain ainda revalida `IsCanonical` e a igualdade `expected == observed == registrado` (`Blocked / SourceHashDivergence`). Comprovado por `AnArtifactChangedAfterRegistrationCannotBePlanned`. |
+| Plano "executável" fabricado sem informação suficiente (boundaries/contagens inventados) | Só existe UM caso planejável sem inventário: o artefato inteiro dentro do `TargetPartBytes` (nenhum split necessário). Acima disso ⇒ `Unsupported / ItemInventoryUnavailable` com ZERO partes, travado também no banco (`CK_pst_partition_plans_outcome_fields`). Comprovado por `AnArtifactAboveTheTargetIsUnsupportedAndPersistsNoPartsAtAll`. |
+| Reaproveitar plano obsoleto após mudança de política/configuração | O fingerprint da política (`canonicalJson`) entra no `plan_hash`; qualquer limite diferente produz identidade diferente e o índice único é por identidade. Comprovado por `ChangingThePolicyProducesANewIdentityAndNeverReusesThePreviousPlan`. |
+| Colisão de identidade entre tenants/projetos com conteúdo idêntico | `plan_hash` inclui tenant, projeto, artefato e inspeção além do hash de origem (extensão explícita sobre a fórmula do runbook §20.2). Comprovado por `TwoArtifactsWithIdenticalContentInDifferentProjectsNeverShareAPlanIdentity`. |
+| Vazamento cross-tenant/cross-project (IDOR) do plano | RLS (`rls.tenant_isolation_policy`, FILTER + BLOCK AFTER INSERT) nas duas tabelas + filtro explícito por `project_id` nas leituras + `PstArtifactNotFoundException` indistinguível de "não existe". Mesmo conhecendo o `plan_hash` exato, outro escopo lê `null`. Comprovado por `CrossTenantAndCrossProjectPlanningIsDeniedIndistinguishablyFromNotFound`. |
+| Plano referenciando inspeção de outro escopo/artefato | FK composta `FK_pst_partition_plans_inspection (inspection_id, tenant_id, project_id, artifact_id)` — o banco recusa a linha, não apenas a aplicação. |
+| Corrida de gravação (dois workers planejam o mesmo artefato) | Índice único filtrado `UX_pst_partition_plans_canonical ... WHERE is_canonical = 1`; a Application captura `PartitionPlanConflictException` e relê o canônico; releitura vazia ⇒ `PartitionPlanConflictUnresolvedException` (nunca devolve plano não persistido). Tradução de `SqlException` 2601/2627 restrita a esse índice. Comprovado por `ConcurrentPlanningOfTheSameArtifactConvergesToExactlyOneCanonicalPlan`. |
+| Plano parcial (linha sem suas partes) sobrevivendo a falha | Plano e partes são gravados na MESMA transação; qualquer falha desfaz tudo antes de propagar. |
+| Store devolvendo como "canônico" algo que não é | A Application revalida `PartitionPlan.IsCanonical` E a identidade determinística antes de reaproveitar (`PartitionPlanCanonicityViolationException`); a store ainda revalida que o fingerprint de política persistido bate com os limites persistidos. |
+| Escalada silenciosa de capacidade (planejar sem inspeção habilitada) | `PstPartitionPlanning:Enabled=false` por padrão; habilitar sem `PstInspection:Enabled=true` derruba o host no startup em vez de ignorar a intenção do operador. Comprovado por `PlanningEnabledWithoutInspectionBringsTheHostDownInsteadOfBeingSilentlyIgnored`. |
+| Execução acidental de split/escrita a partir do planejamento | O caso de uso de planejamento não recebe `IPstEngine` nem qualquer porta capaz de abrir/escrever o PST — não há caminho de código, não apenas ausência de chamada. `IPartitionPlanner.Plan` é síncrono, sem `CancellationToken` e sem I/O. Comprovado por `PlanningHasNoPathToThePstEngineOrAnyOtherWriteCapableDependency`. |
+| SQL injection | Todo acesso a dados é parametrizado (`SqlCommand`/`SqlParameter`), sem concatenação de entrada. |
+
+## Fora de escopo (herdado do STOP-THE-LINE do Passo 2)
+
+Execução de particionamento, criação de PST de saída, repair, parser/vendor não aprovado por ADR,
+Export-EVArchive real, AzCopy/Azure staging, Purview/Graph/Exchange Online/import job, validação e
+reconciliação pós-partição, CSV builder de importação e reconciliação final M365. Nenhum destes fluxos existe
+no código deste Passo — não há superfície de ameaça nova a analisar para eles aqui.

@@ -108,3 +108,81 @@ public sealed class PstInspectionLimitExceededException : Exception
     /// <summary>Código curto e sanitizado do limite excedido (ex.: <c>MAX_SIZE_EXCEEDED</c>, <c>TIMEOUT</c>).</summary>
     public string ReasonCode { get; }
 }
+
+/// <summary>
+/// Lançada pela store de planos quando uma execução concorrente já persistiu o plano CANÔNICO para a mesma
+/// identidade determinística (mesmo <c>planHash</c>) — o índice único filtrado no SQL Server venceu a
+/// corrida antes desta chamada. Fail-closed: nenhuma linha duplicada é criada; o chamador deve reler o
+/// plano canônico existente (réplay), nunca tratar isto como falha de negócio.
+/// </summary>
+public sealed class PartitionPlanConflictException : Exception
+{
+    /// <summary>Cria a exceção sem mensagem.</summary>
+    public PartitionPlanConflictException()
+    {
+    }
+
+    /// <summary>Cria a exceção com mensagem.</summary>
+    public PartitionPlanConflictException(string message)
+        : base(message)
+    {
+    }
+
+    /// <summary>Cria a exceção com mensagem e causa.</summary>
+    public PartitionPlanConflictException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
+}
+
+/// <summary>
+/// Lançada pela Application quando um <see cref="PartitionPlanConflictException"/> foi capturado mas a
+/// releitura subsequente NÃO encontrou o plano canônico — estado impossível sob o invariante de
+/// canonicidade (quem venceu a corrida DEVERIA estar persistido). Fail-closed: o chamador nunca recebe de
+/// volta um <see cref="PartitionPlan"/> que não foi persistido.
+/// </summary>
+public sealed class PartitionPlanConflictUnresolvedException : Exception
+{
+    /// <summary>Cria a exceção sem mensagem.</summary>
+    public PartitionPlanConflictUnresolvedException()
+    {
+    }
+
+    /// <summary>Cria a exceção com mensagem.</summary>
+    public PartitionPlanConflictUnresolvedException(string message)
+        : base(message)
+    {
+    }
+
+    /// <summary>Cria a exceção com mensagem e causa.</summary>
+    public PartitionPlanConflictUnresolvedException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
+}
+
+/// <summary>
+/// Lançada pela Application quando a store de planos devolve, como canônico, um <see cref="PartitionPlan"/>
+/// que o Domain não reconhece como tal (<see cref="PartitionPlan.IsCanonical"/> falso) ou cuja identidade
+/// determinística não é a esperada. Defesa em profundidade: a Application nunca reaproveita cegamente um
+/// plano só porque veio do método de leitura canônica.
+/// </summary>
+public sealed class PartitionPlanCanonicityViolationException : Exception
+{
+    /// <summary>Cria a exceção sem mensagem.</summary>
+    public PartitionPlanCanonicityViolationException()
+    {
+    }
+
+    /// <summary>Cria a exceção com mensagem.</summary>
+    public PartitionPlanCanonicityViolationException(string message)
+        : base(message)
+    {
+    }
+
+    /// <summary>Cria a exceção com mensagem e causa.</summary>
+    public PartitionPlanCanonicityViolationException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
+}
