@@ -1,6 +1,7 @@
 using System.Net;
 using System.Security.Claims;
 using System.Text.RegularExpressions;
+using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.ControlPlane.Composition;
@@ -42,7 +43,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var jobId = await ScheduleRetryAsync(clock, scope, TimeSpan.FromHours(1));
         var (username, password) = await SeedUserAsync(scope, PortalRoles.Operator);
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -67,7 +68,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var jobId = await ScheduleRetryAsync(clock, scope, TimeSpan.FromHours(1));
         var (username, password) = await SeedUserAsync(scope, PortalRoles.Administrator);
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -87,7 +88,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var jobId = await ScheduleRetryAsync(clock, scope, TimeSpan.FromHours(1));
         var (username, password) = await SeedUserAsync(scope, role);
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -127,7 +128,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
             claims.Add(new Claim(PortalClaims.UserId, userIdClaim));
         }
 
-        using var factory = CreateFactory(retryEnabled: true, stubPrincipalClaims: claims);
+        using var factory = CreateFactory(retryEnabled: true, stubPrincipalClaims: claims, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
 
         var before = (await _fixture.Store(clock).GetAsync(scope, jobId, CancellationToken.None))!.NextAttemptAtUtc;
@@ -148,7 +149,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var scope = SqlServerFixture.NewScope();
         var jobId = await ScheduleRetryAsync(clock, scope, TimeSpan.FromHours(1));
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
 
         var before = (await _fixture.Store(clock).GetAsync(scope, jobId, CancellationToken.None))!.NextAttemptAtUtc;
@@ -176,7 +177,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var jobId = await ScheduleRetryAsync(clock, scope, TimeSpan.FromHours(1));
         var (username, password) = await SeedUserAsync(scope, PortalRoles.Operator);
 
-        using var factory = CreateFactory(retryEnabled: false);
+        using var factory = CreateFactory(retryEnabled: false, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -199,7 +200,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var jobId = await ScheduleRetryAsync(clock, scope, TimeSpan.FromHours(1));
         var (username, password) = await SeedUserAsync(scope, PortalRoles.Viewer);
 
-        using var factory = CreateFactory(retryEnabled: false); // gate DESABILITADO
+        using var factory = CreateFactory(retryEnabled: false, clock: clock); // gate DESABILITADO
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -221,7 +222,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var jobId = await ScheduleRetryAsync(clock, scope, TimeSpan.FromHours(1));
         var (username, password) = await SeedUserAsync(scope, PortalRoles.Operator);
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -265,7 +266,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var foreignJobId = await ScheduleRetryAsync(clock, otherProjectScope, TimeSpan.FromHours(1));
         var (username, password) = await SeedUserAsync(operatorScope, PortalRoles.Operator);
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -285,7 +286,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var foreignJobId = await ScheduleRetryAsync(clock, otherTenantScope, TimeSpan.FromHours(1));
         var (username, password) = await SeedUserAsync(operatorScope, PortalRoles.Operator);
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -308,7 +309,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var jobId = await SeedJobInStateAsync(clock, scope, Enum.Parse<JobState>(state));
         var (username, password) = await SeedUserAsync(scope, PortalRoles.Operator);
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -332,7 +333,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var (username, password) = await SeedUserAsync(scope, PortalRoles.Operator);
         var idempotencyKey = Guid.NewGuid();
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -362,7 +363,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var (username, password) = await SeedUserAsync(scope, PortalRoles.Operator);
         var idempotencyKey = Guid.NewGuid();
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -388,7 +389,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var jobId = await ScheduleRetryAsync(clock, scope, TimeSpan.FromHours(1));
         var (username, password) = await SeedUserAsync(scope, PortalRoles.Operator);
 
-        using var factory = CreateFactory(retryEnabled: true);
+        using var factory = CreateFactory(retryEnabled: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -407,7 +408,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var jobId = await ScheduleRetryAsync(clock, scope, TimeSpan.FromHours(1));
         var (username, password) = await SeedUserAsync(scope, PortalRoles.Operator);
 
-        using var factory = CreateFactory(retryEnabled: true, presentation: true);
+        using var factory = CreateFactory(retryEnabled: true, presentation: true, clock: clock);
         using var client = factory.CreateClient(NoRedirect());
         await LoginAsync(client, username, password);
 
@@ -436,7 +437,8 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
             {
                 services.RemoveAll<IPortalOperationalAudit>();
                 services.AddScoped<IPortalOperationalAudit>(_ => new FailingOperationalAudit());
-            }))
+            },
+            clock: clock))
         using (var client = failingFactory.CreateClient(NoRedirect()))
         {
             await LoginAsync(client, username, password);
@@ -447,7 +449,7 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         var afterFailure = await _fixture.Store(clock).GetAsync(scope, jobId, CancellationToken.None);
         Assert.Equal(clock.UtcNow, afterFailure!.NextAttemptAtUtc); // o efeito durável já foi aplicado
 
-        using (var okFactory = CreateFactory(retryEnabled: true))
+        using (var okFactory = CreateFactory(retryEnabled: true, clock: clock))
         using (var client = okFactory.CreateClient(NoRedirect()))
         {
             await LoginAsync(client, username, password);
@@ -465,7 +467,8 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
         bool retryEnabled,
         bool presentation = false,
         Action<IServiceCollection>? configureServices = null,
-        IReadOnlyList<Claim>? stubPrincipalClaims = null) =>
+        IReadOnlyList<Claim>? stubPrincipalClaims = null,
+        MutableClock? clock = null) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             if (stubPrincipalClaims is not null)
@@ -475,6 +478,19 @@ public sealed class Slice4aJobRetryPortalHttpTests(SqlServerFixture fixture)
                     .AddAuthentication(StubPrincipalHandler.SchemeName)
                     .AddScheme<StubPrincipalOptions, StubPrincipalHandler>(
                         StubPrincipalHandler.SchemeName, options => options.Claims = stubPrincipalClaims));
+            }
+
+            if (clock is not null)
+            {
+                // A app real registra IClock/SystemClock (relógio de parede). Sem este override, o SqlJobStore
+                // usado pelo pipeline HTTP aplicaria @now = hora real do sistema — divergente do MutableClock
+                // congelado usado pelo teste para semear o Job e para as asserções, quebrando qualquer
+                // comparação determinística de next_attempt_at_utc. Substituímos pelo MESMO relógio de teste.
+                builder.ConfigureTestServices(services =>
+                {
+                    services.RemoveAll<IClock>();
+                    services.AddSingleton<IClock>(clock);
+                });
             }
 
             builder.UseSetting("environment", "Development");

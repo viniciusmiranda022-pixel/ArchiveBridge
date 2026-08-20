@@ -112,41 +112,65 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
         """;
 
     // Retry manual autorizado (Passo 7): elegível SOMENTE em RetryScheduled (state = 2), SEM fencing por
-    // worker (não há lease ativo neste estado). Adianta next_attempt_at_utc para @now (nunca atrasa) e
-    // grava a chave de idempotência MAIS RECENTE aceita para o Job (retry_idempotency_key). O índice único
-    // filtrado UX_jobs_retry_idempotency (tenant_id, project_id, retry_idempotency_key) é o backstop SQL
-    // contra reuso da MESMA chave por um Job DIFERENTE — a violação de unicidade é capturada e mapeada para
-    // IdempotencyConflict. Um segundo request com a MESMA chave para o MESMO Job não insere uma nova
-    // transição (replay idempotente: nenhum efeito lógico duplicado); somente uma chave NOVA (ou a
-    // primeira) para o Job insere a transição RetryExpedited (auto-loop RetryScheduled → RetryScheduled).
+    // worker (não há lease ativo neste estado). Adianta next_attempt_at_utc para @now (nunca atrasa).
+    //
+    // Idempotência (ajustada em AB-7-002): dbo.job_retry_requests é um LIVRO-RAZÃO append-only — uma linha
+    // POR chave já consumida, para sempre (não apenas a chave mais recente do Job). A leitura dessa linha
+    // pela CHAVE PRIMÁRIA (tenant_id, project_id, idempotency_key) usa WITH (UPDLOCK, HOLDLOCK): isso
+    // serializa qualquer concorrência sobre a MESMA chave — a segunda solicitação concorrente bloqueia até
+    // a primeira confirmar/reverter e então enxerga a linha já gravada (replay), nunca correndo uma
+    // segunda transição. MESMA chave + MESMO job = replay idempotente (nenhum efeito novo). MESMA chave +
+    // job DIFERENTE = conflito determinístico, sem tocar o job B. Chave NOVA + job elegível = aplica
+    // exatamente uma transição RetryExpedited (auto-loop RetryScheduled → RetryScheduled) e grava o
+    // resultado canônico (next_attempt_at_utc aplicado) no ledger.
     private const string RequestManualRetrySql =
         """
         SET NOCOUNT ON;
-        DECLARE @applied TABLE (prior_state TINYINT, prior_key UNIQUEIDENTIFIER);
+        DECLARE @ledgerJob UNIQUEIDENTIFIER;
 
-        UPDATE dbo.jobs
-        SET next_attempt_at_utc = CASE WHEN next_attempt_at_utc IS NULL OR next_attempt_at_utc > @now THEN @now ELSE next_attempt_at_utc END,
-            retry_idempotency_key = @key,
-            updated_at_utc = @now
-        OUTPUT deleted.state, deleted.retry_idempotency_key INTO @applied
-        WHERE job_id = @jobId AND project_id = @project AND state = 2;
+        SELECT @ledgerJob = job_id
+        FROM dbo.job_retry_requests WITH (UPDLOCK, HOLDLOCK)
+        WHERE tenant_id = @tenant AND project_id = @project AND idempotency_key = @key;
 
-        IF EXISTS (SELECT 1 FROM @applied WHERE prior_key IS NULL OR prior_key <> @key)
+        IF @ledgerJob IS NOT NULL
         BEGIN
-            INSERT INTO dbo.job_state_transitions
-                (job_id, tenant_id, project_id, from_state, to_state, reason_code, lease_epoch, worker_id, correlation_id, occurred_at_utc)
-            SELECT @jobId, @tenant, @project, 2, 2, @reason, j.lease_epoch, j.owner_worker, @correlation, @now
-            FROM dbo.jobs j WHERE j.job_id = @jobId AND j.project_id = @project;
-            SELECT 0 AS outcome;
+            IF @ledgerJob = @jobId
+                SELECT 1 AS outcome; -- IdempotentReplay
+            ELSE
+                SELECT 4 AS outcome; -- IdempotencyConflict
         END
-        ELSE IF EXISTS (SELECT 1 FROM @applied)
-            SELECT 1 AS outcome;
         ELSE
         BEGIN
-            IF NOT EXISTS (SELECT 1 FROM dbo.jobs WHERE job_id = @jobId AND project_id = @project)
-                SELECT 3 AS outcome;
+            DECLARE @state TINYINT, @nextAttempt DATETIME2(3), @leaseEpoch BIGINT, @owner NVARCHAR(200);
+            SELECT @state = state, @nextAttempt = next_attempt_at_utc, @leaseEpoch = lease_epoch, @owner = owner_worker
+            FROM dbo.jobs WITH (UPDLOCK, ROWLOCK)
+            WHERE job_id = @jobId AND project_id = @project;
+
+            IF @state IS NULL
+                SELECT 3 AS outcome; -- NotFound (inexistente ou cross-tenant/cross-project)
+            ELSE IF @state <> 2
+                SELECT 2 AS outcome; -- NotEligible
             ELSE
-                SELECT 2 AS outcome;
+            BEGIN
+                DECLARE @canonical DATETIME2(3) =
+                    CASE WHEN @nextAttempt IS NULL OR @nextAttempt > @now THEN @now ELSE @nextAttempt END;
+
+                UPDATE dbo.jobs
+                SET next_attempt_at_utc = @canonical, updated_at_utc = @now
+                WHERE job_id = @jobId AND project_id = @project AND state = 2;
+
+                INSERT INTO dbo.job_state_transitions
+                    (job_id, tenant_id, project_id, from_state, to_state, reason_code, lease_epoch, worker_id, correlation_id, occurred_at_utc)
+                VALUES
+                    (@jobId, @tenant, @project, 2, 2, @reason, @leaseEpoch, @owner, @correlation, @now);
+
+                INSERT INTO dbo.job_retry_requests
+                    (tenant_id, project_id, idempotency_key, job_id, applied_next_attempt_at_utc, created_at_utc)
+                VALUES
+                    (@tenant, @project, @key, @jobId, @canonical, @now);
+
+                SELECT 0 AS outcome; -- Applied
+            END
         END
         """;
 
@@ -340,8 +364,10 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
                 }
                 catch (SqlException sql) when (sql.Number is 2601 or 2627)
                 {
-                    // Backstop do índice único filtrado UX_jobs_retry_idempotency: a MESMA chave já está
-                    // vinculada a um Job DIFERENTE no tenant/projeto — conflito determinístico, sem efeito.
+                    // Defesa em profundidade: a leitura do ledger com UPDLOCK+HOLDLOCK já serializa toda
+                    // concorrência sobre a MESMA (tenant, projeto, chave) — este caminho não deveria ser
+                    // alcançável — mas, se a PK de dbo.job_retry_requests ainda assim disparar (ex.: mudança
+                    // futura de isolamento), o resultado seguro e determinístico é conflito, sem efeito.
                     await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
                     return JobRetryRequestOutcome.IdempotencyConflict;
                 }

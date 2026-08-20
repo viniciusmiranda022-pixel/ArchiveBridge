@@ -62,7 +62,8 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     {
         // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
         // 0001–0018 tivesse divergido, isto lançaria. Um re-apply limpo prova que os hashes anteriores
-        // permanecem estáveis; em seguida confirmamos a 0019 e a coluna/índice de idempotência do retry.
+        // permanecem estáveis; em seguida confirmamos a 0019 e o livro-razão de idempotência do retry
+        // (ajustado em AB-7-002: dbo.job_retry_requests, não mais uma coluna em dbo.jobs).
         var runner = new MigrationRunner(fixture.AdminConnectionString);
         await runner.ApplyAsync(CancellationToken.None); // não lança
 
@@ -75,15 +76,14 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
             Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
         }
 
-        await using (var column = new SqlCommand(
-            "SELECT COUNT(*) FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jobs') AND name = 'retry_idempotency_key';",
-            connection))
+        await using (var table = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.tables WHERE name = 'job_retry_requests';", connection))
         {
-            Assert.Equal(1, Convert.ToInt32(await column.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+            Assert.Equal(1, Convert.ToInt32(await table.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
         }
 
         await using var index = new SqlCommand(
-            "SELECT COUNT(*) FROM sys.indexes WHERE name = 'UX_jobs_retry_idempotency';", connection);
+            "SELECT COUNT(*) FROM sys.indexes WHERE name = 'IX_job_retry_requests_job';", connection);
         Assert.Equal(1, Convert.ToInt32(await index.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
     }
 

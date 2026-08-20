@@ -133,6 +133,35 @@ public sealed class Slice4aJobRetryRequestStoreTests(SqlServerFixture fixture)
         Assert.Single(transitions, t => t.Reason == ReasonCode.RetryExpedited); // nenhum efeito duplicado
     }
 
+    // AB-7-002: prova que o ledger de idempotência é durável para CADA chave já consumida, não apenas
+    // para a "mais recente" do Job. K1 aplicada, depois K2 aplicada ao MESMO job (novo efeito legítimo —
+    // auto-loop RetryScheduled → RetryScheduled), e um replay TARDIO de K1 continua reconhecido como
+    // idempotente — nunca reaplicado como se fosse uma chave nova.
+    [Fact]
+    public async Task AnEarlierKeyRemainsReplayableAfterANewerKeyIsAppliedToTheSameJob()
+    {
+        var clock = new MutableClock(Start);
+        var scope = SqlServerFixture.NewScope();
+        var store = fixture.Store(clock);
+        var audit = fixture.AuditReader();
+        var jobId = await ScheduleRetryAsync(store, clock, scope, TimeSpan.FromHours(1));
+        var keyOne = Guid.NewGuid();
+        var keyTwo = Guid.NewGuid();
+
+        var first = await store.RequestManualRetryAsync(scope, jobId, keyOne, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(JobRetryRequestOutcome.Applied, first);
+
+        var second = await store.RequestManualRetryAsync(scope, jobId, keyTwo, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(JobRetryRequestOutcome.Applied, second); // chave nova no MESMO job: novo efeito lógico legítimo
+
+        var lateReplayOfKeyOne = await store.RequestManualRetryAsync(
+            scope, jobId, keyOne, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(JobRetryRequestOutcome.IdempotentReplay, lateReplayOfKeyOne); // K1 nunca "expira" no ledger
+
+        var transitions = await audit.GetTransitionsAsync(scope, jobId, CancellationToken.None);
+        Assert.Equal(2, transitions.Count(t => t.Reason == ReasonCode.RetryExpedited)); // exatamente K1 + K2
+    }
+
     [Fact]
     public async Task SameKeyForADifferentJobIsADeterministicConflict()
     {
@@ -173,6 +202,11 @@ public sealed class Slice4aJobRetryRequestStoreTests(SqlServerFixture fixture)
 
         var transitions = await audit.GetTransitionsAsync(scope, jobId, CancellationToken.None);
         Assert.Single(transitions, t => t.Reason == ReasonCode.RetryExpedited); // um único efeito lógico
+
+        // Mesmo resultado canônico: qualquer que tenha "vencido" a corrida, o Job reflete UM único instante
+        // aplicado — não duas escritas concorrentes divergentes disputando o valor final.
+        var snapshot = await store.GetAsync(scope, jobId, CancellationToken.None);
+        Assert.Equal(clock.UtcNow, snapshot!.NextAttemptAtUtc);
     }
 
     [Fact]
