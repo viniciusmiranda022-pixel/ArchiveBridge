@@ -80,10 +80,24 @@ Infrastructure.PstProcessing (adapters substituíveis)
   registro (baseline de staleness). `UQ_pst_artifacts_path` impede registrar o mesmo caminho duas vezes no
   mesmo escopo.
 - **`dbo.pst_inspections`** — checkpoint append-only de cada TENTATIVA de inspeção. Só uma tentativa
-  `Completed` cujo hash observado bate com o `expected_hash` é elegível a canônica; reforçado por
-  `UX_pst_inspections_canonical`, um índice único **filtrado** (`WHERE outcome = 0`) que é o backstop de
-  corrida além da revalidação em `Application` — duas execuções concorrentes do mesmo artefato convergem
-  para exatamente UMA linha canônica (ver `ConcurrentInspectionOfTheSameArtifactConvergesToExactlyOneCanonicalRecord`).
+  `Completed` cujo hash observado bate com o `expected_hash` é elegível a canônica. Isto é reforçado por uma
+  coluna `is_canonical` gravada pela Application com o mesmo valor que `PstInspectionRecord.IsCanonical`
+  calcula no Domain (não um filtro de índice que reimplemente a regra separadamente e possa divergir dela) —
+  NÃO é uma coluna computada porque o SQL Server proíbe referenciar coluna computada no predicado de um
+  índice filtrado; em vez disso, um CHECK constraint (`CK_pst_inspections_is_canonical`) trava no banco que o
+  valor gravado é sempre consistente com `outcome`/`observed_hash`/`expected_hash` — e pelo índice único
+  **filtrado** `UX_pst_inspections_canonical` (`WHERE is_canonical = 1`) sobre essa coluna, que é o backstop
+  de corrida além da revalidação em `Application` (que também nunca confia cegamente no que
+  `FindCanonicalAsync` devolve — revalida `IsCanonical` antes de reaproveitar). `ReadError`/`Stale`/
+  `LimitExceeded` (`is_canonical = 0`) nunca ocupam nem disputam este índice — múltiplas tentativas
+  não-canônicas do mesmo artefato coexistem livremente como evidência (ver
+  `ReadErrorIsNeverCanonicalAndDoesNotBlockASubsequentSuccessfulInspection`,
+  `ConcurrentReadErrorAttemptsAreNotConfusedWithACanonicalRace`). Duas execuções concorrentes do mesmo
+  artefato convergem para exatamente UMA linha canônica (ver
+  `ConcurrentInspectionOfTheSameArtifactConvergesToExactlyOneCanonicalRecord`). `SqlPstInspectionStore.SaveAsync`
+  usa `OUTPUT inserted.*` para devolver ao chamador exatamente a linha persistida (inclusive timestamps na
+  precisão de milissegundo de `DATETIME2(3)`) — nunca um valor em memória que divergiria do que um réplay
+  subsequente leria de volta.
 - Ambas as tabelas participam da política de RLS existente (`rls.tenant_isolation_policy`) e concedem
   apenas `SELECT, INSERT` a `ab_app_role` (nenhum `UPDATE`/`DELETE` — append-only; a identidade de
   manutenção não recebe grant algum).
@@ -110,7 +124,9 @@ Infrastructure.PstProcessing (adapters substituíveis)
 
 - Path/tenant/projeto nunca vêm do cliente: `TenantScope` é resolvido pelo composition root a partir do
   principal autenticado; o caminho físico é sempre `raiz configurada + relative_path` validado por
-  `ArtifactPathContainment` (canonicalização + rejeição de symlink/reparse point) antes de abrir o arquivo.
+  `ArtifactPathContainment` (canonicalização + rejeição de symlink/reparse point) antes de abrir o arquivo, E
+  revalidado uma SEGUNDA vez imediatamente após a abertura e antes de qualquer leitura — estreitando (não
+  eliminando; ver limitação abaixo) a janela TOCTOU entre a checagem e a abertura.
 - Cross-tenant/cross-project retorna `PstArtifactNotFoundException` indistinguível de "não existe"
   (`IPstCustodyStore.FindAsync` filtra por `project_id` sob RLS).
 - Erros de leitura (permissão, I/O, TOCTOU) nunca vazam stack trace/caminho real — viram
@@ -125,7 +141,12 @@ Infrastructure.PstProcessing (adapters substituíveis)
   anterior; cada divergência é sua própria linha de evidência (não colide no índice canônico, que só
   protege `Completed`).
 - Corrida de gravação do canônico ⇒ `PstInspectionConflictException` no `SaveAsync`; a Application relê o
-  canônico já persistido em vez de tratar como erro de negócio.
+  canônico já persistido em vez de tratar como erro de negócio. Se a releitura pós-conflito não encontrar
+  nenhum canônico (não deveria ser possível sob o invariante — quem venceu a corrida DEVERIA estar lá), a
+  Application falha fechado com `PstInspectionConflictUnresolvedException` em vez de devolver ao chamador um
+  registro que nunca foi persistido. A tradução de `SqlException` (2601/2627) para `PstInspectionConflictException`
+  em `SqlPstInspectionStore` é restrita à violação do índice `UX_pst_inspections_canonical` especificamente —
+  outra violação de UNIQUE/PK nunca é mascarada como corrida idempotente.
 
 ### Observabilidade/auditoria
 
@@ -140,7 +161,7 @@ Infrastructure.PstProcessing (adapters substituíveis)
 | 1 | Domain/Application independentes de parser/vendor | `VendorBoundaryTests`, `DependencyRuleTests` |
 | 2 | PST autorizado inspecionado read-only, resultado persistido/scoped/auditável | `Slice4bPstInspectionTests.ValidUnicodePstIsDiagnosedValidAndBecomesCanonical` |
 | 3 | Hash/tamanho representam os bytes realmente inspecionados; PST byte-for-byte inalterado | mesmo teste (`onDisk == bytes` após inspeção) |
-| 4 | Reexecução idempotente ⇒ canônico sem duplicar efeitos | `IdempotentReplayReturnsTheSameCanonicalRecordWithoutANewRow` |
+| 4 | Reexecução idempotente ⇒ canônico sem duplicar efeitos | `IdempotentReplayReturnsTheSameCanonicalRecordWithoutANewRow`, `ReadErrorIsNeverCanonicalAndDoesNotBlockASubsequentSuccessfulInspection`, `ConcurrentReadErrorAttemptsAreNotConfusedWithACanonicalRace` |
 | 5 | Artefato alterado/stale falha fechado, não reutiliza resultado anterior | `HashDivergenceSinceRegistrationFailsClosedAsStale` |
 | 6 | Arquivo inválido/truncado/corrompido ⇒ diagnóstico estruturado, nunca sucesso falso/crash | `TruncatedFileIsDiagnosedTooSmallNeverThrows`, `InvalidSignatureFileIsDiagnosedStructurallyNeverThrows`, `UnsupportedVersionIsDiagnosedStructurally` |
 | 7 | Cross-tenant/cross-project/path traversal negados sem revelar existência | `CrossTenantAndCrossProjectAreDeniedIndistinguishablyFromNotFound`, `Slice4bPstInspectionDomainTests.RelativePath*` |
@@ -160,6 +181,11 @@ logs/evidências; avanço para o próximo Passo do Slice 4B.
 
 ## Limitações residuais (para Passos futuros)
 
+- A dupla checagem de contenção/reparse (`ArtifactPathContainment`, antes e depois da abertura do arquivo)
+  **estreita** a janela TOCTOU entre a checagem e a abertura, mas não a **elimina**: ambas reexaminam o
+  caminho no sistema de arquivos, não o handle/descritor já aberto. Uma garantia atômica exigiria
+  verificação baseada em handle (API específica de plataforma via P/Invoke), fora do escopo deste Passo sem
+  novo ADR — ver `docs/security/threat-model-slice-04b.md`.
 - `ItemCount`/`FolderCount` permanecem `null` — travessia da árvore NDB exige uma engine primária ainda
   não aceita por ADR (ver [Decisão de adapter](#decisão-de-adapter-passo-1)).
 - Nenhuma orquestração assíncrona (fila/worker) foi registrada — `InspectPstArtifactUseCase` é hoje

@@ -187,6 +187,49 @@ public sealed class InspectPstArtifactUseCaseTests
         Assert.Equal(1, inspectionStore.SaveCount); // tentou gravar uma vez, conflitou, não tentou de novo
     }
 
+    [Fact]
+    public async Task ConflictWithNoCanonicalFoundOnRereadFailsClosedInsteadOfReturningUnpersistedRecord()
+    {
+        // AB-4B-002 item 2: "existing ?? record" era fail-open — devolvia ao chamador um registro que NUNCA
+        // foi persistido quando a releitura pós-conflito não encontrava nada. Isso não deveria ser possível
+        // sob o invariante (quem venceu o índice único DEVERIA estar lá); a Application deve falhar fechado.
+        var scope = NewScope();
+        var hash = Hash("race-no-winner");
+        var artifact = ArtifactId.New();
+        var custodyStore = new FakePstCustodyStore(scope, artifact, Custody(scope, hash));
+        var inspectionStore = new FakePstInspectionStore(throwOnFirstSave: true); // conflita; releitura não acha canônico algum
+        var engine = new FakePstEngine(new PstInspectionResult(hash, 100, PstStructuralDiagnostic.Valid, PstFormatVariant.Unicode2013Plus, null, null));
+        var useCase = new InspectPstArtifactUseCase(custodyStore, inspectionStore, engine, new StubClock(Now));
+
+        await Assert.ThrowsAsync<PstInspectionConflictUnresolvedException>(() =>
+            useCase.ExecuteAsync(scope, artifact, CorrelationId.New(), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task NonCanonicalRecordReturnedByStoreIsNeverTrustedAsReplayFailsClosed()
+    {
+        // Defesa em profundidade (AB-4B-002 item 1): mesmo que a store devolva de FindCanonicalAsync um
+        // registro que o próprio Domain não reconhece como canônico (bug/corrupção/divergência de query),
+        // a Application nunca reaproveita isso silenciosamente como réplay idempotente.
+        var scope = NewScope();
+        var expectedHash = Hash("expected-in-custody");
+        var storedButDivergentHash = Hash("what-the-store-actually-has");
+        var artifact = ArtifactId.New();
+        var custodyStore = new FakePstCustodyStore(scope, artifact, Custody(scope, expectedHash));
+        var nonCanonical = PstInspectionRecord.Complete(
+            InspectionId.New(), scope.Tenant, scope.Project, artifact, expectedHash, storedButDivergentHash, 100,
+            PstStructuralDiagnostic.Valid, PstFormatVariant.Unicode2013Plus, "Engine", "1.0", CorrelationId.New(), Now, Now);
+        Assert.False(nonCanonical.IsCanonical); // pré-condição do cenário
+        var inspectionStore = new FakePstInspectionStore(nonCanonical);
+        var engine = new FakePstEngine(new PstInspectionResult(expectedHash, 100, PstStructuralDiagnostic.Valid, PstFormatVariant.Unicode2013Plus, null, null));
+        var useCase = new InspectPstArtifactUseCase(custodyStore, inspectionStore, engine, new StubClock(Now));
+
+        await Assert.ThrowsAsync<PstInspectionCanonicityViolationException>(() =>
+            useCase.ExecuteAsync(scope, artifact, CorrelationId.New(), CancellationToken.None));
+
+        Assert.Equal(0, engine.InvocationCount); // falha fechado ANTES de reinvocar a engine
+    }
+
     // ---- Duplos de teste (implementam as portas diretamente, sem Infrastructure) ----
 
     private sealed class FakePstCustodyStore : IPstCustodyStore

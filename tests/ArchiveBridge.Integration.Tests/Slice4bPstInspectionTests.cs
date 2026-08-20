@@ -196,4 +196,116 @@ public sealed class Slice4bPstInspectionTests(SqlServerFixture fixture)
         Assert.NotNull(finalCheck);
         Assert.Equal(results[0].Id, finalCheck!.Id);
     }
+
+    // ---- AB-4B-002 item 1: ReadError nunca ocupa nem é devolvido como canônico ----
+
+    [Fact]
+    public async Task ReadErrorIsNeverCanonicalAndDoesNotBlockASubsequentSuccessfulInspection()
+    {
+        var bytes = Slice4bPstProcessingSupport.ValidUnicodeHeader();
+        var hash = DeterministicHash.ComputeBytes(bytes);
+        var scope = await NewProjectScopeAsync();
+        const string relative = "delayed.pst"; // registrado em custódia, mas o arquivo ainda NÃO existe no disco.
+        var artifact = await Slice4bPstProcessingSupport.CustodyStore(fixture)
+            .RegisterAsync(scope.Tenant, scope.Project, new PstRelativePath(relative), hash, bytes.Length, CancellationToken.None);
+        var useCase = Slice4bPstProcessingSupport.UseCase(fixture);
+
+        // 1ª tentativa: arquivo inexistente ⇒ ReadError, persistido como evidência, NUNCA canônico.
+        var first = await useCase.ExecuteAsync(scope, artifact.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(PstInspectionOutcome.Completed, first.Outcome);
+        Assert.Equal(PstStructuralDiagnostic.ReadError, first.Diagnostic);
+        Assert.False(first.IsCanonical);
+
+        // Réplay imediato: o ReadError anterior NÃO é reaproveitado como se fosse canônico — a engine é
+        // reinvocada de verdade (arquivo continua ausente) e produz sua PRÓPRIA linha de evidência.
+        var stillMissing = await useCase.ExecuteAsync(scope, artifact.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(PstStructuralDiagnostic.ReadError, stillMissing.Diagnostic);
+        Assert.NotEqual(first.Id, stillMissing.Id);
+
+        // A leitura é restabelecida: o arquivo passa a existir com o MESMO hash registrado em custódia.
+        Slice4bPstProcessingSupport.WriteFile(fixture, relative, bytes);
+
+        // 2ª tentativa real: a inspeção é reexecutada de verdade (nunca bloqueada pelo ReadError anterior) e
+        // agora se torna a canônica.
+        var recovered = await useCase.ExecuteAsync(scope, artifact.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(PstStructuralDiagnostic.Valid, recovered.Diagnostic);
+        Assert.True(recovered.IsCanonical);
+
+        // Réplay subsequente: agora sim reaproveita o canônico real, sem reinvocar a engine (mesma linha).
+        var replay = await useCase.ExecuteAsync(scope, artifact.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(recovered.Id, replay.Id);
+
+        var canonicalRow = await Slice4bPstProcessingSupport.InspectionStore(fixture)
+            .FindCanonicalAsync(scope, artifact.Id, hash, CancellationToken.None);
+        Assert.NotNull(canonicalRow);
+        Assert.Equal(recovered.Id, canonicalRow!.Id);
+    }
+
+    [Fact]
+    public async Task ConcurrentReadErrorAttemptsAreNotConfusedWithACanonicalRace()
+    {
+        var bytes = Slice4bPstProcessingSupport.ValidUnicodeHeader();
+        var hash = DeterministicHash.ComputeBytes(bytes);
+        var scope = await NewProjectScopeAsync();
+        var artifact = await Slice4bPstProcessingSupport.CustodyStore(fixture)
+            .RegisterAsync(scope.Tenant, scope.Project, new PstRelativePath("missing-concurrent.pst"), hash, bytes.Length, CancellationToken.None);
+        // O arquivo NUNCA é escrito nesta prova — toda tentativa concorrente resulta em ReadError.
+
+        var tasks = Enumerable.Range(0, 4)
+            .Select(_ => Slice4bPstProcessingSupport.UseCase(fixture)
+                .ExecuteAsync(scope, artifact.Id, CorrelationId.New(), CancellationToken.None))
+            .ToArray();
+        var results = await Task.WhenAll(tasks);
+
+        Assert.All(results, r => Assert.Equal(PstStructuralDiagnostic.ReadError, r.Diagnostic));
+        Assert.All(results, r => Assert.False(r.IsCanonical));
+        // Nenhuma delas disputa o índice único filtrado (que só protege is_canonical=1) — cada tentativa é
+        // sua própria linha de evidência, sem PstInspectionConflictException nem colisão de "canônico".
+        Assert.Equal(4, results.Select(r => r.Id).Distinct().Count());
+    }
+
+    // ---- AB-4B-002 item 3: symlink/reparse point na cadeia de custódia falha fechado como ReadError ----
+
+    [Fact]
+    public async Task SymlinkedArtifactPathIsRejectedFailClosedAsReadError()
+    {
+        var outside = Path.Combine(Path.GetTempPath(), "ab_pst_outside_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        var outsideFile = Path.Combine(outside, "real.pst");
+        File.WriteAllBytes(outsideFile, Slice4bPstProcessingSupport.ValidUnicodeHeader());
+
+        var root = Slice4bPstProcessingSupport.PstRoot(fixture);
+        Directory.CreateDirectory(root);
+        var linkPath = Path.Combine(root, "escape-link.pst");
+        try
+        {
+            File.CreateSymbolicLink(linkPath, outsideFile);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            return; // Ambiente sem suporte a symlink: cenário não aplicável (mesma convenção de ArtifactPathContainmentTests).
+        }
+
+        try
+        {
+            var scope = await NewProjectScopeAsync();
+            var registeredHash = DeterministicHash.ComputeBytes(Slice4bPstProcessingSupport.ValidUnicodeHeader());
+            var artifact = await Slice4bPstProcessingSupport.CustodyStore(fixture)
+                .RegisterAsync(scope.Tenant, scope.Project, new PstRelativePath("escape-link.pst"), registeredHash, 4096, CancellationToken.None);
+            var useCase = Slice4bPstProcessingSupport.UseCase(fixture);
+
+            var result = await useCase.ExecuteAsync(scope, artifact.Id, CorrelationId.New(), CancellationToken.None);
+
+            // Falha fechado: nunca lê através do symlink, nunca reporta sucesso — mesmo que o alvo real
+            // seja um PST válido com o hash "certo", o caminho de custódia nunca deveria ser um reparse point.
+            Assert.Equal(PstInspectionOutcome.Completed, result.Outcome);
+            Assert.Equal(PstStructuralDiagnostic.ReadError, result.Diagnostic);
+            Assert.False(result.IsCanonical);
+        }
+        finally
+        {
+            File.Delete(linkPath);
+            Directory.Delete(outside, recursive: true);
+        }
+    }
 }

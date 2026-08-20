@@ -24,10 +24,20 @@ namespace ArchiveBridge.Infrastructure.PstProcessing;
 ///     custódia registrou, para que a comparação de staleness seja sempre significativa;
 ///   - é substituível: quando uma engine primária real for aceita por ADR futuro, ela implementa
 ///     <see cref="IPstEngine"/> em paralelo/substituição, sem tocar Domain/Application/Contracts.
-/// Abre em modo somente leitura, nunca escreve, nunca segue symlink/reparse point (contenção via
-/// <see cref="ArtifactPathContainment"/>) e nunca deixa exceção não tratada escapar como "sucesso" — todo
-/// erro de leitura vira <see cref="PstStructuralDiagnostic.ReadError"/> sanitizado (sem stack trace/caminho
-/// real). Limite de tamanho/tempo excedido lança <see cref="PstInspectionLimitExceededException"/>.
+/// Abre em modo somente leitura, nunca escreve, e nunca deixa exceção não tratada escapar como "sucesso" —
+/// todo erro de leitura vira <see cref="PstStructuralDiagnostic.ReadError"/> sanitizado (sem stack
+/// trace/caminho real). Limite de tamanho/tempo excedido lança <see cref="PstInspectionLimitExceededException"/>.
+///
+/// GARANTIA DE SYMLINK/REPARSE (ver threat model do Passo 1 — alegação corrigida em AB-4B-002 item 3):
+/// <see cref="ArtifactPathContainment"/> rejeita qualquer symlink/reparse point observado na cadeia de
+/// diretórios NO MOMENTO da checagem, e esta engine repete a mesma checagem uma SEGUNDA vez, imediatamente
+/// após abrir o <see cref="FileStream"/> e ANTES de ler qualquer byte — estreitando a janela TOCTOU de
+/// "check→open" para "check→open→recheck→leitura". Isto NÃO é uma garantia atômica: as duas checagens
+/// reexaminam o CAMINHO no sistema de arquivos, não o handle/descritor já aberto; uma verificação
+/// baseada no handle (ex.: resolver o destino real do descritor de arquivo via API específica de
+/// plataforma) eliminaria a janela por completo, mas exige interop específico de SO sem ADR aceito até
+/// este Passo. Qualquer reparse point detectado em qualquer uma das duas checagens falha fechado como
+/// <see cref="PstStructuralDiagnostic.ReadError"/> — nunca lê nem hasheia o conteúdo.
 /// </summary>
 public sealed class HeaderOnlyPstInspectionEngine(IPstCustodyStore custodyStore, PstStorageOptions options) : IPstEngine
 {
@@ -117,6 +127,19 @@ public sealed class HeaderOnlyPstInspectionEngine(IPstCustodyStore custodyStore,
             FileShare.Read,
             StreamBufferSize,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+        // Segunda checagem de contenção/reparse (ver doc da classe): estreita, mas não elimina, a janela
+        // TOCTOU entre a checagem original (antes do FileStream acima) e o início da leitura. Qualquer
+        // reparse point detectado agora falha fechado — a stream já aberta é descartada pelo "await using"
+        // do escopo do método, nenhum byte é lido/hasheado.
+        try
+        {
+            ArtifactPathContainment.EnsureContained(_options.RootPath, absolutePath);
+        }
+        catch (ArgumentException)
+        {
+            return ReadErrorResult();
+        }
 
         var header = new byte[HeaderPrefixLength];
         var headerLength = 0;

@@ -42,6 +42,15 @@ public sealed class InspectPstArtifactUseCase(
             .ConfigureAwait(false);
         if (canonical is not null)
         {
+            // Defesa em profundidade: a Application nunca confia cegamente que tudo que a store devolve
+            // de FindCanonicalAsync É de fato canônico — revalida o invariante do próprio Domain antes de
+            // reaproveitar. Reforça a regra "na Application", não só no SQL (ver AB-4B-002 item 1).
+            if (!canonical.IsCanonical)
+            {
+                throw new PstInspectionCanonicityViolationException(
+                    "IPstInspectionStore.FindCanonicalAsync devolveu um registro que o Domain não reconhece como canônico.");
+            }
+
             // Réplay idempotente: mesmo artefato + mesmo hash de custódia ⇒ resultado canônico, sem
             // reinvocar a engine (§4 dos critérios de aceite — "sem duplicar efeitos").
             return canonical;
@@ -62,7 +71,18 @@ public sealed class InspectPstArtifactUseCase(
             var existing = await _inspectionStore
                 .FindCanonicalAsync(scope, artifact, custody.RegisteredHash, cancellationToken)
                 .ConfigureAwait(false);
-            return existing ?? record;
+
+            // Fail-closed (AB-4B-002 item 2): "existing ?? record" devolveria ao chamador um registro NUNCA
+            // persistido caso a releitura não encontre nada — mascarando corrupção/condição inesperada como
+            // se fosse um checkpoint durável. Se o índice único sinalizou conflito, um canônico DEVE existir;
+            // sua ausência é uma violação de invariante, não um "sem resultado" silencioso.
+            if (existing is null)
+            {
+                throw new PstInspectionConflictUnresolvedException(
+                    "Conflito de gravação detectado (índice único de canonicidade), mas nenhum resultado canônico foi encontrado na releitura.");
+            }
+
+            return existing;
         }
     }
 

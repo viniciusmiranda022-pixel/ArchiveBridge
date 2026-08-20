@@ -34,8 +34,9 @@ CREATE TABLE dbo.pst_artifacts
 GO
 
 -- Checkpoints de inspeção (dbo.pst_inspections): append-only, uma linha por TENTATIVA. Só uma tentativa
--- Completed cujo hash observado bate com expected_hash pode ser canônica — reforçado pelo índice único
--- filtrado abaixo (backstop de corrida além da revalidação em Application).
+-- Completed cujo hash observado bate com expected_hash pode ser canônica — reforçado pela coluna computada
+-- is_canonical (abaixo) e pelo índice único filtrado sobre ela (backstop de corrida além da revalidação em
+-- Application).
 CREATE TABLE dbo.pst_inspections
 (
     inspection_id       UNIQUEIDENTIFIER NOT NULL,
@@ -77,10 +78,28 @@ CREATE TABLE dbo.pst_inspections
 );
 GO
 
--- Idempotência: só existe UMA tentativa canônica (Completed, hash observado == esperado) por artefato.
+-- Canonicidade reforçada como COLUNA explícita gravada pela aplicação (nunca um filtro de índice que
+-- reimplemente a regra separadamente e possa divergir de PstInspectionRecord.IsCanonical no Domain — a
+-- Application calcula IsCanonical UMA vez e grava o mesmo valor aqui). NÃO é uma coluna computada: o SQL
+-- Server proíbe referenciar coluna computada no predicado WHERE de um índice filtrado ("filter expression
+-- cannot include a computed column"), mesmo PERSISTED. Em vez disso, o CHECK abaixo reforça no banco que o
+-- valor gravado é SEMPRE consistente com outcome/observed_hash/expected_hash — não é possível gravar
+-- is_canonical divergente da regra do Domain, mesmo por acidente ou bug futuro na Application.
+ALTER TABLE dbo.pst_inspections ADD is_canonical BIT NOT NULL CONSTRAINT DF_pst_inspections_is_canonical DEFAULT 0;
+GO
+
+ALTER TABLE dbo.pst_inspections ADD CONSTRAINT CK_pst_inspections_is_canonical CHECK (
+    is_canonical = CASE WHEN outcome = 0 AND observed_hash IS NOT NULL AND observed_hash = expected_hash
+                         THEN CONVERT(BIT, 1) ELSE CONVERT(BIT, 0) END
+);
+GO
+
+-- Idempotência: só existe UMA tentativa canônica por artefato+hash esperado. ReadError/Stale/LimitExceeded
+-- (is_canonical = 0) nunca ocupam nem disputam este índice — múltiplas tentativas não-canônicas do mesmo
+-- artefato coexistem livremente como evidência/auditoria (ver critério de aceite do AB-4B-002 item 1).
 CREATE UNIQUE INDEX UX_pst_inspections_canonical
     ON dbo.pst_inspections (tenant_id, project_id, artifact_id, expected_hash)
-    WHERE outcome = 0;
+    WHERE is_canonical = 1;
 GO
 
 -- Índice de consulta do histórico de tentativas por artefato (evidência/auditoria), mais recente primeiro.

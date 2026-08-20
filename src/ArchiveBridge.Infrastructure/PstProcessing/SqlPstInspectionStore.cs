@@ -12,13 +12,22 @@ namespace ArchiveBridge.Infrastructure.PstProcessing;
 
 /// <summary>
 /// Custódia SQL append-only das tentativas de inspeção (<see cref="PstInspectionRecord"/>). A idempotência
-/// do resultado canônico é reforçada pelo índice único filtrado <c>UX_pst_inspections_canonical</c> — o
-/// backstop de corrida quando duas execuções concorrentes tentam gravar o canônico do mesmo (tenant,
-/// projeto, artefato, hash esperado) ao mesmo tempo (Application relê via <see cref="FindCanonicalAsync"/>
-/// ao capturar <see cref="PstInspectionConflictException"/>).
+/// do resultado canônico é reforçada pela coluna <c>is_canonical</c>, gravada por <see cref="SaveAsync"/>
+/// com o mesmo valor que <see cref="PstInspectionRecord.IsCanonical"/> calcula no Domain (nunca um filtro de
+/// índice que reimplemente a regra separadamente) e travada por um CHECK constraint (migration) que impede
+/// gravar um valor divergente da regra, e pelo índice único filtrado <c>UX_pst_inspections_canonical</c>
+/// sobre ela — o backstop de corrida quando duas execuções concorrentes tentam gravar o canônico do mesmo
+/// (tenant, projeto, artefato, hash esperado) ao mesmo tempo (Application relê via
+/// <see cref="FindCanonicalAsync"/> ao capturar <see cref="PstInspectionConflictException"/>).
 /// </summary>
 public sealed class SqlPstInspectionStore(TenantConnectionFactory connectionFactory) : IPstInspectionStore
 {
+    // Nome do índice único filtrado que reforça a canonicidade — usado para restringir a tradução de
+    // SqlException 2601/2627 (violação de UNIQUE/PK) exatamente a este backstop de corrida esperado. Uma
+    // violação de OUTRA constraint única (ex.: PK_pst_inspections por colisão de GUID) não pode ser mascarada
+    // como corrida idempotente — deve propagar como o erro inesperado que é.
+    private const string CanonicalIndexName = "UX_pst_inspections_canonical";
+
     private const string FindCanonicalSql =
         """
         SET NOCOUNT ON;
@@ -26,20 +35,29 @@ public sealed class SqlPstInspectionStore(TenantConnectionFactory connectionFact
                observed_size_bytes, outcome, diagnostic, format_variant, engine_name, engine_version,
                correlation_id, started_at_utc, completed_at_utc
         FROM dbo.pst_inspections
-        WHERE outcome = 0 AND artifact_id = @artifact AND project_id = @project AND expected_hash = @expectedHash;
+        WHERE is_canonical = 1 AND artifact_id = @artifact AND project_id = @project AND expected_hash = @expectedHash;
         """;
 
+    // OUTPUT inserted.* devolve as colunas EXATAMENTE como persistidas (ex.: started_at_utc/completed_at_utc
+    // truncados para a precisão de milissegundo de DATETIME2(3)) — SaveAsync nunca retorna ao chamador um
+    // valor em memória que diverge do que um réplay subsequente (FindCanonicalAsync) leria de volta.
+    // is_canonical é gravado explicitamente com o valor calculado pelo Domain (PstInspectionRecord.IsCanonical)
+    // — CK_pst_inspections_is_canonical (migration) reforça no banco que este valor nunca diverge da regra.
     private const string InsertSql =
         """
         SET NOCOUNT ON;
         INSERT INTO dbo.pst_inspections
             (inspection_id, tenant_id, project_id, artifact_id, expected_hash, observed_hash,
              observed_size_bytes, outcome, diagnostic, format_variant, engine_name, engine_version,
-             correlation_id, started_at_utc, completed_at_utc)
+             correlation_id, started_at_utc, completed_at_utc, is_canonical)
+        OUTPUT inserted.inspection_id, inserted.tenant_id, inserted.project_id, inserted.artifact_id,
+               inserted.expected_hash, inserted.observed_hash, inserted.observed_size_bytes, inserted.outcome,
+               inserted.diagnostic, inserted.format_variant, inserted.engine_name, inserted.engine_version,
+               inserted.correlation_id, inserted.started_at_utc, inserted.completed_at_utc
         VALUES
             (@inspectionId, @tenant, @project, @artifact, @expectedHash, @observedHash,
              @observedSizeBytes, @outcome, @diagnostic, @formatVariant, @engineName, @engineVersion,
-             @correlation, @startedAt, @completedAt);
+             @correlation, @startedAt, @completedAt, @isCanonical);
         """;
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
@@ -67,16 +85,26 @@ public sealed class SqlPstInspectionStore(TenantConnectionFactory connectionFact
         Bind(command, record);
         try
         {
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            var inserted = await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+                ? ReadRecord(reader)
+                : throw new InvalidOperationException("INSERT com OUTPUT não devolveu a linha persistida.");
+            return inserted;
         }
-        catch (SqlException sql) when (sql.Number is 2601 or 2627)
+        catch (SqlException sql) when (sql.Number is 2601 or 2627 && IsCanonicalIndexViolation(sql))
         {
             throw new PstInspectionConflictException(
                 "Uma tentativa canônica concorrente já foi gravada para este artefato/hash.", sql);
         }
-
-        return record;
     }
+
+    // SqlException não expõe o nome da constraint/índice como propriedade estruturada — apenas na
+    // mensagem em texto livre (comportamento padrão do driver). Restringe a tradução para
+    // PstInspectionConflictException exatamente ao backstop de canonicidade esperado; qualquer OUTRA
+    // violação de UNIQUE/PK (ex.: colisão de PK_pst_inspections) propaga como SqlException não traduzida —
+    // nunca mascarada como corrida idempotente.
+    private static bool IsCanonicalIndexViolation(SqlException sql) =>
+        sql.Message.Contains(CanonicalIndexName, StringComparison.Ordinal);
 
     private static void Bind(SqlCommand command, PstInspectionRecord record)
     {
@@ -99,6 +127,7 @@ public sealed class SqlPstInspectionStore(TenantConnectionFactory connectionFact
         command.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = record.Correlation.Value });
         command.Parameters.Add(new SqlParameter("@startedAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(record.StartedAtUtc) });
         command.Parameters.Add(new SqlParameter("@completedAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(record.CompletedAtUtc) });
+        command.Parameters.Add(new SqlParameter("@isCanonical", SqlDbType.Bit) { Value = record.IsCanonical });
     }
 
     private static PstInspectionRecord ReadRecord(SqlDataReader reader) =>
