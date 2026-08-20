@@ -188,6 +188,33 @@ Domain.PstProcessing
 - Defesa em profundidade: a Application revalida `IsCanonical` (da inspeção **e** do plano) e a identidade
   determinística antes de reaproveitar qualquer coisa que a store devolva como "canônico".
 
+## A persistência é uma fronteira NÃO confiável (AB-4B-005)
+
+Um `CHECK` constraint do SQL Server é **row-local**: ele não consegue relacionar a linha do plano às suas
+linhas-filhas. Por isso o banco aceita, sozinho, uma linha canônica cujas *partes* contradizem o agregado —
+sequências não contíguas, soma diferente de `source_size_bytes`, parte acima de `hard_part_bytes`,
+`covers_entire_source` incoerente com o caso "cabe em uma parte". Reidratar essas linhas sem validá-las
+transformaria `PartitionPlan.Rehydrate` num caminho de confiança implícita e anularia, no réplay, os
+invariantes que `PartitionPlan.Create` garante na criação.
+
+- **Caminho único de validação**: `Create` e `Rehydrate` compartilham `FindStructuralViolation` — criar e
+  reidratar nunca podem divergir sobre o que é um plano válido. A diferença é apenas o tipo de falha:
+  `ArgumentException` (argumento inválido) vs. `PartitionPlanIntegrityViolationException` (dado persistido
+  corrompido/adulterado).
+- **Identidade revalidada contra as próprias entradas persistidas**: comparar o `plan_hash` gravado com o
+  `plan_hash` PEDIDO pelo chamador não prova nada sobre a linha. `Rehydrate` recalcula
+  `PartitionPlanIdentity.ComputePlanHash(...)` a partir de tenant/projeto/origem/política/planner
+  **persistidos** e exige igualdade exata; cada `part_key` tem de ser exatamente
+  `ComputePartKey(plan_hash, sequência)`. `PartitionPlan.HasConsistentIdentity()` expõe a mesma verificação
+  para a Application aplicá-la a qualquer implementação de `IPartitionPlanStore`.
+- **Fail-closed, nunca normalização**: uma linha inválida não é corrigida, truncada nem ignorada — a leitura
+  falha e nenhum plano é devolvido ou reaproveitado (`ReplayOf...FailsClosed`, cinco cenários com dados
+  corrompidos gravados fora da aplicação em SQL Server real).
+- **Sem migration nova**: os invariantes restantes são **agregados** (plano × partes) e nenhum `CHECK`
+  row-local os expressa; os row-local que existem já estão em 0021 (`part_sequence >= 1`,
+  `planned_size_bytes >= 0`, coerência desfecho/motivo/`part_count`/`is_canonical`). A migration 0021
+  permanece **byte-for-byte** intacta, como toda 0001–0020.
+
 ## Segurança e minimização de PII
 
 - Tenant/projeto/artefato vêm sempre do `TenantScope` resolvido pelo composition root; cross-tenant e

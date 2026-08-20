@@ -411,6 +411,179 @@ public sealed class Slice4bPartitionPlanningTests(SqlServerFixture fixture)
         Assert.Contains("FK_pst_partition_plans_inspection", exception.Message, StringComparison.Ordinal);
     }
 
+    // ---- A PERSISTÊNCIA É FRONTEIRA NÃO CONFIÁVEL: linha canônica corrompida nunca é reaproveitada ----
+    //
+    // Cada cenário abaixo grava, por FORA da aplicação (identidade de manutenção), uma linha canônica que o
+    // banco aceita — porque nenhum CHECK row-local consegue relacionar o plano às suas partes — mas que
+    // viola um invariante AGREGADO do Domain. As linhas usam a identidade determinística REAL que a
+    // aplicação recalcularia, de modo que o réplay idempotente realmente as encontra: provar que ele falha
+    // fechado (em vez de devolver um plano estruturalmente inválido) é o objetivo do teste.
+
+    [Fact]
+    public async Task ReplayOfAPersistedCanonicalPlanWhosePartsDoNotSumToTheSourceFailsClosed() =>
+        await AssertCorruptCanonicalPlanIsRejectedAsync(
+            "corrupt-sum.pst", PartitionPolicy.RunbookDefault,
+            partSizeDelta: -1, partSequence: 1, coversEntireSource: false, forgeStoredPlanHash: false);
+
+    [Fact]
+    public async Task ReplayOfAPersistedCanonicalPlanWithANonContiguousPartSequenceFailsClosed() =>
+        await AssertCorruptCanonicalPlanIsRejectedAsync(
+            "corrupt-sequence.pst", PartitionPolicy.RunbookDefault,
+            partSizeDelta: 0, partSequence: 2, coversEntireSource: true, forgeStoredPlanHash: false);
+
+    [Fact]
+    public async Task ReplayOfAPersistedCanonicalPlanWithAPartAboveTheHardLimitFailsClosed() =>
+        // Parte gravada acima do limite DURO da política persistida (20 GB do runbook §20.1).
+        await AssertCorruptCanonicalPlanIsRejectedAsync(
+            "corrupt-hard-limit.pst", PartitionPolicy.RunbookDefault,
+            partSizeDelta: PartitionPolicy.RunbookDefault.HardPartBytes,
+            partSequence: 1, coversEntireSource: false, forgeStoredPlanHash: false);
+
+    [Fact]
+    public async Task ReplayOfASinglePartCanonicalPlanThatDoesNotCoverTheEntireSourceFailsClosed() =>
+        await AssertCorruptCanonicalPlanIsRejectedAsync(
+            "corrupt-covers.pst", PartitionPolicy.RunbookDefault,
+            partSizeDelta: 0, partSequence: 1, coversEntireSource: false, forgeStoredPlanHash: false);
+
+    [Fact]
+    public async Task ReplayOfACanonicalPlanWhoseStoredHashDoesNotMatchItsPersistedInputsFailsClosed() =>
+        // Estruturalmente íntegro: só a IDENTIDADE gravada não fecha com as próprias entradas persistidas.
+        await AssertCorruptCanonicalPlanIsRejectedAsync(
+            "corrupt-identity.pst", PartitionPolicy.RunbookDefault,
+            partSizeDelta: 0, partSequence: 1, coversEntireSource: true, forgeStoredPlanHash: true);
+
+    private async Task AssertCorruptCanonicalPlanIsRejectedAsync(
+        string fileName,
+        PartitionPolicy policy,
+        long partSizeDelta,
+        int partSequence,
+        bool coversEntireSource,
+        bool forgeStoredPlanHash)
+    {
+        var (scope, artifact, _) = await RegisterAndInspectAsync(
+            Slice4bPstProcessingSupport.ValidUnicodeHeader(), fileName);
+        var (source, storedPlanHash) = await SeedCorruptCanonicalPlanAsync(
+            scope, artifact, policy, partSizeDelta, partSequence, coversEntireSource, forgeStoredPlanHash);
+
+        // 1) A store nunca devolve a linha corrompida como plano: reidratar já falha fechado.
+        await Assert.ThrowsAsync<PartitionPlanIntegrityViolationException>(() =>
+            Slice4bPstProcessingSupport.PlanStore(fixture)
+                .FindCanonicalAsync(scope, artifact, storedPlanHash, CancellationToken.None));
+
+        // 2) O réplay idempotente do caso de uso — que recalcula EXATAMENTE esta identidade — também falha
+        //    fechado, em vez de devolver o plano inválido ou gravar uma segunda linha canônica por cima.
+        if (!forgeStoredPlanHash)
+        {
+            await Assert.ThrowsAsync<PartitionPlanIntegrityViolationException>(() =>
+                Slice4bPstProcessingSupport.PlanUseCase(fixture, policy)
+                    .ExecuteAsync(scope, artifact, CorrelationId.New(), CancellationToken.None));
+        }
+
+        // Nenhuma segunda linha canônica foi gravada por cima da corrompida, e nada nela foi "corrigido".
+        Assert.Equal(1, await PlanRowCountAsync(scope, artifact));
+        Assert.Equal(source.SourceSizeBytes!.Value, await ScalarAsync<long>(
+            scope,
+            "SELECT source_size_bytes FROM dbo.pst_partition_plans WHERE artifact_id = @artifact AND project_id = @project;",
+            ("@artifact", artifact.Value), ("@project", scope.Project.Value)));
+    }
+
+    /// <summary>
+    /// Grava, fora da aplicação, UMA linha canônica com a identidade determinística real do artefato e uma
+    /// parte deliberadamente incoerente com o agregado. Devolve a origem persistida e o <c>plan_hash</c>
+    /// efetivamente gravado.
+    /// </summary>
+    private async Task<(PartitionPlanSource Source, Sha256Hash StoredPlanHash)> SeedCorruptCanonicalPlanAsync(
+        TenantScope scope,
+        ArtifactId artifact,
+        PartitionPolicy policy,
+        long partSizeDelta,
+        int partSequence,
+        bool coversEntireSource,
+        bool forgeStoredPlanHash)
+    {
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+        await using (var context = new SqlCommand(
+            "EXEC sys.sp_set_session_context @key = N'tenant_id', @value = @tenant;", connection))
+        {
+            context.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+            await context.ExecuteNonQueryAsync();
+        }
+
+        // A origem persistida do plano é a MESMA que a aplicação usaria: a inspeção canônica do Passo 1.
+        Guid inspection;
+        string expectedHash, engineName, engineVersion;
+        long observedSize;
+        await using (var lookup = new SqlCommand(
+            """
+            SELECT TOP 1 inspection_id, expected_hash, observed_size_bytes, engine_name, engine_version
+            FROM dbo.pst_inspections
+            WHERE artifact_id = @artifact AND project_id = @project AND is_canonical = 1;
+            """,
+            connection))
+        {
+            lookup.Parameters.Add(new SqlParameter("@artifact", SqlDbType.UniqueIdentifier) { Value = artifact.Value });
+            lookup.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+            await using var reader = await lookup.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync(), "A inspeção canônica do artefato é pré-condição do cenário.");
+            inspection = reader.GetGuid(0);
+            expectedHash = reader.GetString(1);
+            observedSize = reader.GetInt64(2);
+            engineName = reader.GetString(3);
+            engineVersion = reader.GetString(4);
+        }
+
+        var source = new PartitionPlanSource(
+            artifact, new InspectionId(inspection), new Sha256Hash(expectedHash.TrimEnd()), observedSize,
+            engineName, engineVersion);
+        var planner = Slice4bPstProcessingSupport.Planner(policy).Identity;
+        var storedPlanHash = forgeStoredPlanHash
+            ? DeterministicHash.Compute(["identity-of-another-input"])
+            : PartitionPlanIdentity.ComputePlanHash(scope.Tenant, scope.Project, source, policy, planner);
+
+        var planId = Guid.NewGuid();
+        await using var command = new SqlCommand(
+            """
+            INSERT INTO dbo.pst_partition_plans
+                (plan_id, tenant_id, project_id, artifact_id, inspection_id, source_hash, source_size_bytes,
+                 plan_hash, policy_fingerprint, target_part_bytes, hard_part_bytes, planner_name, planner_version,
+                 engine_name, engine_version, outcome, reason, part_count, is_canonical, correlation_id, planned_at_utc)
+            VALUES
+                (@planId, @tenant, @project, @artifact, @inspection, @sourceHash, @sourceSize,
+                 @planHash, @policyFingerprint, @targetPartBytes, @hardPartBytes, @plannerName, @plannerVersion,
+                 @engineName, @engineVersion, 0, 0, 1, 1, NEWID(), SYSUTCDATETIME());
+
+            INSERT INTO dbo.pst_partition_plan_parts
+                (part_id, plan_id, tenant_id, project_id, part_sequence, part_key, planned_size_bytes, covers_entire_source)
+            VALUES
+                (NEWID(), @planId, @tenant, @project, @sequence, @partKey, @partSize, @covers);
+            """,
+            connection);
+        command.Parameters.Add(new SqlParameter("@planId", SqlDbType.UniqueIdentifier) { Value = planId });
+        command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        command.Parameters.Add(new SqlParameter("@artifact", SqlDbType.UniqueIdentifier) { Value = artifact.Value });
+        command.Parameters.Add(new SqlParameter("@inspection", SqlDbType.UniqueIdentifier) { Value = inspection });
+        command.Parameters.Add(new SqlParameter("@sourceHash", SqlDbType.Char, 64) { Value = source.SourceHash.Value });
+        command.Parameters.Add(new SqlParameter("@sourceSize", SqlDbType.BigInt) { Value = observedSize });
+        command.Parameters.Add(new SqlParameter("@planHash", SqlDbType.Char, 64) { Value = storedPlanHash.Value });
+        command.Parameters.Add(new SqlParameter("@policyFingerprint", SqlDbType.Char, 64) { Value = policy.Fingerprint.Value });
+        command.Parameters.Add(new SqlParameter("@targetPartBytes", SqlDbType.BigInt) { Value = policy.TargetPartBytes });
+        command.Parameters.Add(new SqlParameter("@hardPartBytes", SqlDbType.BigInt) { Value = policy.HardPartBytes });
+        command.Parameters.Add(new SqlParameter("@plannerName", SqlDbType.NVarChar, 100) { Value = planner.Name });
+        command.Parameters.Add(new SqlParameter("@plannerVersion", SqlDbType.NVarChar, 50) { Value = planner.Version });
+        command.Parameters.Add(new SqlParameter("@engineName", SqlDbType.NVarChar, 100) { Value = engineName });
+        command.Parameters.Add(new SqlParameter("@engineVersion", SqlDbType.NVarChar, 50) { Value = engineVersion });
+        command.Parameters.Add(new SqlParameter("@sequence", SqlDbType.Int) { Value = partSequence });
+        command.Parameters.Add(new SqlParameter("@partKey", SqlDbType.Char, 64)
+        { Value = PartitionPlanIdentity.ComputePartKey(storedPlanHash, partSequence).Value });
+        command.Parameters.Add(new SqlParameter("@partSize", SqlDbType.BigInt) { Value = observedSize + partSizeDelta });
+        command.Parameters.Add(new SqlParameter("@covers", SqlDbType.Bit) { Value = coversEntireSource });
+        await command.ExecuteNonQueryAsync();
+
+        return (source, storedPlanHash);
+    }
+
     private async Task InsertPlanRowAsync(
         TenantScope scope, ArtifactId artifact, Guid inspection, byte outcome, byte reason, int partCount, byte isCanonical)
     {

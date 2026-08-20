@@ -119,7 +119,10 @@ public sealed class PlanPstPartitionUseCase(
             return null;
         }
 
-        if (!existing.IsCanonical || existing.PlanHash != planHash)
+        // Defesa em profundidade em TRÊS eixos, independentemente da implementação de store: o plano tem de
+        // ser canônico para o Domain, ter a identidade PEDIDA e ter uma identidade que se sustenta nas suas
+        // próprias entradas (um plan_hash gravado que não é o recalculado nunca é reaproveitado em réplay).
+        if (!existing.IsCanonical || existing.PlanHash != planHash || !existing.HasConsistentIdentity())
         {
             throw new PartitionPlanCanonicityViolationException(
                 "IPartitionPlanStore.FindCanonicalAsync devolveu um plano que o Domain não reconhece como canônico para esta identidade.");

@@ -417,6 +417,222 @@ public sealed class Slice4bPartitionPlanningDomainTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new PartitionPlanSource(
             ArtifactId.New(), null, Hash("h"), -1, null, null));
 
+    // ---- Reidratação: a persistência é fronteira NÃO CONFIÁVEL ----
+
+    [Fact]
+    public void RehydratingAWellFormedPersistedPlanPreservesIdentityCorrelationAndTimestamp()
+    {
+        var custody = Custody(Hash("rehydrate-ok"));
+        var persisted = Plan(custody, Canonical(custody, 4096));
+
+        var rehydrated = Rehydrate(persisted);
+
+        // Reidratar valida, mas NUNCA regenera: nada de novo ID, carimbo de tempo ou correlação.
+        Assert.Equal(persisted.Id, rehydrated.Id);
+        Assert.Equal(persisted.PlanHash, rehydrated.PlanHash);
+        Assert.Equal(persisted.Correlation, rehydrated.Correlation);
+        Assert.Equal(persisted.PlannedAtUtc, rehydrated.PlannedAtUtc);
+        Assert.Equal(Assert.Single(persisted.Parts).Id, Assert.Single(rehydrated.Parts).Id);
+        Assert.True(rehydrated.IsCanonical);
+        Assert.True(rehydrated.HasConsistentIdentity());
+    }
+
+    [Fact]
+    public void RehydratingAPersistedPlanWhosePartsDoNotSumToTheSourceSizeFailsClosed()
+    {
+        var custody = Custody(Hash("rehydrate-sum"));
+        var persisted = Plan(custody, Canonical(custody, 4096));
+        var truncated = Assert.Single(persisted.Parts);
+
+        // A linha-filha foi adulterada para 1 byte a menos que a origem: a soma deixa de cobrir o artefato.
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(
+            persisted,
+            [new PartitionPlanPart(
+                truncated.Id, truncated.Sequence, truncated.PartKey, truncated.PlannedSizeBytes - 1, coversEntireSource: false)]));
+    }
+
+    [Fact]
+    public void RehydratingAPersistedPlanWithNonContiguousPartSequencesFailsClosed()
+    {
+        var custody = Custody(Hash("rehydrate-sequence"));
+        var persisted = Plan(custody, Canonical(custody, 4096));
+        var only = Assert.Single(persisted.Parts);
+
+        // Sequência 2 sem a 1: a parte 1 desapareceu da persistência (ou nunca foi gravada).
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(
+            persisted,
+            [new PartitionPlanPart(
+                only.Id,
+                sequence: 2,
+                PartitionPlanIdentity.ComputePartKey(persisted.PlanHash, 2),
+                only.PlannedSizeBytes,
+                only.CoversEntireSource)]));
+    }
+
+    [Fact]
+    public void RehydratingAPersistedPartAboveTheHardLimitFailsClosed()
+    {
+        var policy = PartitionPolicy.Create(100, 200);
+        var (tenant, project) = (new TenantId(Guid.NewGuid()), new ProjectId(Guid.NewGuid()));
+        var source = new PartitionPlanSource(ArtifactId.New(), InspectionId.New(), Hash("hard"), 300, "Engine", "1.0");
+        var planHash = PartitionPlanIdentity.ComputePlanHash(tenant, project, source, policy, Planner);
+
+        // A soma bate com a origem, mas a parte única viola o limite DURO da política persistida.
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => RehydrateRaw(
+            tenant, project, source, policy, planHash, PartitionPlanReason.SinglePartWithinTarget,
+            [new PartitionPlanPart(
+                PartitionPlanPartId.New(), 1, PartitionPlanIdentity.ComputePartKey(planHash, 1), 300, true)]));
+    }
+
+    [Fact]
+    public void RehydratingASinglePartWithinTargetPlanThatDoesNotCoverTheEntireSourceFailsClosed()
+    {
+        var custody = Custody(Hash("rehydrate-covers"));
+        var persisted = Plan(custody, Canonical(custody, 4096));
+        var only = Assert.Single(persisted.Parts);
+
+        // covers_entire_source = 0 numa parte única de SinglePartWithinTarget: o plano afirmaria caber
+        // inteiro numa parte que declara NÃO cobrir a origem — contradição, nunca normalizada em silêncio.
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(
+            persisted,
+            [new PartitionPlanPart(
+                only.Id, only.Sequence, only.PartKey, only.PlannedSizeBytes, coversEntireSource: false)]));
+    }
+
+    [Fact]
+    public void RehydratingAPlannedPlanWithoutPartsOrWithoutTheInspectionIdentityFailsClosed()
+    {
+        var custody = Custody(Hash("rehydrate-required"));
+        var persisted = Plan(custody, Canonical(custody, 4096));
+
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(persisted, []));
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(
+            persisted,
+            source: new PartitionPlanSource(custody.Id, null, custody.RegisteredHash, 4096, "Engine", "1.0")));
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(
+            persisted,
+            source: new PartitionPlanSource(custody.Id, InspectionId.New(), custody.RegisteredHash, 4096, null, null)));
+    }
+
+    [Fact]
+    public void RehydratingANonPlannedPlanThatCarriesPartsFailsClosed()
+    {
+        var custody = Custody(Hash("rehydrate-blocked"));
+        var persisted = Plan(custody, Canonical(custody, 4096));
+
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(
+            persisted, reason: PartitionPlanReason.ItemInventoryUnavailable));
+    }
+
+    [Fact]
+    public void RehydratingAReasonThatIsNotAKnownEnumValueFailsClosed()
+    {
+        var custody = Custody(Hash("rehydrate-reason"));
+        var persisted = Plan(custody, Canonical(custody, 4096));
+
+        // reason é persistido como TINYINT: um byte desconhecido é dado corrompido, não argumento inválido.
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(
+            persisted, reason: (PartitionPlanReason)99));
+    }
+
+    [Fact]
+    public void RehydratingAPlanWhoseStoredHashDoesNotMatchItsOwnInputsFailsClosed()
+    {
+        var custody = Custody(Hash("rehydrate-identity"));
+        var persisted = Plan(custody, Canonical(custody, 4096));
+
+        // Estruturalmente íntegro, mas o plan_hash gravado não é o recalculado a partir das entradas
+        // persistidas: comparar o hash gravado com o PEDIDO pelo chamador nunca bastaria para detectar isso.
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(
+            persisted, planHash: Hash("identity-of-another-input")));
+    }
+
+    [Fact]
+    public void RehydratingAPlanWhoseStoredInputsWereTamperedWithFailsClosed()
+    {
+        var custody = Custody(Hash("rehydrate-tampered"));
+        var persisted = Plan(custody, Canonical(custody, 4096));
+
+        // Mesmo plan_hash e mesmas partes, mas a inspeção de origem gravada foi trocada: a identidade
+        // determinística deixa de fechar com as próprias entradas.
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(
+            persisted,
+            source: new PartitionPlanSource(
+                custody.Id, InspectionId.New(), custody.RegisteredHash, 4096,
+                persisted.Source.EngineName, persisted.Source.EngineVersion)));
+    }
+
+    [Fact]
+    public void RehydratingAPartKeyThatIsNotDerivedFromThePlanIdentityFailsClosed()
+    {
+        var custody = Custody(Hash("rehydrate-part-key"));
+        var persisted = Plan(custody, Canonical(custody, 4096));
+        var only = Assert.Single(persisted.Parts);
+
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => Rehydrate(
+            persisted,
+            [new PartitionPlanPart(
+                only.Id, only.Sequence, Hash("forged-part-key"), only.PlannedSizeBytes, only.CoversEntireSource)]));
+    }
+
+    [Fact]
+    public void CreationAndRehydrationShareTheSameNotionOfAValidPlan()
+    {
+        // O MESMO conjunto inválido é recusado nos dois caminhos — criar e reidratar nunca divergem sobre o
+        // que é um plano válido (apenas o tipo de exceção difere: argumento inválido vs. dado persistido).
+        var (tenant, project) = (new TenantId(Guid.NewGuid()), new ProjectId(Guid.NewGuid()));
+        var source = new PartitionPlanSource(ArtifactId.New(), InspectionId.New(), Hash("shared"), 100, "Engine", "1.0");
+        var planHash = PartitionPlanIdentity.ComputePlanHash(tenant, project, source, PartitionPolicy.RunbookDefault, Planner);
+        PartitionPlanPart[] partial =
+            [new PartitionPlanPart(PartitionPlanPartId.New(), 1, PartitionPlanIdentity.ComputePartKey(planHash, 1), 100, false)];
+
+        Assert.Throws<ArgumentException>(() => PartitionPlan.Create(
+            PartitionPlanId.New(), tenant, project, source, PartitionPolicy.RunbookDefault, Planner, planHash,
+            PartitionPlanReason.SinglePartWithinTarget, partial, CorrelationId.New(), Now));
+        Assert.Throws<PartitionPlanIntegrityViolationException>(() => RehydrateRaw(
+            tenant, project, source, PartitionPolicy.RunbookDefault, planHash,
+            PartitionPlanReason.SinglePartWithinTarget, partial));
+    }
+
+    [Fact]
+    public void APartThatCoversTheEntireSourceCanNeverCoexistWithOtherParts()
+    {
+        var (tenant, project) = (new TenantId(Guid.NewGuid()), new ProjectId(Guid.NewGuid()));
+        var source = new PartitionPlanSource(ArtifactId.New(), InspectionId.New(), Hash("coexist"), 100, "Engine", "1.0");
+        PartitionPlanPart[] parts =
+        [
+            new PartitionPlanPart(PartitionPlanPartId.New(), 1, Hash("a"), 100, true),
+            new PartitionPlanPart(PartitionPlanPartId.New(), 2, Hash("b"), 0, false),
+        ];
+
+        Assert.Throws<ArgumentException>(() => PartitionPlan.Create(
+            PartitionPlanId.New(), tenant, project, source, PartitionPolicy.RunbookDefault, Planner, Hash("plan"),
+            PartitionPlanReason.SinglePartWithinTarget, parts, CorrelationId.New(), Now));
+    }
+
+    private static PartitionPlan Rehydrate(
+        PartitionPlan persisted,
+        IReadOnlyList<PartitionPlanPart>? parts = null,
+        PartitionPlanSource? source = null,
+        Sha256Hash? planHash = null,
+        PartitionPlanReason? reason = null) =>
+        PartitionPlan.Rehydrate(
+            persisted.Id, persisted.Tenant, persisted.Project, source ?? persisted.Source, persisted.Policy,
+            persisted.Planner, planHash ?? persisted.PlanHash, reason ?? persisted.Reason,
+            parts ?? persisted.Parts, persisted.Correlation, persisted.PlannedAtUtc);
+
+    private static PartitionPlan RehydrateRaw(
+        TenantId tenant,
+        ProjectId project,
+        PartitionPlanSource source,
+        PartitionPolicy policy,
+        Sha256Hash planHash,
+        PartitionPlanReason reason,
+        IReadOnlyList<PartitionPlanPart> parts) =>
+        PartitionPlan.Rehydrate(
+            PartitionPlanId.New(), tenant, project, source, policy, Planner, planHash, reason, parts,
+            CorrelationId.New(), Now);
+
     [Fact]
     public void PolicyCanonicalJsonUsesInvariantFormattingForLargeNumbers()
     {

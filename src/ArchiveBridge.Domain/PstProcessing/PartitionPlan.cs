@@ -197,34 +197,33 @@ public sealed class PartitionPlan
         ArgumentNullException.ThrowIfNull(planner);
         ArgumentNullException.ThrowIfNull(parts);
 
-        if (tenant.Value == Guid.Empty)
+        if (FindStructuralViolation(tenant, project, source, policy, reason, parts) is { } violation)
         {
-            throw new ArgumentException("Tenant é obrigatório para planejar.", nameof(tenant));
-        }
-
-        if (project.Value == Guid.Empty)
-        {
-            throw new ArgumentException("Projeto é obrigatório para planejar.", nameof(project));
-        }
-
-        var outcome = PartitionPlanReasons.OutcomeOf(reason);
-        if (outcome == PartitionPlanOutcome.Planned)
-        {
-            ValidatePlanned(source, policy, parts);
-        }
-        else if (parts.Count > 0)
-        {
-            throw new ArgumentException(
-                "Plano não concluído (Unsupported/Blocked) nunca tem partes — boundaries jamais são inventados.",
-                nameof(parts));
+            throw new ArgumentException(violation.Message, violation.ParamName);
         }
 
         return new PartitionPlan(
-            id, tenant, project, source, policy, planner, planHash, outcome, reason,
+            id, tenant, project, source, policy, planner, planHash, PartitionPlanReasons.OutcomeOf(reason), reason,
             [.. parts], correlation, plannedAtUtc);
     }
 
-    /// <summary>Reconstrói um plano já persistido (uso exclusivo da camada de persistência).</summary>
+    /// <summary>
+    /// Reconstrói um plano JÁ PERSISTIDO (uso exclusivo da camada de persistência) preservando exatamente a
+    /// identidade, os carimbos de tempo e a correlação gravados — nada é regenerado nem normalizado.
+    /// <para>
+    /// A persistência é uma fronteira NÃO CONFIÁVEL: a reidratação aplica os MESMOS invariantes estruturais
+    /// de <see cref="Create"/> (via <see cref="FindStructuralViolation"/>, caminho único e compartilhado) e
+    /// ainda revalida a identidade determinística contra as PRÓPRIAS entradas persistidas — o
+    /// <c>plan_hash</c> gravado tem de ser exatamente
+    /// <see cref="PartitionPlanIdentity.ComputePlanHash"/> dessas entradas e cada <c>part_key</c> tem de ser
+    /// exatamente <see cref="PartitionPlanIdentity.ComputePartKey"/> do plano + sequência. Uma linha
+    /// corrompida ou adulterada falha fechado em vez de ser devolvida/reaproveitada em réplay.
+    /// </para>
+    /// </summary>
+    /// <exception cref="PartitionPlanIntegrityViolationException">
+    /// A linha persistida viola um invariante estrutural do agregado ou sua identidade determinística
+    /// gravada não corresponde às entradas persistidas.
+    /// </exception>
     public static PartitionPlan Rehydrate(
         PartitionPlanId id,
         TenantId tenant,
@@ -238,33 +237,107 @@ public sealed class PartitionPlan
         CorrelationId correlation,
         DateTimeOffset plannedAtUtc)
     {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(policy);
+        ArgumentNullException.ThrowIfNull(planner);
         ArgumentNullException.ThrowIfNull(parts);
+
+        // O motivo é persistido como TINYINT: um byte fora do enum conhecido não tem desfecho derivável e é
+        // dado corrompido, não "argumento inválido" de um chamador.
+        if (!Enum.IsDefined(reason))
+        {
+            throw new PartitionPlanIntegrityViolationException(
+                "O motivo persistido não é um PartitionPlanReason conhecido — nenhum desfecho pode ser derivado dele.");
+        }
+
+        if (FindStructuralViolation(tenant, project, source, policy, reason, parts) is { } violation)
+        {
+            throw new PartitionPlanIntegrityViolationException(
+                $"Plano persistido viola um invariante estrutural do Domain: {violation.Message}");
+        }
+
+        if (PartitionPlanIdentity.ComputePlanHash(tenant, project, source, policy, planner) != planHash)
+        {
+            throw new PartitionPlanIntegrityViolationException(
+                "O plan_hash persistido não corresponde à identidade determinística recalculada a partir das próprias entradas persistidas.");
+        }
+
+        foreach (var part in parts)
+        {
+            if (PartitionPlanIdentity.ComputePartKey(planHash, part.Sequence) != part.PartKey)
+            {
+                throw new PartitionPlanIntegrityViolationException(
+                    "Uma part_key persistida não corresponde à chave opaca determinística derivada do plano e da sequência.");
+            }
+        }
+
         return new PartitionPlan(
-            id, tenant, project, source, policy, planner, planHash,
-            PartitionPlanReasons.OutcomeOf(reason), reason, [.. parts], correlation, plannedAtUtc);
+            id, tenant, project, source, policy, planner, planHash, PartitionPlanReasons.OutcomeOf(reason), reason,
+            [.. parts], correlation, plannedAtUtc);
     }
 
-    private static void ValidatePlanned(
-        PartitionPlanSource source, PartitionPolicy policy, IReadOnlyList<PartitionPlanPart> parts)
+    /// <summary>
+    /// Verdadeiro quando o <see cref="PlanHash"/> deste plano é EXATAMENTE a identidade determinística
+    /// recalculada a partir das suas próprias entradas (escopo, origem, política, planner). Permite que a
+    /// Application recuse, em defesa em profundidade, um plano cuja identidade gravada não se sustenta —
+    /// independentemente da implementação de store que o devolveu.
+    /// </summary>
+    public bool HasConsistentIdentity() =>
+        PartitionPlanIdentity.ComputePlanHash(Tenant, Project, Source, Policy, Planner) == PlanHash;
+
+    /// <summary>Invariante estrutural violado, já sanitizado (nunca carrega caminho, UPN ou conteúdo).</summary>
+    private readonly record struct StructuralViolation(string Message, string ParamName);
+
+    /// <summary>
+    /// Caminho ÚNICO de validação dos invariantes estruturais do agregado, compartilhado por
+    /// <see cref="Create"/> e <see cref="Rehydrate"/> — criar e reidratar nunca podem divergir sobre o que é
+    /// um plano válido. Devolve <see langword="null"/> quando o plano é válido.
+    /// </summary>
+    private static StructuralViolation? FindStructuralViolation(
+        TenantId tenant,
+        ProjectId project,
+        PartitionPlanSource source,
+        PartitionPolicy policy,
+        PartitionPlanReason reason,
+        IReadOnlyList<PartitionPlanPart> parts)
     {
+        if (tenant.Value == Guid.Empty)
+        {
+            return new StructuralViolation("Tenant é obrigatório para planejar.", nameof(tenant));
+        }
+
+        if (project.Value == Guid.Empty)
+        {
+            return new StructuralViolation("Projeto é obrigatório para planejar.", nameof(project));
+        }
+
+        if (PartitionPlanReasons.OutcomeOf(reason) != PartitionPlanOutcome.Planned)
+        {
+            return parts.Count > 0
+                ? new StructuralViolation(
+                    "Plano não concluído (Unsupported/Blocked) nunca tem partes — boundaries jamais são inventados.",
+                    nameof(parts))
+                : null;
+        }
+
         if (source.Inspection is null)
         {
-            throw new ArgumentException("Plano concluído exige a identidade da inspeção canônica.", nameof(source));
+            return new StructuralViolation("Plano concluído exige a identidade da inspeção canônica.", nameof(source));
         }
 
         if (source.SourceSizeBytes is not { } sourceSize)
         {
-            throw new ArgumentException("Plano concluído exige o tamanho observado da origem.", nameof(source));
+            return new StructuralViolation("Plano concluído exige o tamanho observado da origem.", nameof(source));
         }
 
         if (source.EngineName is null || source.EngineVersion is null)
         {
-            throw new ArgumentException("Plano concluído exige nome/versão da engine da inspeção.", nameof(source));
+            return new StructuralViolation("Plano concluído exige nome/versão da engine da inspeção.", nameof(source));
         }
 
         if (parts.Count == 0)
         {
-            throw new ArgumentException("Plano concluído exige ao menos uma parte.", nameof(parts));
+            return new StructuralViolation("Plano concluído exige ao menos uma parte.", nameof(parts));
         }
 
         long total = 0;
@@ -273,22 +346,50 @@ public sealed class PartitionPlan
             var part = parts[index];
             if (part.Sequence != index + 1)
             {
-                throw new ArgumentException("Sequências das partes devem ser contíguas e começar em 1.", nameof(parts));
+                return new StructuralViolation(
+                    "Sequências das partes devem ser contíguas e começar em 1.", nameof(parts));
             }
 
             if (part.PlannedSizeBytes > policy.HardPartBytes)
             {
-                throw new ArgumentException("Nenhuma parte planejada pode exceder HardPartBytes.", nameof(parts));
+                return new StructuralViolation("Nenhuma parte planejada pode exceder HardPartBytes.", nameof(parts));
             }
 
+            // Uma parte que declara cobrir a origem INTEIRA só pode existir sozinha e com o tamanho exato do
+            // observado — do contrário o plano afirmaria, ao mesmo tempo, cobrir tudo e ser parcial.
+            if (part.CoversEntireSource && (parts.Count != 1 || part.PlannedSizeBytes != sourceSize))
+            {
+                return new StructuralViolation(
+                    "Uma parte que cobre a origem inteira precisa ser a única do plano e ter exatamente o tamanho observado.",
+                    nameof(parts));
+            }
+
+            // Somar antes de comparar poderia estourar Int64 num conjunto persistido adulterado; como todo
+            // tamanho é não-negativo, ultrapassar a origem já é violação e encerra a soma com segurança.
             total += part.PlannedSizeBytes;
+            if (total > sourceSize)
+            {
+                return new StructuralViolation(
+                    "A soma das partes planejadas deve cobrir exatamente o tamanho observado da origem.", nameof(parts));
+            }
         }
 
         if (total != sourceSize)
         {
-            throw new ArgumentException(
+            return new StructuralViolation(
                 "A soma das partes planejadas deve cobrir exatamente o tamanho observado da origem.", nameof(parts));
         }
+
+        // Regra específica do único motivo concluído deste Passo: "cabe em uma parte" é literalmente UMA
+        // parte cobrindo a origem inteira. Qualquer outra forma seria um split — capacidade inexistente aqui.
+        if (reason == PartitionPlanReason.SinglePartWithinTarget
+            && (parts.Count != 1 || !parts[0].CoversEntireSource))
+        {
+            return new StructuralViolation(
+                "SinglePartWithinTarget exige exatamente uma parte que cobre a origem inteira.", nameof(parts));
+        }
+
+        return null;
     }
 
     /// <summary>Identidade do plano.</summary>

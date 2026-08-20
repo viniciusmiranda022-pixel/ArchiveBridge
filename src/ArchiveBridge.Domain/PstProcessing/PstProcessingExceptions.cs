@@ -162,6 +162,35 @@ public sealed class PartitionPlanConflictUnresolvedException : Exception
 }
 
 /// <summary>
+/// Lançada por <see cref="PartitionPlan.Rehydrate"/> quando uma linha JÁ PERSISTIDA viola um invariante
+/// estrutural do agregado (partes não contíguas, soma divergente do tamanho de origem, parte acima do limite
+/// duro, <c>covers_entire_source</c> incoerente, campos obrigatórios ausentes) ou quando a identidade
+/// determinística gravada não corresponde às próprias entradas persistidas (<c>plan_hash</c>/<c>part_key</c>
+/// recalculados divergem). A persistência é uma fronteira NÃO CONFIÁVEL: uma linha corrompida ou adulterada
+/// nunca pode ser reidratada, devolvida ou reaproveitada em réplay como se fosse um plano válido — e nunca é
+/// silenciosamente normalizada. Fail-closed.
+/// </summary>
+public sealed class PartitionPlanIntegrityViolationException : Exception
+{
+    /// <summary>Cria a exceção sem mensagem.</summary>
+    public PartitionPlanIntegrityViolationException()
+    {
+    }
+
+    /// <summary>Cria a exceção com mensagem.</summary>
+    public PartitionPlanIntegrityViolationException(string message)
+        : base(message)
+    {
+    }
+
+    /// <summary>Cria a exceção com mensagem e causa.</summary>
+    public PartitionPlanIntegrityViolationException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
+}
+
+/// <summary>
 /// Lançada pela Application quando a store de planos devolve, como canônico, um <see cref="PartitionPlan"/>
 /// que o Domain não reconhece como tal (<see cref="PartitionPlan.IsCanonical"/> falso) ou cuja identidade
 /// determinística não é a esperada. Defesa em profundidade: a Application nunca reaproveita cegamente um
