@@ -47,6 +47,10 @@ CREATE TABLE dbo.pst_partition_plans
     engine_version      NVARCHAR(50)     NULL,
     outcome             TINYINT          NOT NULL,
     reason              TINYINT          NOT NULL,
+    -- part_count é gravado junto do plano (e não derivado por COUNT) porque um CHECK constraint não pode
+    -- consultar outra tabela: é ele que permite ao BANCO reforçar "Unsupported/Blocked nunca tem partes" e
+    -- a regra de canonicidade abaixo. Plano e partes são gravados na MESMA transação, então os dois nunca
+    -- divergem (uma falha no meio do caminho desfaz ambos).
     part_count          INT              NOT NULL,
     is_canonical        BIT              NOT NULL,
     correlation_id      UNIQUEIDENTIFIER NOT NULL,
