@@ -135,6 +135,53 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Migration0022AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0021 tivesse divergido (inclusive a do Passo 2 do Slice 4B), isto lançaria. Em seguida
+        // confirmamos a 0022 e os objetos aditivos da execução de particionamento.
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 22;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var tables = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.tables WHERE name = 'pst_partition_executions';", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // Toda linha é canônica por construção: o índice único (não filtrado) já é o backstop completo de
+        // idempotência/concorrência.
+        await using (var canonicalIndex = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.indexes WHERE name = 'UX_pst_partition_executions_canonical' AND has_filter = 0 AND is_unique = 1;",
+            connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await canonicalIndex.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // Append-only: a aplicação recebe apenas SELECT/INSERT na tabela nova (nenhum UPDATE/DELETE).
+        await using var grants = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.database_permissions AS p
+            JOIN sys.objects AS o ON o.object_id = p.major_id
+            JOIN sys.database_principals AS r ON r.principal_id = p.grantee_principal_id
+            WHERE r.name = 'ab_app_role'
+              AND o.name = 'pst_partition_executions'
+              AND p.permission_name NOT IN ('SELECT', 'INSERT');
+            """,
+            connection);
+        Assert.Equal(0, Convert.ToInt32(await grants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
         var original = await ReadHashAsync(1);

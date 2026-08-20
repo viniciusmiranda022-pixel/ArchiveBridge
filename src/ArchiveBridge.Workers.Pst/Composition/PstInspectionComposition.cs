@@ -12,15 +12,17 @@ using Microsoft.Extensions.Hosting;
 namespace ArchiveBridge.Workers.Pst.Composition;
 
 /// <summary>
-/// Raiz de composição das capacidades PST do Slice 4B: inspeção (Passo 1) e PLANEJAMENTO de particionamento
-/// (Passo 2). Reutiliza as implementações REAIS existentes (sem versões paralelas) e é FAIL-CLOSED no
-/// startup: com <c>Enabled=false</c> nenhum serviço é registrado (nenhuma conexão SQL é sequer aberta); com
-/// <c>Enabled=true</c>, configuração inválida derruba o host antes de qualquer efeito. O planejamento tem
-/// sua própria chave (<see cref="PstPartitionPlanningOptions"/>, também <c>false</c> por padrão) e exige a
-/// inspeção habilitada — habilitá-lo sozinho derruba o host em vez de ser ignorado silenciosamente.
+/// Raiz de composição das capacidades PST do Slice 4B: inspeção (Passo 1), PLANEJAMENTO de particionamento
+/// (Passo 2) e EXECUÇÃO de particionamento (Passo 3). Reutiliza as implementações REAIS existentes (sem
+/// versões paralelas) e é FAIL-CLOSED no startup: com <c>Enabled=false</c> nenhum serviço é registrado
+/// (nenhuma conexão SQL é sequer aberta); com <c>Enabled=true</c>, configuração inválida derruba o host
+/// antes de qualquer efeito. Cada capacidade tem sua própria chave (<see cref="PstPartitionPlanningOptions"/>,
+/// <see cref="PstPartitionExecutionOptions"/>, ambas <c>false</c> por padrão) e exige a capacidade anterior
+/// habilitada — habilitar uma sozinha derruba o host em vez de ser ignorado silenciosamente.
 /// Registra apenas casos de uso diretamente invocáveis (<see cref="InspectPstArtifactUseCase"/>,
-/// <see cref="PlanPstPartitionUseCase"/>) — NÃO registra worker que reivindica fila (nenhuma orquestração
-/// assíncrona foi autorizada nestes Passos; ver STOP-THE-LINE dos work orders).
+/// <see cref="PlanPstPartitionUseCase"/>, <see cref="ExecutePartitionPlanUseCase"/>) — NÃO registra worker
+/// que reivindica fila (nenhuma orquestração assíncrona foi autorizada nestes Passos; ver STOP-THE-LINE dos
+/// work orders).
 /// </summary>
 public static class PstInspectionComposition
 {
@@ -37,14 +39,24 @@ public static class PstInspectionComposition
             .Get<PstPartitionPlanningOptions>() ?? new PstPartitionPlanningOptions();
         builder.Services.AddSingleton(planningOptions);
 
+        var executionOptions = builder.Configuration.GetSection(PstPartitionExecutionOptions.SectionName)
+            .Get<PstPartitionExecutionOptions>() ?? new PstPartitionExecutionOptions();
+        builder.Services.AddSingleton(executionOptions);
+
         if (!options.Enabled)
         {
             // Inspeção desabilitada ⇒ nenhum serviço é registrado (não executa, não conecta). Se o
-            // planejamento estivesse habilitado sozinho, isso seria uma configuração incoerente e SILENCIOSA:
-            // valida aqui para derrubar o host em vez de ignorar a intenção do operador.
+            // planejamento (ou a execução) estivesse habilitado sozinho, isso seria uma configuração
+            // incoerente e SILENCIOSA: valida aqui para derrubar o host em vez de ignorar a intenção do
+            // operador.
             if (planningOptions.Enabled)
             {
                 planningOptions.ValidateForOperation(inspectionEnabled: false);
+            }
+
+            if (executionOptions.Enabled)
+            {
+                executionOptions.ValidateForOperation(planningEnabled: false, sourceRootPath: options.RootPath);
             }
 
             return;
@@ -59,8 +71,17 @@ public static class PstInspectionComposition
             ? planningOptions.ValidateForOperation(inspectionEnabled: true)
             : null;
 
+        // Execução habilitada exige planejamento habilitado (só executa um plano já persistido) e raiz de
+        // output válida/distinta — fail-closed no startup, mesmo com a inspeção ligada, em vez de registrar
+        // um caso de uso incoerente ou deixar a falha aparecer só na primeira execução real.
+        if (executionOptions.Enabled)
+        {
+            executionOptions.ValidateForOperation(planningOptions.Enabled, options.RootPath);
+        }
+
         RegisterServices(
-            builder.Services, options, applicationConnection!, maintenanceConnection!, partitionPolicy);
+            builder.Services, options, applicationConnection!, maintenanceConnection!, partitionPolicy,
+            executionOptions.Enabled ? executionOptions : null);
     }
 
     private static void RegisterServices(
@@ -68,7 +89,8 @@ public static class PstInspectionComposition
         PstInspectionOptions options,
         string applicationConnection,
         string maintenanceConnection,
-        PartitionPolicy? partitionPolicy)
+        PartitionPolicy? partitionPolicy,
+        PstPartitionExecutionOptions? executionOptions)
     {
         var connectionFactory = new TenantConnectionFactory(applicationConnection, maintenanceConnection);
         var clock = new SystemClock();
@@ -101,5 +123,25 @@ public static class PstInspectionComposition
         services.AddSingleton(planStore);
         services.AddSingleton(planner);
         services.AddSingleton(new PlanPstPartitionUseCase(custodyStore, inspectionStore, planStore, planner, clock));
+
+        if (executionOptions is null)
+        {
+            return; // Execução desabilitada (ou planejamento desabilitado) ⇒ nenhum serviço de execução é registrado.
+        }
+
+        // Passo 3 — execução do único caso já provado pelo planner. Raiz de output DISTINTA da raiz de
+        // custódia de origem (validada em PstPartitionExecutionOptions.ValidateForOperation).
+        var outputOptions = new PartitionExecutionOutputOptions
+        {
+            RootPath = executionOptions.OutputRootPath,
+            MinFreeSpaceMarginBytes = executionOptions.MinFreeSpaceMarginBytes,
+            Timeout = executionOptions.Timeout,
+        };
+
+        IPartitionExecutionStore executionStore = new SqlPartitionExecutionStore(connectionFactory);
+        IPartitionPartWriter writer = new LocalSinglePartExecutionWriter(storageOptions, outputOptions);
+        services.AddSingleton(executionStore);
+        services.AddSingleton(writer);
+        services.AddSingleton(new ExecutePartitionPlanUseCase(custodyStore, planStore, executionStore, writer, clock));
     }
 }

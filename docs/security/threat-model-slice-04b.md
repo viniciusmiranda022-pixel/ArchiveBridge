@@ -96,3 +96,61 @@ Execução de particionamento, criação de PST de saída, repair, parser/vendor
 Export-EVArchive real, AzCopy/Azure staging, Purview/Graph/Exchange Online/import job, validação e
 reconciliação pós-partição, CSV builder de importação e reconciliação final M365. Nenhum destes fluxos existe
 no código deste Passo — não há superfície de ameaça nova a analisar para eles aqui.
+
+---
+
+# Delta — Slice 4B, Passo 3 (Partition Execution Foundation)
+
+Escopo adicional: **execução** — a única operação autorizada é materializar
+`Planned / SinglePartWithinTarget` como cópia byte-for-byte verificada. Continua sem split/rewrite real, sem
+parser/vendor novo, sem Export-EVArchive, upload/AzCopy, Purview/Graph/EXO e sem importação (ver
+STOP-THE-LINE em [`vertical-slice-04b-partition-execution.md`](../engineering/vertical-slice-04b-partition-execution.md)).
+
+## Ativos adicionais
+
+- **Execuções de partição** (`dbo.pst_partition_executions`): IDs opacos (execução, plano, parte, artefato),
+  identidade determinística (`plan_hash`/`part_key`/`part_sequence`), hash/tamanho de origem e de saída, nome/
+  versão do executor, correlação e timestamps. Manifesto durável do `PartCreated` — **não** contém conteúdo
+  de mailbox nem caminho físico.
+- **O output materializado** (`part.pst` + `part.sha256` + `manifest.json`), em repouso sob a raiz de output
+  configurada, em um caminho DERIVADO DE IDS OPACOS (nunca de UPN/nome de arquivo/caminho da origem). É a
+  única capacidade deste Slice que cria um arquivo NOVO — sempre uma cópia, nunca o PST original.
+
+## Classificação de dados
+
+A tabela `dbo.pst_partition_executions` e o `manifest.json` do bundle **não guardam caminho físico, nome de
+arquivo, UPN, assunto, corpo, destinatário ou anexo** — não há sequer coluna/campo capaz de carregá-los; o
+local físico do output é sempre derivado, em tempo de leitura, dos IDs opacos já persistidos. Comprovado
+lendo TODAS as colunas persistidas E o `manifest.json` inteiro em
+`ThePersistedExecutionAndManifestCarryNoPathFileNameOrMailboxIdentifier`. O que resta é metadado operacional
+atribuível a uma execução específica, na mesma classificação das tabelas dos Passos 1/2.
+
+## Ameaças e mitigações (delta)
+
+| Ameaça | Mitigação |
+| --- | --- |
+| Execução de um plano inelegível (Unsupported/Blocked/não-canônico/múltiplas partes) | `ExecutePartitionPlanUseCase.EnsureEligible` recusa ANTES de qualquer I/O — zero arquivo, zero linha SQL. Comprovado por `AnUnsupportedPlanIsRejectedWithZeroOutputAndZeroExecutionRows`, `ABlockedPlanIsRejectedWithZeroOutputAndZeroExecutionRows`, `ForgedPlanIdentityIsRejectedBeforeAnyIO`. |
+| Output que não é cópia byte-for-byte da origem (bug de escrita, parser silenciosamente corrompendo bytes) | Reforçado em DUAS camadas independentes: `PartitionExecutionRecord.Complete`/`Rehydrate` no Domain exige `OutputHash == SourceHash` e `OutputSizeBytes == SourceSizeBytes`; `CK_pst_partition_executions_byte_identical` trava o mesmo invariante no banco. Nenhuma das duas confia na outra. |
+| Origem alterada entre o planejamento e a execução (staleness) | O writer sempre lê a origem AO VIVO e recalcula o hash durante a cópia — divergência contra `plan.Source.SourceHash` aborta ANTES de publicar qualquer output (`PartitionExecutionSourceStaleException`, staging descartado). Comprovado por `SourceThatDriftedOnDiskAfterPlanningIsRejectedBeforeAnyCanonicalOutputIsPublished`. |
+| Output publicado prematuramente (antes de verificado) | Protocolo de 3 checkpoints: staging + reabertura (checkpoint 1) → `Directory.Move` atômico + reabertura do bundle final (checkpoint 2) → INSERT SQL (checkpoint 3). Nenhum checkpoint anterior é pulado; a Application só recebe o resultado depois do checkpoint 2. |
+| Crash entre a publicação do output e o checkpoint SQL | O restart detecta o bundle já publicado no caminho determinístico, reconfere (nunca confia na mera existência do arquivo) e converge sem reescrever — só então persiste o checkpoint SQL que faltava. Comprovado por `ACrashAfterFinalizationButBeforeThePersistCheckpointConvergesWithoutDuplicating`. |
+| Adulteração do output já publicado | Toda reutilização do caminho final (réplay via filesystem, corrida de publicação) reabre e reconfere hash/tamanho ANTES de confiar — divergência nunca é sobrescrita automaticamente (`PartitionExecutionOutputTamperedException`). Comprovado por `TamperingTheExistingOutputIsDetectedOnReadbackAndNeverSilentlyOverwritten`. Consistente com o runbook §20.5: um part perdido/adulterado nunca é regenerado silenciosamente. |
+| Diretório de staging órfão confundido com sucesso | A canonicidade é decidida SOMENTE pelo bundle validado no caminho FINAL — staging nunca é lido como evidência de conclusão. `TempStagingReconciler` (operação de manutenção explícita, nunca automática) remove staging mais antigo que um limiar de idade seguro. Comprovado por `AnOrphanStagingDirectoryIsNeverConfusedWithACompletedPartAndIsSafelyReconciled`. |
+| Corrida de escrita (dois workers executam o mesmo plano ao mesmo tempo) | Convergência em DUAS camadas: filesystem (o writer detecta o bundle final já publicado e reconfere em vez de reescrever) e SQL (índice único `UX_pst_partition_executions_canonical (tenant_id, project_id, plan_id, part_id)`; conflito de INSERT relê o canônico; releitura vazia ⇒ `PartitionExecutionConflictUnresolvedException`). Comprovado por `ConcurrentExecutionOfTheSamePlanConvergesToExactlyOneCanonicalResult`. |
+| Exaustão de espaço em disco | Preflight (`DriveInfo.AvailableFreeSpace`) ANTES de abrir qualquer stream de escrita — nunca inicia uma cópia que não teria como terminar. Comprovado por `InsufficientDiskSpacePreflightFailsClosedWithoutWritingAnything`. |
+| Cópia pendurada indefinidamente (I/O travado, disco lento) | `CancellationTokenSource` vinculado com `CancelAfter(Timeout)`, distinto do cancelamento do chamador — nenhum output canônico é publicado em nenhum dos dois casos. Comprovado por `ACopyThatNeverCompletesIsAbortedByTheConfiguredTimeoutWithoutPublishingAnyOutput`, `CallerCancellationDuringTheCopyNeverPublishesAnyOutput`. |
+| Path traversal / escape da raiz de output ou de origem | `ArtifactPathContainment.EnsureContained` protege TODO caminho resolvido (origem, staging root, staging dir, diretório final) — mesma defesa já usada em `HeaderOnlyPstInspectionEngine`/`FileSystemMappingArtifactStore`, incluindo rejeição de symlink/reparse point na cadeia. |
+| Vazamento cross-tenant/cross-project (IDOR) da execução | `IPartitionPlanStore.FindByIdAsync` filtra por escopo (RLS + `project_id` explícito); `IPartitionExecutionStore.FindCanonicalAsync` idem. Mesmo conhecendo o `PartitionPlanId` exato, outro escopo lê "não encontrado", indistinguível de "não existe". Comprovado por `CrossTenantAndCrossProjectExecutionIsDeniedIndistinguishablyFromNotFound`. |
+| Store devolvendo como "canônica" uma execução que não é | A Application revalida `HasConsistentIdentity()` e o `PlanHash` PEDIDO antes de reaproveitar (`PartitionExecutionCanonicityViolationException`). |
+| Linha canônica persistida corrompida/adulterada sendo reidratada e reaproveitada | `PartitionExecutionRecord.Rehydrate` aplica os MESMOS invariantes estruturais de `Complete` (identidade de parte consistente, output byte-for-byte, timestamps coerentes); divergência ⇒ `PartitionExecutionIntegrityViolationException`, nada é normalizado nem devolvido. |
+| Escrita a partir da execução vazando para fora da raiz de output configurada | `PstPartitionExecutionOptions.ValidateForOperation` exige `OutputRootPath` distinto de `PstInspection:RootPath`, validado no STARTUP (nunca detectado só na primeira execução real). |
+| Escalada silenciosa de capacidade (executar sem planejamento habilitado) | `PstPartitionExecution:Enabled=false` por padrão; habilitar sem `PstPartitionPlanning:Enabled=true` derruba o host no startup. Comprovado por `ExecutionEnabledWithoutPlanningBringsTheHostDownInsteadOfBeingSilentlyIgnored`. |
+| SQL injection | Todo acesso a dados é parametrizado (`SqlCommand`/`SqlParameter`), sem concatenação de entrada. |
+
+## Fora de escopo (herdado do STOP-THE-LINE do Passo 3)
+
+Parser/writer/splitter Aspose, libpff ou qualquer vendor novo; split multi-part real; semantic partitioning
+por item/pasta/data/bin-packing; repair/ScanPST/quarantine workflow além de registrar falha necessária;
+Export-EVArchive real; AzCopy/Azure staging/SAS; Purview, Graph, Exchange Online ou import job; CSV builder
+do Purview; reconciliação final M365; regeneração automática de part já usada em import. Nenhum destes
+fluxos existe no código deste Passo — não há superfície de ameaça nova a analisar para eles aqui.

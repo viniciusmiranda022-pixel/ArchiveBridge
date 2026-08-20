@@ -89,4 +89,31 @@ internal static class Slice4bPstProcessingSupport
         bytes[10] = 99; bytes[11] = 0; // wVer desconhecido
         return bytes;
     }
+
+    // ---- Slice 4B, Passo 3 (Partition Execution) ----
+
+    /// <summary>Raiz de OUTPUT isolada desta execução de testes (subpasta distinta da raiz de custódia de origem).</summary>
+    public static string PartitionOutputRoot(SqlServerFixture fixture) => Path.Combine(fixture.ArtifactRoot, "pst-output");
+
+    public static PartitionExecutionOutputOptions DefaultOutputOptions(SqlServerFixture fixture) => new()
+    {
+        RootPath = PartitionOutputRoot(fixture),
+        MinFreeSpaceMarginBytes = 0, // ambiente de teste: sem margem extra além do tamanho da origem.
+    };
+
+    public static SqlPartitionExecutionStore ExecutionStore(SqlServerFixture fixture) => new(fixture.Factory);
+
+    public static LocalSinglePartExecutionWriter Writer(
+        SqlServerFixture fixture, PstStorageOptions? sourceOptions = null, PartitionExecutionOutputOptions? outputOptions = null) =>
+        new(sourceOptions ?? DefaultOptions(fixture), outputOptions ?? DefaultOutputOptions(fixture));
+
+    /// <summary>Caso de uso de EXECUÇÃO — materializa um plano já persistido.</summary>
+    public static ExecutePartitionPlanUseCase ExecuteUseCase(
+        SqlServerFixture fixture, PartitionPolicy? policy = null, IClock? clock = null, LocalSinglePartExecutionWriter? writer = null)
+    {
+        var effectiveClock = clock ?? DefaultClock;
+        return new ExecutePartitionPlanUseCase(
+            CustodyStore(fixture, effectiveClock), PlanStore(fixture), ExecutionStore(fixture),
+            writer ?? Writer(fixture), effectiveClock);
+    }
 }
