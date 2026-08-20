@@ -1,27 +1,10 @@
 @page
-@inject PresentationModeOptions Presentation
-@inject IPresentationDataProvider Demo
-@inject IControlPlaneQueries Queries
-@inject IPortalScopeAccessor ScopeAccessor
+@model ArchiveBridge.ControlPlane.Pages.Jobs.DetailsModel
 @{
     ViewData["Title"] = "Job";
-    var ct = HttpContext.RequestAborted;
-    Guid.TryParse(Request.Query["jobId"].ToString(), out var jobId);
-
-    JobSummary? job;
-    IReadOnlyList<JobTransitionView> transitions;
-    if (Presentation.Enabled)
-    {
-        job = jobId == Guid.Empty ? null : Demo.GetJobs().FirstOrDefault(j => j.JobId == jobId);
-        transitions = jobId == Guid.Empty ? [] : Demo.GetJobTransitions(jobId);
-    }
-    else
-    {
-        var scope = ScopeAccessor.Resolve(User);
-        job = jobId == Guid.Empty ? null : (await Queries.ListJobsAsync(scope, 200, ct)).FirstOrDefault(j => j.JobId == jobId);
-        transitions = jobId == Guid.Empty ? [] : await Queries.ListJobTransitionsAsync(scope, jobId, ct);
-    }
-
+    var job = Model.Job;
+    var transitions = Model.Transitions;
+    var jobId = Model.JobIdValue;
     var latestLease = transitions.Count > 0 ? transitions[^1].LeaseEpoch.ToString(System.Globalization.CultureInfo.InvariantCulture) : "—";
 }
 
@@ -48,6 +31,38 @@ else
         }
     </div>
 
+    @if (Model.PresentationMode && job is not null && job.State == nameof(ArchiveBridge.Domain.Jobs.JobState.RetryScheduled))
+    {
+        <div class="alert warning">
+            <span class="a-ico">@Icons.Svg("info")</span>
+            <div class="a-body"><strong>Modo demonstração</strong>O retry manual está desabilitado: este job é um exemplo sintético.</div>
+        </div>
+    }
+    else if (!Model.PresentationMode && job is not null && job.State == nameof(ArchiveBridge.Domain.Jobs.JobState.RetryScheduled))
+    {
+        if (!Model.RetryEnabled)
+        {
+            <div class="alert neutral">
+                <span class="a-ico">@Icons.Svg("info")</span>
+                <div class="a-body"><strong>Retry manual indisponível neste deployment.</strong>A solicitação de retry está desabilitada por configuração; a nova tentativa ainda ocorrerá automaticamente no horário agendado.</div>
+            </div>
+        }
+        else if (!Model.IsRetryOperator)
+        {
+            <div class="alert info">
+                <span class="a-ico">@Icons.Svg("shield")</span>
+                <div class="a-body"><strong>Acesso de leitura.</strong>Solicitar retry manual requer o papel Operator ou Administrator.</div>
+            </div>
+        }
+        else
+        {
+            <div class="alert info">
+                <span class="a-ico">@Icons.Svg("shield")</span>
+                <div class="a-body"><strong>Retry autorizado e idempotente.</strong>Adianta a próxima tentativa já agendada pelo domínio para agora. Não força nenhuma transição de estado nem reexecuta efeitos externos.</div>
+            </div>
+        }
+    }
+
     <div class="grid-2">
         <div class="card">
             <div class="card-head"><h3>Resumo</h3></div>
@@ -67,6 +82,23 @@ else
                         </div>
                     </div>
                 </details>
+                @if (job is not null && job.State == nameof(ArchiveBridge.Domain.Jobs.JobState.RetryScheduled))
+                {
+                    <div class="card-actions">
+                        @if (Model.CanRequestRetry)
+                        {
+                            <form method="post" asp-page-handler="Retry" data-guard>
+                                <input type="hidden" name="jobId" value="@jobId" />
+                                <input type="hidden" name="idempotencyKey" value="@Model.IdempotencyKey" />
+                                <button type="submit" class="btn sm primary" data-busy="Solicitando…">@Icons.Svg("retry") Retry agora</button>
+                            </form>
+                        }
+                        else if (Model.PresentationMode)
+                        {
+                            <button type="button" class="btn sm primary" disabled title="Operação desabilitada no modo demonstração">@Icons.Svg("retry") Retry agora</button>
+                        }
+                    </div>
+                }
             </div>
         </div>
 

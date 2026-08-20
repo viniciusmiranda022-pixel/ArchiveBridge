@@ -111,6 +111,45 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
         END
         """;
 
+    // Retry manual autorizado (Passo 7): elegível SOMENTE em RetryScheduled (state = 2), SEM fencing por
+    // worker (não há lease ativo neste estado). Adianta next_attempt_at_utc para @now (nunca atrasa) e
+    // grava a chave de idempotência MAIS RECENTE aceita para o Job (retry_idempotency_key). O índice único
+    // filtrado UX_jobs_retry_idempotency (tenant_id, project_id, retry_idempotency_key) é o backstop SQL
+    // contra reuso da MESMA chave por um Job DIFERENTE — a violação de unicidade é capturada e mapeada para
+    // IdempotencyConflict. Um segundo request com a MESMA chave para o MESMO Job não insere uma nova
+    // transição (replay idempotente: nenhum efeito lógico duplicado); somente uma chave NOVA (ou a
+    // primeira) para o Job insere a transição RetryExpedited (auto-loop RetryScheduled → RetryScheduled).
+    private const string RequestManualRetrySql =
+        """
+        SET NOCOUNT ON;
+        DECLARE @applied TABLE (prior_state TINYINT, prior_key UNIQUEIDENTIFIER);
+
+        UPDATE dbo.jobs
+        SET next_attempt_at_utc = CASE WHEN next_attempt_at_utc IS NULL OR next_attempt_at_utc > @now THEN @now ELSE next_attempt_at_utc END,
+            retry_idempotency_key = @key,
+            updated_at_utc = @now
+        OUTPUT deleted.state, deleted.retry_idempotency_key INTO @applied
+        WHERE job_id = @jobId AND project_id = @project AND state = 2;
+
+        IF EXISTS (SELECT 1 FROM @applied WHERE prior_key IS NULL OR prior_key <> @key)
+        BEGIN
+            INSERT INTO dbo.job_state_transitions
+                (job_id, tenant_id, project_id, from_state, to_state, reason_code, lease_epoch, worker_id, correlation_id, occurred_at_utc)
+            SELECT @jobId, @tenant, @project, 2, 2, @reason, j.lease_epoch, j.owner_worker, @correlation, @now
+            FROM dbo.jobs j WHERE j.job_id = @jobId AND j.project_id = @project;
+            SELECT 0 AS outcome;
+        END
+        ELSE IF EXISTS (SELECT 1 FROM @applied)
+            SELECT 1 AS outcome;
+        ELSE
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM dbo.jobs WHERE job_id = @jobId AND project_id = @project)
+                SELECT 3 AS outcome;
+            ELSE
+                SELECT 2 AS outcome;
+        END
+        """;
+
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
     private readonly IClock _clock = clock;
     private readonly long _agingSeconds = ComputeAgingSeconds(agingInterval);
@@ -258,6 +297,66 @@ public sealed class SqlJobStore(TenantConnectionFactory connectionFactory, ICloc
             lastError: (byte)errorCode,
             nextAttempt: SqlJobMapping.ToDbUtc(nextAttemptAtUtc),
             cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<JobRetryRequestOutcome> RequestManualRetryAsync(
+        TenantScope scope,
+        JobId jobId,
+        Guid idempotencyKey,
+        CorrelationId correlation,
+        CancellationToken cancellationToken)
+    {
+        // Fail-closed na borda de infraestrutura (defesa em profundidade — o caso de uso também valida):
+        // uma chave vazia é rejeitada ANTES de abrir conexão/transação — nenhuma escrita ocorre.
+        if (idempotencyKey == Guid.Empty)
+        {
+            throw new ArgumentException("A chave de idempotência é obrigatória.", nameof(idempotencyKey));
+        }
+
+        var now = SqlJobMapping.ToDbUtc(_clock.UtcNow);
+
+        await using var tenantConnection = await _connectionFactory
+            .OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var transaction = (SqlTransaction)await tenantConnection.Connection
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            int outcome;
+            await using (var sqlCommand = new SqlCommand(RequestManualRetrySql, tenantConnection.Connection, transaction))
+            {
+                sqlCommand.Parameters.Add(new SqlParameter("@jobId", SqlDbType.UniqueIdentifier) { Value = jobId.Value });
+                sqlCommand.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+                sqlCommand.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+                sqlCommand.Parameters.Add(new SqlParameter("@key", SqlDbType.UniqueIdentifier) { Value = idempotencyKey });
+                sqlCommand.Parameters.Add(new SqlParameter("@reason", SqlDbType.TinyInt) { Value = (byte)ReasonCode.RetryExpedited });
+                sqlCommand.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = correlation.Value });
+                sqlCommand.Parameters.Add(new SqlParameter("@now", SqlDbType.DateTime2) { Value = now });
+
+                object? scalar;
+                try
+                {
+                    scalar = await sqlCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (SqlException sql) when (sql.Number is 2601 or 2627)
+                {
+                    // Backstop do índice único filtrado UX_jobs_retry_idempotency: a MESMA chave já está
+                    // vinculada a um Job DIFERENTE no tenant/projeto — conflito determinístico, sem efeito.
+                    await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                    return JobRetryRequestOutcome.IdempotencyConflict;
+                }
+
+                outcome = Convert.ToInt32(scalar, CultureInfo.InvariantCulture);
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return (JobRetryRequestOutcome)outcome;
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            throw;
+        }
     }
 
     private async Task<JobCommandOutcome> ApplyTransitionAsync(

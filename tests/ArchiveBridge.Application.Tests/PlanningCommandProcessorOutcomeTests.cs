@@ -132,6 +132,9 @@ public sealed class PlanningCommandProcessorOutcomeTests
 
         public Task<JobCommandOutcome> ScheduleRetryAsync(LeaseCommand command, ErrorCode errorCode, DateTimeOffset nextAttemptAtUtc, CancellationToken cancellationToken) =>
             Task.FromResult(failRetryOutcome);
+
+        public Task<JobRetryRequestOutcome> RequestManualRetryAsync(TenantScope scope, JobId jobId, Guid idempotencyKey, CorrelationId correlation, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
     }
 
     private sealed class StubLeaseManager : IJobLeaseManager

@@ -58,6 +58,36 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Migration0019AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0018 tivesse divergido, isto lançaria. Um re-apply limpo prova que os hashes anteriores
+        // permanecem estáveis; em seguida confirmamos a 0019 e a coluna/índice de idempotência do retry.
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 19;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var column = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.columns WHERE object_id = OBJECT_ID('dbo.jobs') AND name = 'retry_idempotency_key';",
+            connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await column.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using var index = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.indexes WHERE name = 'UX_jobs_retry_idempotency';", connection);
+        Assert.Equal(1, Convert.ToInt32(await index.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
         var original = await ReadHashAsync(1);

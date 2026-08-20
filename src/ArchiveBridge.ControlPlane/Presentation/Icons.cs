@@ -47,6 +47,7 @@ public static class Icons
         ["layers"] = "<path d='M12 3l9 5-9 5-9-5z'/><path d='M3 12l9 5 9-5'/>",
         ["clipboard-check"] = "<rect x='6' y='4' width='12' height='17' rx='2'/><path d='M9 4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2'/><path d='M9 13l2 2 4-4'/>",
         ["search"] = "<circle cx='11' cy='11' r='7'/><path d='M21 21l-4.3-4.3'/>",
+        ["retry"] = "<path d='M3 12a9 9 0 0 1 15.4-6.4L21 8'/><path d='M21 3v5h-5'/><path d='M21 12a9 9 0 0 1-15.4 6.4L3 16'/><path d='M3 21v-5h5'/>",
     };
 
     /// <summary>Retorna o SVG inline do ícone nomeado (ou uma cadeia vazia se desconhecido).</summary>

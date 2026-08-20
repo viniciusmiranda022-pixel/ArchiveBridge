@@ -17,6 +17,13 @@ internal sealed class FakeJobStore(int attemptCount) : IJobStore
 
     public DateTimeOffset? ScheduledNextAttempt { get; private set; }
 
+    /// <summary>Resultado devolvido por <see cref="RequestManualRetryAsync"/> — configurável pelo teste.</summary>
+    public JobRetryRequestOutcome RetryOutcome { get; set; } = JobRetryRequestOutcome.Applied;
+
+    public bool RequestManualRetryCalled { get; private set; }
+
+    public Guid? LastRetryIdempotencyKey { get; private set; }
+
     public Task<JobId> CreateAsync(CreateJobCommand command, CancellationToken cancellationToken) =>
         Task.FromResult(JobId.New());
 
@@ -61,6 +68,18 @@ internal sealed class FakeJobStore(int attemptCount) : IJobStore
         ScheduleRetryCalled = true;
         ScheduledNextAttempt = nextAttemptAtUtc;
         return Task.FromResult(JobCommandOutcome.Applied);
+    }
+
+    public Task<JobRetryRequestOutcome> RequestManualRetryAsync(
+        TenantScope scope,
+        JobId jobId,
+        Guid idempotencyKey,
+        CorrelationId correlation,
+        CancellationToken cancellationToken)
+    {
+        RequestManualRetryCalled = true;
+        LastRetryIdempotencyKey = idempotencyKey;
+        return Task.FromResult(RetryOutcome);
     }
 }
 

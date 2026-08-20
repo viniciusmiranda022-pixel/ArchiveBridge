@@ -129,4 +129,92 @@ public sealed class JobTests
 
         Assert.Throws<InvalidJobTransitionException>(() => job.Cancel(Now));
     }
+
+    // ---- Passo 7: retry manual autorizado (RequestManualRetry) — elegível SOMENTE em RetryScheduled.
+
+    [Fact]
+    public void ManualRetryFromRetryScheduledExpeditesNextAttemptWithoutChangingState()
+    {
+        var job = NewJob();
+        job.Claim(new WorkerId("w"), Now, Lease);
+        var scheduledFor = Now + TimeSpan.FromHours(1);
+        job.ScheduleRetry(new WorkerId("w"), job.LeaseEpoch, ErrorCode.TransientProvider, scheduledFor, Now);
+        var requestedAt = Now + TimeSpan.FromMinutes(1);
+
+        Assert.True(job.CanRequestManualRetry());
+        var transition = job.RequestManualRetry(requestedAt);
+
+        Assert.Equal(JobState.RetryScheduled, job.State);      // não é uma transição de estado (auto-loop)
+        Assert.Equal(JobState.RetryScheduled, transition.FromState);
+        Assert.Equal(JobState.RetryScheduled, transition.ToState);
+        Assert.Equal(ReasonCode.RetryExpedited, transition.Reason);
+        Assert.Equal(requestedAt, job.NextAttemptAtUtc);        // adiantado para agora
+    }
+
+    [Fact]
+    public void ManualRetryNeverDelaysAnAlreadyEligibleNextAttempt()
+    {
+        var job = NewJob();
+        job.Claim(new WorkerId("w"), Now, Lease);
+        var scheduledFor = Now - TimeSpan.FromMinutes(5); // já elegível (no passado)
+        job.ScheduleRetry(new WorkerId("w"), job.LeaseEpoch, ErrorCode.TransientProvider, scheduledFor, Now);
+
+        job.RequestManualRetry(Now + TimeSpan.FromMinutes(1));
+
+        Assert.Equal(scheduledFor, job.NextAttemptAtUtc); // nunca atrasa uma tentativa já elegível
+    }
+
+    [Fact]
+    public void ManualRetryFromPendingFailsClosed()
+    {
+        var job = NewJob();
+
+        Assert.False(job.CanRequestManualRetry());
+        Assert.Throws<InvalidJobTransitionException>(() => job.RequestManualRetry(Now));
+    }
+
+    [Fact]
+    public void ManualRetryFromProcessingFailsClosed()
+    {
+        var job = NewJob();
+        job.Claim(new WorkerId("w"), Now, Lease);
+
+        Assert.False(job.CanRequestManualRetry());
+        Assert.Throws<InvalidJobTransitionException>(() => job.RequestManualRetry(Now));
+    }
+
+    [Fact]
+    public void ManualRetryNeverResurrectsACompletedJob()
+    {
+        var job = NewJob();
+        job.Claim(new WorkerId("w"), Now, Lease);
+        job.Complete(new WorkerId("w"), job.LeaseEpoch, Now);
+
+        Assert.False(job.CanRequestManualRetry());
+        Assert.Throws<InvalidJobTransitionException>(() => job.RequestManualRetry(Now));
+        Assert.Equal(JobState.Completed, job.State); // permanece terminal — sem efeito colateral
+    }
+
+    [Fact]
+    public void ManualRetryNeverResurrectsAFailedJob()
+    {
+        var job = NewJob();
+        job.Claim(new WorkerId("w"), Now, Lease);
+        job.Fail(new WorkerId("w"), job.LeaseEpoch, ErrorCode.PermanentProvider, Now);
+
+        Assert.False(job.CanRequestManualRetry());
+        Assert.Throws<InvalidJobTransitionException>(() => job.RequestManualRetry(Now));
+        Assert.Equal(JobState.Failed, job.State); // permanece terminal — sem efeito colateral
+    }
+
+    [Fact]
+    public void ManualRetryNeverResurrectsACancelledJob()
+    {
+        var job = NewJob();
+        job.Cancel(Now);
+
+        Assert.False(job.CanRequestManualRetry());
+        Assert.Throws<InvalidJobTransitionException>(() => job.RequestManualRetry(Now));
+        Assert.Equal(JobState.Cancelled, job.State); // permanece terminal — sem efeito colateral
+    }
 }
