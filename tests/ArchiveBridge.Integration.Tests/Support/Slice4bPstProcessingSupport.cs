@@ -1,5 +1,6 @@
 using ArchiveBridge.Application.PstProcessing;
 using ArchiveBridge.Contracts.Abstractions;
+using ArchiveBridge.Domain.PstProcessing;
 using ArchiveBridge.Infrastructure.PstProcessing;
 using ArchiveBridge.Infrastructure.Time;
 
@@ -29,6 +30,23 @@ internal static class Slice4bPstProcessingSupport
     }
 
     public static PstStorageOptions DefaultOptions(SqlServerFixture fixture) => new() { RootPath = PstRoot(fixture) };
+
+    // ---- Slice 4B, Passo 2 (Partition Planning) ----
+
+    public static SqlPartitionPlanStore PlanStore(SqlServerFixture fixture) => new(fixture.Factory);
+
+    public static SizeBoundedPartitionPlanner Planner(PartitionPolicy? policy = null) =>
+        new(policy ?? PartitionPolicy.RunbookDefault);
+
+    /// <summary>Caso de uso de PLANEJAMENTO — note que ele não recebe a engine: planejar é read-only.</summary>
+    public static PlanPstPartitionUseCase PlanUseCase(
+        SqlServerFixture fixture, PartitionPolicy? policy = null, IClock? clock = null)
+    {
+        var effectiveClock = clock ?? DefaultClock;
+        return new PlanPstPartitionUseCase(
+            CustodyStore(fixture, effectiveClock), InspectionStore(fixture), PlanStore(fixture),
+            Planner(policy), effectiveClock);
+    }
 
     /// <summary>Escreve bytes de teste sob a raiz de custódia PST e devolve o caminho relativo gravado.</summary>
     public static string WriteFile(SqlServerFixture fixture, string relativeName, byte[] content)

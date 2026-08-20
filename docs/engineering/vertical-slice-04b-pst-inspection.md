@@ -7,6 +7,9 @@ Engineering Reviewer para o HEAD SHA corrente, com CI totalmente verde.**
 
 Work order versionado: [`docs/engineering/requests/AB-4B-001.md`](requests/AB-4B-001.md) (`REQUEST_ID: AB-4B-001`).
 
+> **Passo seguinte:** [Partition Planning (Passo 2)](vertical-slice-04b-partition-planning.md) — planejamento
+> determinístico e read-only sobre a inspeção canônica produzida aqui. Continua sem execução de partição.
+
 ## Objetivo
 
 Iniciar a fundação documentada de **PST Inspector / Inventory** após o fechamento do Slice 4A: contratos de
