@@ -178,13 +178,69 @@ Domain.PstProcessing
   part.pst        — cópia byte-for-byte da origem
   part.sha256     — sidecar com o hash hex (mesmo padrão de FileSystemMappingArtifactStore)
   manifest.json   — {tenant, project, plan, part, planHash, partSequence, partKey,
-                      outputHash, outputSizeBytes, executorName, executorVersion}
+                      sourceHash, outputHash, outputSizeBytes, executorName, executorVersion,
+                      correlationId, startedAtUtc, completedAtUtc}
 ```
+
+**Conteúdo mínimo do manifesto físico (correção AB-4B-008).** O work order AB-4B-006, item 7, exige que o
+manifesto durável por part/conjunto contenha metadados suficientes para lineage/auditoria — não apenas
+identidade/hash de output, mas também `source hash`, `timestamps/correlation`. A versão original do
+`manifest.json` (Passo 3 inicial) tinha apenas tenant/project/plan/part, `planHash`, `partSequence`/`partKey`,
+`outputHash`/`outputSizeBytes` e a identidade do executor — esses quatro campos já existiam em
+`PartitionExecutionRecord`/SQL, mas o sidecar físico não os carregava, então não era autoconsistente como
+evidência local (dependia do banco para lineage completa). `PartitionExecutionManifestJson` agora inclui
+também:
+
+- `sourceHash` — hash SHA-256 da origem no momento da execução. Neste Passo é SEMPRE igual a `outputHash`
+  (invariante `SinglePartWithinTarget`: a saída é o artefato inteiro), mas é persistido explicitamente —
+  nunca inferido do `outputHash` — para preservar a semântica de lineage sem ambiguidade e permitir evolução
+  futura (um split real onde as duas divergem já teria o campo certo desde já).
+- `correlationId` — a mesma correlação (`CorrelationId`) que amarra a execução à requisição/trilha de
+  auditoria, também gravada no checkpoint SQL.
+- `startedAtUtc`/`completedAtUtc` — início e conclusão da execução, truncados para a precisão de
+  milissegundo de `DATETIME2(3)` (a mesma coluna SQL) para que o valor gravado no manifesto imutável bata
+  EXATAMENTE com o que a Application persiste no checkpoint 3 — nunca dois relógios/arredondamentos
+  divergentes descrevendo a mesma execução.
+
+**Fronteira de imutabilidade preservada.** `started_at_utc`/`correlation_id` só são conhecidos pela
+Application (que recebe a correlação do chamador e lê o relógio injetado) e `completed_at_utc` só é conhecido
+depois que o bundle está pronto para publicação — mas o protocolo continua publicando o bundle **uma única
+vez, já completo**, sem escrita mutável pós-publicação:
+
+1. A Application computa `started_at_utc` (relógio injetado) IMEDIATAMENTE ANTES de chamar o writer e
+   empacota, junto com a correlação já recebida do chamador, num `PartitionExecutionContext` — passado ao
+   writer como parâmetro de `IPartitionPartWriter.ExecuteAsync`, não descoberto por ele.
+2. O writer grava `manifest.json` (com `sourceHash`/`correlationId`/`startedAtUtc` do contexto, e
+   `completedAtUtc` do PRÓPRIO relógio do writer, lido no instante em que o bundle está pronto para
+   publicação) no MESMO diretório de staging que `part.pst`/`part.sha256`, ANTES do `Directory.Move` atômico
+   (checkpoint 2) — a lineage completa já está dentro do bundle no momento em que ele se torna visível no
+   caminho final.
+3. O `PartitionPartArtifact` devolvido ao chamador sempre reflete a lineage REALMENTE gravada no bundle —
+   lida de volta do manifesto já revalidado (nunca um valor "de memória" divergente do que foi persistido).
+   Isso vale tanto para uma escrita NOVA quanto para a convergência idempotente/de corrida sobre um bundle
+   publicado por uma execução ANTERIOR/concorrente: nesse caso a lineage devolvida (e depois persistida no
+   checkpoint SQL) é a de quem REALMENTE materializou o output, não a do contexto desta chamada.
+4. A Application persiste o checkpoint SQL usando **exatamente** os valores devolvidos pelo writer — nunca
+   os que ela mesma calculou localmente — garantindo que `manifest.json` e a linha SQL sejam idênticos por
+   construção.
+
+**Revalidação estrita no réplay (AB-4B-007 + AB-4B-008).** `PartitionOutputBundleValidator.ExpectedManifest`
+sempre exige igualdade estrita de `sourceHash` (conhecido de antemão a partir do plano). Para
+`correlationId`/`startedAtUtc`/`completedAtUtc`, a igualdade estrita só é cobrada quando o chamador tem um
+valor independente para comparar — a reabertura do writer logo depois de gravar SUA PRÓPRIA escrita, e o
+réplay de um checkpoint SQL JÁ PERSISTIDO (`LocalSinglePartExecutionVerifier`, que sempre compara contra o
+registro persistido). Quando o writer converge para um bundle de uma execução ANTERIOR/concorrente (réplay
+interno antes de qualquer checkpoint SQL existir), não há um valor independente para cobrar — mas os três
+campos ainda são exigidos como estruturalmente válidos (presentes, parseáveis, `completedAtUtc >= startedAtUtc`);
+ausência ou malformação falha fechado em QUALQUER caminho. Um manifesto nunca é aceito só porque "concorda
+consigo mesmo" no único caminho onde isso importaria de verdade: o réplay pós-checkpoint SQL, coberto pelo
+verificador.
 
 Nenhum campo do manifesto (SQL ou `manifest.json`) carrega caminho absoluto, UPN/mailbox completo,
 assunto/corpo, nome de anexo, SAS/segredo ou bytes de conteúdo — provado lendo TODAS as colunas persistidas
-e o `manifest.json` inteiro (`ThePersistedExecutionAndManifestCarryNoPathFileNameOrMailboxIdentifier`). A
-raiz de output é sempre distinta da raiz de custódia de origem (validado no startup por
+e o `manifest.json` inteiro (`ThePersistedExecutionAndManifestCarryNoPathFileNameOrMailboxIdentifier`,
+`ThePhysicalManifestContainsTheMinimumLineageFieldsMatchingThePersistedCheckpoint`). A raiz de output é
+sempre distinta da raiz de custódia de origem (validado no startup por
 `PstPartitionExecutionOptions.ValidateForOperation`) — o writer nunca escreve dentro da árvore read-only de
 origem.
 

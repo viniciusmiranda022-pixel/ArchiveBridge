@@ -139,7 +139,7 @@ public static class PstInspectionComposition
         };
 
         IPartitionExecutionStore executionStore = new SqlPartitionExecutionStore(connectionFactory);
-        IPartitionPartWriter writer = new LocalSinglePartExecutionWriter(storageOptions, outputOptions);
+        IPartitionPartWriter writer = new LocalSinglePartExecutionWriter(storageOptions, outputOptions, clock);
         IPartitionPartVerifier verifier = new LocalSinglePartExecutionVerifier(outputOptions);
         services.AddSingleton(executionStore);
         services.AddSingleton(writer);

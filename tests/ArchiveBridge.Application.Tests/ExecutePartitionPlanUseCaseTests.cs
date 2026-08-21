@@ -194,10 +194,13 @@ public sealed class ExecutePartitionPlanUseCaseTests
         var custodyStore = new FakePstCustodyStore(scope, custody.Id, custody);
         var planStore = new FakePartitionPlanStore(plan);
         var executionStore = new FakePartitionExecutionStore();
-        var writer = new FakePartitionPartWriter(new PartitionPartArtifact(hash, 2048));
+        var expectedCorrelation = CorrelationId.New();
+        var expectedCompletedAtUtc = Now.AddSeconds(1);
+        var writer = new FakePartitionPartWriter(
+            new PartitionPartArtifact(hash, 2048, hash, expectedCorrelation, Now, expectedCompletedAtUtc));
 
         var result = await UseCase(custodyStore, planStore, executionStore, writer)
-            .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
+            .ExecuteAsync(scope, plan.Id, expectedCorrelation, CancellationToken.None);
 
         Assert.Equal(1, writer.ExecuteCount);
         Assert.Equal(1, executionStore.SaveCount);
@@ -206,6 +209,18 @@ public sealed class ExecutePartitionPlanUseCaseTests
         Assert.Equal(plan.Id, result.Plan);
         Assert.Equal(plan.Parts[0].Id, result.Part);
         Assert.True(result.HasConsistentIdentity());
+
+        // Lineage do checkpoint SQL vem do que o writer devolveu (lido do manifesto físico já validado) —
+        // nunca recalculada localmente pela Application (work order AB-4B-006 item 7 / correção AB-4B-008).
+        Assert.Equal(hash, result.SourceHash);
+        Assert.Equal(expectedCorrelation, result.Correlation);
+        Assert.Equal(Now, result.StartedAtUtc);
+        Assert.Equal(expectedCompletedAtUtc, result.CompletedAtUtc);
+
+        // O contexto fornecido ao writer é determinado pela Application ANTES da materialização: correlação
+        // do chamador e início vindo do relógio injetado — nunca inventado pelo writer.
+        Assert.Equal(expectedCorrelation, writer.LastContext?.Correlation);
+        Assert.Equal(Now, writer.LastContext?.StartedAtUtc);
     }
 
     // ---- Idempotência / concorrência ----
@@ -290,7 +305,7 @@ public sealed class ExecutePartitionPlanUseCaseTests
         var custodyStore = new FakePstCustodyStore(scope, custody.Id, custody);
         var planStore = new FakePartitionPlanStore(plan);
         var executionStore = new FakePartitionExecutionStore(canonical: null, canonicalAfterConflict: racedWinner, throwOnFirstSave: true);
-        var writer = new FakePartitionPartWriter(new PartitionPartArtifact(hash, 2048));
+        var writer = new FakePartitionPartWriter(new PartitionPartArtifact(hash, 2048, hash, CorrelationId.New(), Now, Now));
         var verifier = new FakePartitionPartVerifier();
 
         var result = await UseCase(custodyStore, planStore, executionStore, writer, verifier)
@@ -314,7 +329,7 @@ public sealed class ExecutePartitionPlanUseCaseTests
         var custodyStore = new FakePstCustodyStore(scope, custody.Id, custody);
         var planStore = new FakePartitionPlanStore(plan);
         var executionStore = new FakePartitionExecutionStore(canonical: null, canonicalAfterConflict: null, throwOnFirstSave: true);
-        var writer = new FakePartitionPartWriter(new PartitionPartArtifact(hash, 2048));
+        var writer = new FakePartitionPartWriter(new PartitionPartArtifact(hash, 2048, hash, CorrelationId.New(), Now, Now));
 
         await Assert.ThrowsAsync<PartitionExecutionConflictUnresolvedException>(() =>
             UseCase(custodyStore, planStore, executionStore, writer)
@@ -348,6 +363,64 @@ public sealed class ExecutePartitionPlanUseCaseTests
                 .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None));
 
         Assert.Equal(0, writer.ExecuteCount);
+    }
+
+    // ---- Lineage (AB-4B-008): contexto fornecido ANTES da materialização, nunca reinventado depois ----
+
+    [Fact]
+    public async Task TheWriterReceivesADeterministicContextComputedBeforeMaterializationStarts()
+    {
+        var scope = NewScope();
+        var hash = Hash("context-before-write");
+        var custody = Custody(scope, hash, size: 2048);
+        var inspection = Canonical(scope, custody.Id, hash, 2048);
+        var plan = PlannedSinglePart(custody, inspection);
+
+        var custodyStore = new FakePstCustodyStore(scope, custody.Id, custody);
+        var planStore = new FakePartitionPlanStore(plan);
+        var executionStore = new FakePartitionExecutionStore();
+        var writer = new FakePartitionPartWriter();
+        var correlation = CorrelationId.New();
+
+        await UseCase(custodyStore, planStore, executionStore, writer)
+            .ExecuteAsync(scope, plan.Id, correlation, CancellationToken.None);
+
+        // O contexto (correlação/início) é o MESMO fornecido pela Application ANTES de qualquer I/O — nunca
+        // um valor inventado pelo writer depois do fato (work order AB-4B-006 item 7 / correção AB-4B-008).
+        Assert.NotNull(writer.LastContext);
+        Assert.Equal(correlation, writer.LastContext!.Correlation);
+        Assert.Equal(Now, writer.LastContext.StartedAtUtc);
+    }
+
+    [Fact]
+    public async Task LineageOfAConvergedBundleFromAnEarlierExecutionIsPersistedAsReturnedNotRecomputedLocally()
+    {
+        // Simula o writer convergindo para um bundle publicado por uma execução ANTERIOR/concorrente
+        // (crash-recovery/corrida) cuja lineage própria diverge do contexto desta chamada — a Application
+        // nunca "corrige" isso com seus próprios valores locais, sempre confia no que o writer devolveu
+        // (lido de volta do manifesto físico já revalidado).
+        var scope = NewScope();
+        var hash = Hash("converged-bundle");
+        var custody = Custody(scope, hash, size: 2048);
+        var inspection = Canonical(scope, custody.Id, hash, 2048);
+        var plan = PlannedSinglePart(custody, inspection);
+
+        var earlierCorrelation = CorrelationId.New();
+        var earlierStarted = Now.AddMinutes(-5);
+        var earlierCompleted = Now.AddMinutes(-4);
+        var earlierExecutionArtifact = new PartitionPartArtifact(hash, 2048, hash, earlierCorrelation, earlierStarted, earlierCompleted);
+
+        var custodyStore = new FakePstCustodyStore(scope, custody.Id, custody);
+        var planStore = new FakePartitionPlanStore(plan);
+        var executionStore = new FakePartitionExecutionStore();
+        var writer = new FakePartitionPartWriter(earlierExecutionArtifact);
+
+        var result = await UseCase(custodyStore, planStore, executionStore, writer)
+            .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None); // correlação DESTA chamada, diferente da anterior.
+
+        Assert.Equal(earlierCorrelation, result.Correlation);
+        Assert.Equal(earlierStarted, result.StartedAtUtc);
+        Assert.Equal(earlierCompleted, result.CompletedAtUtc);
     }
 
     // ---- Duplos de teste (Domain + Contracts apenas — sem Infrastructure) ----
@@ -419,15 +492,25 @@ public sealed class ExecutePartitionPlanUseCaseTests
     {
         public int ExecuteCount { get; private set; }
 
+        public PartitionExecutionContext? LastContext { get; private set; }
+
         public string ExecutorName => "FakeExecutor";
 
         public string ExecutorVersion => "0.0";
 
         public Task<PartitionPartArtifact> ExecuteAsync(
-            TenantScope scope, MigrationArtifact source, PartitionPlan plan, PartitionPlanPart part, CancellationToken cancellationToken)
+            TenantScope scope, MigrationArtifact source, PartitionPlan plan, PartitionPlanPart part,
+            PartitionExecutionContext context, CancellationToken cancellationToken)
         {
             ExecuteCount++;
-            return Task.FromResult(result ?? new PartitionPartArtifact(source.RegisteredHash, source.RegisteredSizeBytes));
+            LastContext = context;
+
+            // Duplo de teste: reflete a lineage que um bundle físico REAL conteria (source hash fixo pelo
+            // plano, correlação/início ecoados do contexto fornecido pela Application, conclusão um instante
+            // depois) — nunca inventa um valor divergente do que a Application forneceu.
+            return Task.FromResult(result ?? new PartitionPartArtifact(
+                source.RegisteredHash, source.RegisteredSizeBytes, source.RegisteredHash, context.Correlation,
+                context.StartedAtUtc, context.StartedAtUtc));
         }
     }
 

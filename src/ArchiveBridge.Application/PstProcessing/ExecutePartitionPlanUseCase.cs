@@ -94,10 +94,17 @@ public sealed class ExecutePartitionPlanUseCase(
                 "A origem foi alterada desde o planejamento (hash de custódia diverge do hash registrado no plano).");
         }
 
-        var startedAtUtc = _clock.UtcNow;
-        var artifact = await _writer.ExecuteAsync(scope, custody, plan, part, cancellationToken).ConfigureAwait(false);
-        var completedAtUtc = _clock.UtcNow;
+        // started_at_utc é definido AQUI, determinística e ANTES de qualquer materialização (work order
+        // AB-4B-006 item 7 / correção AB-4B-008): fornecido ao writer via PartitionExecutionContext para que
+        // o manifesto físico já nasça com a lineage completa, publicado uma ÚNICA vez, sem escrita mutável
+        // pós-publicação. correlation já chega como parâmetro desta chamada.
+        var context = new PartitionExecutionContext(correlation, _clock.UtcNow);
+        var artifact = await _writer.ExecuteAsync(scope, custody, plan, part, context, cancellationToken).ConfigureAwait(false);
 
+        // A lineage do checkpoint SQL vem SEMPRE do que o writer leu de volta do bundle físico já validado —
+        // nunca de valores locais recalculados — para que manifest.json e a linha SQL sejam idênticos por
+        // construção (o mesmo vale quando o writer convergiu para um bundle publicado por uma execução
+        // anterior/concorrente: a lineage persistida tem de ser a de quem realmente materializou o output).
         var record = PartitionExecutionRecord.Complete(
             PartitionExecutionId.New(),
             scope.Tenant,
@@ -108,14 +115,14 @@ public sealed class ExecutePartitionPlanUseCase(
             plan.PlanHash,
             part.Sequence,
             part.PartKey,
-            plan.Source.SourceHash,
+            artifact.SourceHash,
             plan.Source.SourceSizeBytes!.Value,
             artifact.OutputHash,
             artifact.OutputSizeBytes,
             new PartitionExecutorIdentity(_writer.ExecutorName, _writer.ExecutorVersion),
-            correlation,
-            startedAtUtc,
-            completedAtUtc);
+            artifact.Correlation,
+            artifact.StartedAtUtc,
+            artifact.CompletedAtUtc);
 
         try
         {

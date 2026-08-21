@@ -5,6 +5,7 @@ using ArchiveBridge.Domain.IdentityAndAccess;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Domain.PstProcessing;
 using ArchiveBridge.Infrastructure.PstProcessing;
+using ArchiveBridge.Infrastructure.Time;
 using Xunit;
 
 namespace ArchiveBridge.Integration.Tests;
@@ -56,10 +57,13 @@ public sealed class LocalSinglePartExecutionWriterLimitEnforcementTests : IDispo
             MinFreeSpaceMarginBytes = 0,
             Timeout = TimeSpan.FromMilliseconds(50),
         };
-        var writer = new LocalSinglePartExecutionWriter(sourceOptions, outputOptions, new FixedStreamFactory(new NeverCompletingStream()));
+        var writer = new LocalSinglePartExecutionWriter(
+            sourceOptions, outputOptions, new SystemClock(), new FixedStreamFactory(new NeverCompletingStream()));
 
         var exception = await Assert.ThrowsAsync<PartitionExecutionLimitExceededException>(() =>
-            writer.ExecuteAsync(scope, custody, plan, part, CancellationToken.None));
+            writer.ExecuteAsync(
+                scope, custody, plan, part, new PartitionExecutionContext(CorrelationId.New(), DateTimeOffset.UtcNow),
+                CancellationToken.None));
 
         Assert.Equal("TIMEOUT", exception.ReasonCode);
         AssertNoCanonicalOutputAndNoOrphanStaging(scope, plan, part);
@@ -80,12 +84,14 @@ public sealed class LocalSinglePartExecutionWriterLimitEnforcementTests : IDispo
             MinFreeSpaceMarginBytes = 0,
             Timeout = TimeSpan.FromMinutes(10), // bem maior que o cancelamento do chamador, abaixo.
         };
-        var writer = new LocalSinglePartExecutionWriter(sourceOptions, outputOptions, new FixedStreamFactory(new NeverCompletingStream()));
+        var writer = new LocalSinglePartExecutionWriter(
+            sourceOptions, outputOptions, new SystemClock(), new FixedStreamFactory(new NeverCompletingStream()));
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(30));
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            writer.ExecuteAsync(scope, custody, plan, part, cts.Token));
+            writer.ExecuteAsync(
+                scope, custody, plan, part, new PartitionExecutionContext(CorrelationId.New(), DateTimeOffset.UtcNow), cts.Token));
 
         AssertNoCanonicalOutputAndNoOrphanStaging(scope, plan, part);
     }

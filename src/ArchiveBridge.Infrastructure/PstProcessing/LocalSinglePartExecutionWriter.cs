@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.PstProcessing;
 using ArchiveBridge.Domain.Common;
@@ -43,11 +44,12 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
 
     private readonly PstStorageOptions _sourceOptions;
     private readonly PartitionExecutionOutputOptions _outputOptions;
+    private readonly IClock _clock;
     private readonly IPstArtifactStreamFactory _sourceStreamFactory;
 
     /// <summary>Constrói o writer com a factory física padrão de stream de origem (uso normal em produção/composition root).</summary>
-    public LocalSinglePartExecutionWriter(PstStorageOptions sourceOptions, PartitionExecutionOutputOptions outputOptions)
-        : this(sourceOptions, outputOptions, PhysicalPstArtifactStreamFactory.Instance)
+    public LocalSinglePartExecutionWriter(PstStorageOptions sourceOptions, PartitionExecutionOutputOptions outputOptions, IClock clock)
+        : this(sourceOptions, outputOptions, clock, PhysicalPstArtifactStreamFactory.Instance)
     {
     }
 
@@ -59,10 +61,12 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
     /// Nunca usado pelo composition root — a sobrecarga pública acima sempre usa a factory física real.
     /// </summary>
     internal LocalSinglePartExecutionWriter(
-        PstStorageOptions sourceOptions, PartitionExecutionOutputOptions outputOptions, IPstArtifactStreamFactory sourceStreamFactory)
+        PstStorageOptions sourceOptions, PartitionExecutionOutputOptions outputOptions, IClock clock,
+        IPstArtifactStreamFactory sourceStreamFactory)
     {
         _sourceOptions = sourceOptions;
         _outputOptions = outputOptions;
+        _clock = clock;
         _sourceStreamFactory = sourceStreamFactory;
     }
 
@@ -74,11 +78,13 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
 
     /// <inheritdoc />
     public async Task<PartitionPartArtifact> ExecuteAsync(
-        TenantScope scope, MigrationArtifact source, PartitionPlan plan, PartitionPlanPart part, CancellationToken cancellationToken)
+        TenantScope scope, MigrationArtifact source, PartitionPlan plan, PartitionPlanPart part,
+        PartitionExecutionContext context, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(part);
+        ArgumentNullException.ThrowIfNull(context);
 
         // Defesa em profundidade: mesmo que a Application já tenha validado a elegibilidade do plano, o
         // writer nunca confia cegamente no chamador — este é o ÚNICO shape que sabe materializar.
@@ -91,9 +97,16 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
         var expectedSize = plan.Source.SourceSizeBytes
             ?? throw new PartitionExecutionNotEligibleException("Plano sem tamanho de origem observado.");
         var expectedHash = plan.Source.SourceHash;
+
+        // SourceHash é sempre conhecido de antemão (o plano já o fixa) e por isso SEMPRE checado por
+        // igualdade estrita nos DOIS caminhos abaixo. Correlation/StartedAtUtc/CompletedAtUtc ficam de fora
+        // deste "expected" genérico: um bundle já existente (réplay/corrida) pertence a uma execução
+        // ANTERIOR/concorrente cuja lineage não tem por que coincidir com o contexto desta chamada — só é
+        // seguro cobrar igualdade estrita deles contra a nossa PRÓPRIA escrita (ver expectedManifestOwnWrite
+        // mais abaixo).
         var expectedManifest = new PartitionOutputBundleValidator.ExpectedManifest(
             scope.Tenant.Value, scope.Project.Value, plan.Id.Value, part.Id.Value, plan.PlanHash, part.Sequence,
-            part.PartKey, ExecutorName, ExecutorVersion);
+            part.PartKey, expectedHash, ExecutorName, ExecutorVersion);
 
         var finalDir = VersionDir(scope, plan, part);
         if (Directory.Exists(finalDir))
@@ -141,7 +154,33 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
                     "O arquivo de staging não confere após reabertura/reinspeção (fail-closed, nada publicado).");
             }
 
-            await FlushSidecarsAsync(stagingDir, expectedHash, expectedSize, scope, plan, part, timeoutSource.Token).ConfigureAwait(false);
+            // started_at_utc vem da Application (determinístico, definido ANTES desta chamada — nunca
+            // inventado pelo writer); completed_at_utc é o ÚNICO timestamp que o writer decide por conta
+            // própria, no instante em que o bundle está pronto para ser publicado — os dois são truncados
+            // para a mesma precisão de milissegundo da coluna SQL, para que o valor gravado AGORA no
+            // manifesto imutável bata exatamente com o que a Application persistirá no checkpoint 3 a seguir.
+            var startedAtUtc = PartitionOutputBundleValidator.TruncateToMillisecondPrecision(context.StartedAtUtc);
+            var completedAtUtc = PartitionOutputBundleValidator.TruncateToMillisecondPrecision(_clock.UtcNow);
+            if (completedAtUtc < startedAtUtc)
+            {
+                completedAtUtc = startedAtUtc; // relógio não-monotônico (raríssimo): nunca publica um manifesto inconsistente.
+            }
+
+            await FlushSidecarsAsync(
+                    stagingDir, expectedHash, expectedSize, scope, plan, part, context.Correlation, startedAtUtc,
+                    completedAtUtc, timeoutSource.Token)
+                .ConfigureAwait(false);
+
+            // Só agora (depois de gravar o manifesto com a NOSSA PRÓPRIA lineage) sabemos o que esperar de
+            // volta na reabertura final — um "expected" estrito, distinto do genérico acima, que só é válido
+            // para o bundle que ESTA chamada está prestes a publicar (nunca reaproveitado para o caminho de
+            // convergência de corrida, que valida a lineage de outra execução).
+            var expectedManifestOwnWrite = expectedManifest with
+            {
+                Correlation = context.Correlation,
+                StartedAtUtc = startedAtUtc,
+                CompletedAtUtc = completedAtUtc,
+            };
 
             Directory.CreateDirectory(Path.GetDirectoryName(finalDir)!);
             try
@@ -154,7 +193,7 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
             catch (IOException) when (Directory.Exists(finalDir))
             {
                 // Corrida: outra execução concorrente do MESMO plano/parte já publicou primeiro. Converge
-                // para o resultado dela (após reconferir) em vez de duplicar/sobrescrever.
+                // para o resultado DELA (lineage própria, não a nossa) em vez de duplicar/sobrescrever.
                 var raced = await PartitionOutputBundleValidator.ValidateAsync(
                     finalDir, expectedHash, expectedSize, expectedManifest, cancellationToken).ConfigureAwait(false);
                 CleanupStagingBestEffort(stagingDir);
@@ -162,9 +201,10 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
             }
 
             // Reabertura/reinspeção FINAL — só depois desta confirmação a Application publica o checkpoint 3
-            // (o manifesto SQL). "PartCreated somente após sucesso" (runbook §20.4).
+            // (o manifesto SQL). "PartCreated somente após sucesso" (runbook §20.4). Revalida também a
+            // lineage que ACABAMOS de gravar (correlação/timestamps), nunca só "concorda consigo mesma".
             return await PartitionOutputBundleValidator.ValidateAsync(
-                finalDir, expectedHash, expectedSize, expectedManifest, cancellationToken).ConfigureAwait(false);
+                finalDir, expectedHash, expectedSize, expectedManifestOwnWrite, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -272,6 +312,7 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
 
     private static async Task FlushSidecarsAsync(
         string stagingDir, Sha256Hash hash, long size, TenantScope scope, PartitionPlan plan, PartitionPlanPart part,
+        CorrelationId correlation, DateTimeOffset startedAtUtc, DateTimeOffset completedAtUtc,
         CancellationToken cancellationToken)
     {
         await FlushToDiskAsync(
@@ -280,8 +321,12 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
             .ConfigureAwait(false);
 
         // Manifesto: APENAS IDs opacos, hashes e metadados de execução — nunca caminho, UPN, assunto, corpo,
-        // nome de anexo ou segredo (work order AB-4B-006, item 7). Mesma forma serializada usada na
-        // revalidação (writer e verifier, correção AB-4B-007) — ver PartitionOutputBundleValidator.
+        // nome de anexo ou segredo (work order AB-4B-006, item 7). Inclui source_hash/correlation_id/
+        // started_at_utc/completed_at_utc (correção AB-4B-008) — o manifesto físico precisa ser
+        // autoconsistente como evidência de lineage/auditoria local, sem depender exclusivamente do banco.
+        // hash == source hash SEMPRE neste Passo (invariante SinglePartWithinTarget), mas source_hash é
+        // gravado EXPLICITAMENTE para preservar a semântica de lineage sem ambiguidade. Mesma forma
+        // serializada usada na revalidação (writer e verifier, correção AB-4B-007) — ver PartitionOutputBundleValidator.
         var manifest = new PartitionOutputBundleValidator.PartitionExecutionManifestJson(
             scope.Tenant.Value,
             scope.Project.Value,
@@ -291,9 +336,13 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
             part.Sequence,
             part.PartKey.Value,
             hash.Value,
+            hash.Value,
             size,
             "ArchiveBridge.SinglePartByteCopyExecutor",
-            "1.0.0");
+            "1.0.0",
+            correlation.Value.ToString(),
+            startedAtUtc,
+            completedAtUtc);
         await FlushToDiskAsync(
                 Path.Combine(stagingDir, PartitionOutputBundleValidator.ManifestFileName),
                 JsonSerializer.SerializeToUtf8Bytes(manifest), cancellationToken)

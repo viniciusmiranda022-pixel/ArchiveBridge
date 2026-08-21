@@ -104,8 +104,9 @@ internal static class Slice4bPstProcessingSupport
     public static SqlPartitionExecutionStore ExecutionStore(SqlServerFixture fixture) => new(fixture.Factory);
 
     public static LocalSinglePartExecutionWriter Writer(
-        SqlServerFixture fixture, PstStorageOptions? sourceOptions = null, PartitionExecutionOutputOptions? outputOptions = null) =>
-        new(sourceOptions ?? DefaultOptions(fixture), outputOptions ?? DefaultOutputOptions(fixture));
+        SqlServerFixture fixture, PstStorageOptions? sourceOptions = null, PartitionExecutionOutputOptions? outputOptions = null,
+        IClock? clock = null) =>
+        new(sourceOptions ?? DefaultOptions(fixture), outputOptions ?? DefaultOutputOptions(fixture), clock ?? DefaultClock);
 
     public static LocalSinglePartExecutionVerifier Verifier(
         SqlServerFixture fixture, PartitionExecutionOutputOptions? outputOptions = null) =>

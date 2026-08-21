@@ -34,6 +34,11 @@ public sealed class LocalSinglePartExecutionVerifier(PartitionExecutionOutputOpt
                 "Output do checkpoint persistido não existe mais no caminho canônico (fail-closed; nunca reconstruído).");
         }
 
+        // Réplay de um checkpoint JÁ PERSISTIDO (AB-4B-007): diferente da convergência interna do writer, AQUI
+        // sempre existe um valor esperado independente para source_hash/correlation_id/started_at_utc/
+        // completed_at_utc — o registro SQL persistido — então os quatro são checados por igualdade estrita
+        // contra o manifesto físico (correção AB-4B-008, work order AB-4B-006 item 7). Um manifesto que só
+        // "concorda consigo mesmo" nunca passa aqui.
         var expectedManifest = new PartitionOutputBundleValidator.ExpectedManifest(
             scope.Tenant.Value,
             scope.Project.Value,
@@ -42,8 +47,12 @@ public sealed class LocalSinglePartExecutionVerifier(PartitionExecutionOutputOpt
             execution.PlanHash,
             execution.PartSequence,
             execution.PartKey,
+            execution.SourceHash,
             execution.Executor.Name,
-            execution.Executor.Version);
+            execution.Executor.Version,
+            execution.Correlation,
+            execution.StartedAtUtc,
+            execution.CompletedAtUtc);
 
         // ValidateAsync é puramente de LEITURA: só compara o que encontra no disco contra o esperado — nunca
         // escreve, sobrescreve ou apaga nada, mesmo quando encontra divergência.

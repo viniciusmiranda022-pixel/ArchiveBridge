@@ -134,7 +134,7 @@ public sealed class PstPartitionExecutionConfigurationTests
             "new ExecutePartitionPlanUseCase(custodyStore, planStore, executionStore, writer, verifier, clock)",
             composition, StringComparison.Ordinal);
         Assert.Contains("new SqlPartitionExecutionStore(connectionFactory)", composition, StringComparison.Ordinal);
-        Assert.Contains("new LocalSinglePartExecutionWriter(storageOptions, outputOptions)", composition, StringComparison.Ordinal);
+        Assert.Contains("new LocalSinglePartExecutionWriter(storageOptions, outputOptions, clock)", composition, StringComparison.Ordinal);
         Assert.Contains("new LocalSinglePartExecutionVerifier(outputOptions)", composition, StringComparison.Ordinal);
     }
 }

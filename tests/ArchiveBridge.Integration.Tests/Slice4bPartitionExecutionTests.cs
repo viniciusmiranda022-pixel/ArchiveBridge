@@ -3,9 +3,11 @@ using System.Globalization;
 using System.Text.Json;
 using ArchiveBridge.Application.PstProcessing;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Contracts.PstProcessing;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.PstProcessing;
 using ArchiveBridge.Infrastructure.PstProcessing;
+using ArchiveBridge.Infrastructure.Time;
 using ArchiveBridge.Integration.Tests.Support;
 using Microsoft.Data.SqlClient;
 using Xunit;
@@ -177,8 +179,10 @@ public sealed class Slice4bPartitionExecutionTests(SqlServerFixture fixture)
         // Simula o writer tendo terminado (temp file + rename/finalização) mas o processo caiu ANTES do
         // checkpoint 3 (persist SQL): chama o writer DIRETAMENTE, sem passar pelo caso de uso.
         var writer = Slice4bPstProcessingSupport.Writer(fixture);
-        var direct = await writer.ExecuteAsync(scope, custody!, plan, plan.Parts[0], CancellationToken.None);
+        var directContext = new PartitionExecutionContext(CorrelationId.New(), DateTimeOffset.UtcNow);
+        var direct = await writer.ExecuteAsync(scope, custody!, plan, plan.Parts[0], directContext, CancellationToken.None);
         Assert.Equal(plan.Source.SourceHash, direct.OutputHash);
+        Assert.Equal(plan.Source.SourceHash, direct.SourceHash);
         Assert.Equal(0, await ExecutionRowCountAsync(scope, plan.Id)); // ainda nenhum checkpoint SQL.
 
         // "Restart": o caso de uso completo roda do zero. O writer converge para o MESMO output (nunca
@@ -298,10 +302,13 @@ public sealed class Slice4bPartitionExecutionTests(SqlServerFixture fixture)
             {
                 RootPath = Slice4bPstProcessingSupport.PartitionOutputRoot(fixture),
                 MinFreeSpaceMarginBytes = long.MaxValue / 2, // impossível de satisfazer em qualquer disco real.
-            });
+            },
+            new SystemClock());
 
         var exception = await Assert.ThrowsAsync<PartitionExecutionLimitExceededException>(() =>
-            starvedWriter.ExecuteAsync(scope, custody!, plan, plan.Parts[0], CancellationToken.None));
+            starvedWriter.ExecuteAsync(
+                scope, custody!, plan, plan.Parts[0], new PartitionExecutionContext(CorrelationId.New(), DateTimeOffset.UtcNow),
+                CancellationToken.None));
         Assert.Equal("INSUFFICIENT_SPACE", exception.ReasonCode);
         Assert.Equal(0, await ExecutionRowCountAsync(scope, plan.Id));
     }
@@ -318,7 +325,8 @@ public sealed class Slice4bPartitionExecutionTests(SqlServerFixture fixture)
         // Materializa via o writer diretamente (sem persistir o checkpoint SQL — simula o estado "output já
         // existe no caminho final" sob o qual o writer sempre reconfere antes de reaproveitar).
         var writer = Slice4bPstProcessingSupport.Writer(fixture);
-        await writer.ExecuteAsync(scope, custody!, plan, plan.Parts[0], CancellationToken.None);
+        var writerContext = new PartitionExecutionContext(CorrelationId.New(), DateTimeOffset.UtcNow);
+        await writer.ExecuteAsync(scope, custody!, plan, plan.Parts[0], writerContext, CancellationToken.None);
 
         var finalDir = FinalOutputDir(scope, plan);
         var partPath = Path.Combine(finalDir, "part.pst");
@@ -328,7 +336,7 @@ public sealed class Slice4bPartitionExecutionTests(SqlServerFixture fixture)
         // Readback via o writer (o MESMO caminho que a Application percorreria se replay chegasse a tocar o
         // filesystem antes de um checkpoint SQL existir) detecta a adulteração e recusa reaproveitar.
         await Assert.ThrowsAsync<PartitionExecutionOutputTamperedException>(() =>
-            writer.ExecuteAsync(scope, custody!, plan, plan.Parts[0], CancellationToken.None));
+            writer.ExecuteAsync(scope, custody!, plan, plan.Parts[0], writerContext, CancellationToken.None));
 
         // Nunca sobrescrito automaticamente: os bytes adulterados continuam lá, exatamente como estavam.
         Assert.Equal(tampered, File.ReadAllBytes(partPath));
@@ -430,6 +438,143 @@ public sealed class Slice4bPartitionExecutionTests(SqlServerFixture fixture)
         Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
     }
 
+    // ---- Correção AB-4B-008: o manifesto físico carrega a lineage mínima exigida pelo work order AB-4B-006
+    // item 7 (source_hash, correlation_id, started_at_utc, completed_at_utc) — autoconsistente como evidência
+    // local, revalidada por igualdade estrita contra o checkpoint SQL no réplay (nunca "concorda consigo
+    // mesmo"), e falha fechado quando adulterada, ausente ou malformada. ----
+
+    [Fact]
+    public async Task ThePhysicalManifestContainsTheMinimumLineageFieldsMatchingThePersistedCheckpoint()
+    {
+        var (scope, _, plan, _) = await RegisterInspectAndPlanAsync(
+            Slice4bPstProcessingSupport.ValidUnicodeHeader(), "execute-lineage-fields.pst");
+
+        var execution = await Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+            .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
+
+        var manifest = await ReadManifestNodeAsync(ManifestPath(scope, plan));
+        Assert.Equal(execution.SourceHash.Value, manifest["SourceHash"]!.GetValue<string>());
+        Assert.Equal(execution.Correlation.Value, Guid.Parse(manifest["CorrelationId"]!.GetValue<string>()));
+        Assert.Equal(execution.StartedAtUtc, manifest["StartedAtUtc"]!.GetValue<DateTimeOffset>());
+        Assert.Equal(execution.CompletedAtUtc, manifest["CompletedAtUtc"]!.GetValue<DateTimeOffset>());
+
+        // source_hash é gravado explicitamente mesmo sendo, neste Passo, sempre igual a output_hash
+        // (invariante SinglePartWithinTarget) — preserva a semântica de lineage sem ambiguidade (item 5).
+        Assert.Equal(execution.OutputHash.Value, manifest["SourceHash"]!.GetValue<string>());
+    }
+
+    [Theory]
+    [InlineData("SourceHash")]
+    [InlineData("CorrelationId")]
+    [InlineData("StartedAtUtc")]
+    [InlineData("CompletedAtUtc")]
+    public async Task ReplayAfterThePersistedCheckpointDetectsIsolatedLineageFieldTamperingAndFailsClosed(string fieldName)
+    {
+        var (scope, _, plan, _) = await RegisterInspectAndPlanAsync(
+            Slice4bPstProcessingSupport.ValidUnicodeHeader(), $"execute-replay-tamper-lineage-{fieldName}.pst");
+        await Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+            .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
+
+        var manifestPath = ManifestPath(scope, plan);
+        var node = await ReadManifestNodeAsync(manifestPath);
+        var original = node[fieldName]!.GetValue<string>();
+        node[fieldName] = TamperedLineageValue(fieldName, original);
+        await File.WriteAllTextAsync(manifestPath, node.ToJsonString());
+
+        await Assert.ThrowsAsync<PartitionExecutionOutputTamperedException>(() =>
+            Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+                .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None));
+
+        // Fail-closed, nunca reescrito: o manifesto adulterado continua lá e nenhuma linha nova foi gravada.
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
+    }
+
+    [Theory]
+    [InlineData("SourceHash")]
+    [InlineData("CorrelationId")]
+    [InlineData("StartedAtUtc")]
+    [InlineData("CompletedAtUtc")]
+    public async Task ReplayAfterThePersistedCheckpointDetectsAMissingLineageFieldAndFailsClosed(string fieldName)
+    {
+        var (scope, _, plan, _) = await RegisterInspectAndPlanAsync(
+            Slice4bPstProcessingSupport.ValidUnicodeHeader(), $"execute-replay-missing-lineage-{fieldName}.pst");
+        await Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+            .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
+
+        var manifestPath = ManifestPath(scope, plan);
+        var node = await ReadManifestNodeAsync(manifestPath);
+        Assert.True(node.Remove(fieldName)); // pré-condição: o campo realmente existia antes da remoção.
+        await File.WriteAllTextAsync(manifestPath, node.ToJsonString());
+
+        await Assert.ThrowsAsync<PartitionExecutionOutputTamperedException>(() =>
+            Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+                .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None));
+
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id)); // nenhuma linha nova.
+    }
+
+    [Fact]
+    public async Task ReplayAfterThePersistedCheckpointDetectsAMalformedCorrelationIdAndFailsClosed()
+    {
+        var (scope, _, plan, _) = await RegisterInspectAndPlanAsync(
+            Slice4bPstProcessingSupport.ValidUnicodeHeader(), "execute-replay-malformed-correlation.pst");
+        await Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+            .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
+
+        var manifestPath = ManifestPath(scope, plan);
+        var node = await ReadManifestNodeAsync(manifestPath);
+        node["CorrelationId"] = "not-a-guid"; // malformado — nunca um GUID válido diferente, mas texto ilegível.
+        await File.WriteAllTextAsync(manifestPath, node.ToJsonString());
+
+        await Assert.ThrowsAsync<PartitionExecutionOutputTamperedException>(() =>
+            Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+                .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None));
+
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
+    }
+
+    [Fact]
+    public async Task ReplayAfterThePersistedCheckpointDetectsAMalformedTimestampAndFailsClosed()
+    {
+        var (scope, _, plan, _) = await RegisterInspectAndPlanAsync(
+            Slice4bPstProcessingSupport.ValidUnicodeHeader(), "execute-replay-malformed-timestamp.pst");
+        await Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+            .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
+
+        var manifestPath = ManifestPath(scope, plan);
+        var node = await ReadManifestNodeAsync(manifestPath);
+        node["StartedAtUtc"] = "not-a-date"; // manifest.json malformado (item 6: "malformed manifest falha fechado").
+        await File.WriteAllTextAsync(manifestPath, node.ToJsonString());
+
+        await Assert.ThrowsAsync<PartitionExecutionOutputTamperedException>(() =>
+            Slice4bPstProcessingSupport.ExecuteUseCase(fixture)
+                .ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None));
+
+        Assert.Equal(1, await ExecutionRowCountAsync(scope, plan.Id));
+    }
+
+    private static string TamperedLineageValue(string fieldName, string original) => fieldName switch
+    {
+        "SourceHash" => string.Equals(original, new string('0', 64), StringComparison.Ordinal) ? new string('1', 64) : new string('0', 64),
+        "CorrelationId" => Guid.NewGuid().ToString(),
+        "StartedAtUtc" or "CompletedAtUtc" => DateTimeOffset.Parse(
+                original, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)
+            .AddSeconds(1).ToString("O", CultureInfo.InvariantCulture),
+        _ => throw new ArgumentOutOfRangeException(nameof(fieldName), fieldName, "Campo de lineage desconhecido no teste."),
+    };
+
+    private string ManifestPath(TenantScope scope, PartitionPlan plan) => Path.Combine(FinalOutputDir(scope, plan), "manifest.json");
+
+    private static async Task<System.Text.Json.Nodes.JsonObject> ReadManifestNodeAsync(string manifestPath)
+    {
+        var json = await File.ReadAllTextAsync(manifestPath);
+        return System.Text.Json.Nodes.JsonNode.Parse(json)!.AsObject();
+    }
+
     // ---- Órfão de staging: nunca confundido com sucesso; reconciliação segura por idade ----
 
     [Fact]
@@ -508,11 +653,14 @@ public sealed class Slice4bPartitionExecutionTests(SqlServerFixture fixture)
         Assert.DoesNotContain("mailboxes", manifestText, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(".pst", manifestText, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(Path.DirectorySeparatorChar.ToString(), manifestText, StringComparison.Ordinal);
-        // Só os campos esperados (IDs opacos, hashes, metadados de execução) existem no manifesto.
+        // Só os campos esperados (IDs opacos, hashes, metadados de execução e lineage mínima do work order
+        // AB-4B-006 item 7 — sourceHash/correlationId/startedAtUtc/completedAtUtc, correção AB-4B-008)
+        // existem no manifesto.
         var expectedFields = new[]
         {
-            "tenant", "project", "plan", "part", "planHash", "partSequence", "partKey", "outputHash",
-            "outputSizeBytes", "executorName", "executorVersion",
+            "tenant", "project", "plan", "part", "planHash", "partSequence", "partKey", "sourceHash",
+            "outputHash", "outputSizeBytes", "executorName", "executorVersion", "correlationId",
+            "startedAtUtc", "completedAtUtc",
         };
         foreach (var property in manifest.RootElement.EnumerateObject())
         {

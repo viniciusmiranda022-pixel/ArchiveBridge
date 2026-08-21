@@ -30,7 +30,19 @@ internal static class PartitionOutputBundleValidator
     // internal (não private): reaproveitado pelo writer para o buffer de streaming da cópia/hash.
     internal const int StreamBufferSize = 4 * 1024 * 1024;
 
-    /// <summary>Conteúdo estrutural esperado do manifesto, derivado do registro persistido/plano/parte (nunca do próprio manifesto).</summary>
+    /// <summary>
+    /// Conteúdo estrutural esperado do manifesto, derivado do registro persistido/plano/parte (nunca do
+    /// próprio manifesto). <see cref="SourceHash"/> é sempre conhecido de antemão (o plano já fixa a
+    /// identidade da origem) e por isso é SEMPRE checado por igualdade estrita. <see cref="Correlation"/>,
+    /// <see cref="StartedAtUtc"/> e <see cref="CompletedAtUtc"/> são <c>null</c> quando o chamador não tem um
+    /// valor esperado independente para comparar — por exemplo, o writer detectando um bundle que já existia
+    /// de uma execução ANTERIOR/concorrente, cuja lineage pertence a quem realmente o publicou, não a esta
+    /// tentativa. Quando não-<c>null</c> (réplay pós-checkpoint SQL do AB-4B-007, ou a reabertura do writer
+    /// logo depois de gravar SUA PRÓPRIA escrita), o valor é checado por igualdade estrita — nunca um
+    /// manifesto que apenas "concorda consigo mesmo" (work order AB-4B-006 item 7 / correção AB-4B-008).
+    /// Mesmo quando <c>null</c>, os campos ainda são exigidos como estruturalmente válidos (não ausentes, não
+    /// malformados) — um manifesto sem lineage nunca passa.
+    /// </summary>
     internal readonly record struct ExpectedManifest(
         Guid Tenant,
         Guid Project,
@@ -39,8 +51,28 @@ internal static class PartitionOutputBundleValidator
         Sha256Hash PlanHash,
         int PartSequence,
         Sha256Hash PartKey,
+        Sha256Hash SourceHash,
         string ExecutorName,
-        string ExecutorVersion);
+        string ExecutorVersion,
+        CorrelationId? Correlation = null,
+        DateTimeOffset? StartedAtUtc = null,
+        DateTimeOffset? CompletedAtUtc = null);
+
+    /// <summary>Lineage lida (e já validada) de volta de um manifesto físico.</summary>
+    internal readonly record struct ManifestLineage(
+        Sha256Hash SourceHash, CorrelationId Correlation, DateTimeOffset StartedAtUtc, DateTimeOffset CompletedAtUtc);
+
+    /// <summary>
+    /// Trunca para a precisão de milissegundo (mesma precisão de <c>DATETIME2(3)</c> usada por
+    /// <c>dbo.pst_partition_executions</c>) — gravado no manifesto físico JÁ nesta precisão para que o valor
+    /// baked-in no bundle imutável bata EXATAMENTE com o que a Application persiste no checkpoint SQL logo
+    /// em seguida (nenhum arredondamento divergente entre as duas evidências independentes).
+    /// </summary>
+    internal static DateTimeOffset TruncateToMillisecondPrecision(DateTimeOffset value)
+    {
+        var ticks = value.UtcTicks - (value.UtcTicks % TimeSpan.TicksPerMillisecond);
+        return new DateTimeOffset(ticks, TimeSpan.Zero);
+    }
 
     /// <summary>Caminho determinístico do diretório de output de uma parte, derivado apenas de IDs opacos.</summary>
     internal static string VersionDir(string outputRoot, Guid tenant, Guid project, Guid plan, string partKey)
@@ -83,15 +115,19 @@ internal static class PartitionOutputBundleValidator
                 "part.sha256 diverge do conteúdo de part.pst; artefato adulterado (fail-closed).");
         }
 
-        await ValidateManifestAsync(manifestPath, hash, size, expectedManifest, cancellationToken).ConfigureAwait(false);
+        var lineage = await ValidateManifestAsync(manifestPath, hash, size, expectedManifest, cancellationToken).ConfigureAwait(false);
 
-        return new PartitionPartArtifact(hash, size);
+        return new PartitionPartArtifact(hash, size, lineage.SourceHash, lineage.Correlation, lineage.StartedAtUtc, lineage.CompletedAtUtc);
     }
 
     // O manifesto é evidência, NUNCA a fonte de verdade da verificação: todo campo estrutural (IDs opacos,
-    // PlanHash, PartSequence/PartKey, hash/size, identidade do executor) tem de bater EXATAMENTE com o
-    // esperado — um manifesto que "concorda consigo mesmo" mas diverge do registro persistido é adulteração.
-    private static async Task ValidateManifestAsync(
+    // PlanHash, PartSequence/PartKey, hash/size, identidade do executor, SourceHash) tem de bater EXATAMENTE
+    // com o esperado — um manifesto que "concorda consigo mesmo" mas diverge do registro persistido é
+    // adulteração. Correlation/StartedAtUtc/CompletedAtUtc são checados por igualdade estrita SOMENTE quando
+    // o chamador fornece um valor esperado (ver ExpectedManifest); em QUALQUER caso, os três têm de estar
+    // presentes e ser estruturalmente válidos — ausência/malformação falha fechado (work order AB-4B-006
+    // item 7, correção AB-4B-008).
+    private static async Task<ManifestLineage> ValidateManifestAsync(
         string manifestPath, Sha256Hash hash, long size, ExpectedManifest expected, CancellationToken cancellationToken)
     {
         PartitionExecutionManifestJson? manifest;
@@ -114,6 +150,7 @@ internal static class PartitionOutputBundleValidator
             && string.Equals(manifest.PlanHash, expected.PlanHash.Value, StringComparison.Ordinal)
             && manifest.PartSequence == expected.PartSequence
             && string.Equals(manifest.PartKey, expected.PartKey.Value, StringComparison.Ordinal)
+            && string.Equals(manifest.SourceHash, expected.SourceHash.Value, StringComparison.Ordinal)
             && string.Equals(manifest.OutputHash, hash.Value, StringComparison.Ordinal)
             && manifest.OutputSizeBytes == size
             && string.Equals(manifest.ExecutorName, expected.ExecutorName, StringComparison.Ordinal)
@@ -124,6 +161,39 @@ internal static class PartitionOutputBundleValidator
             throw new PartitionExecutionOutputTamperedException(
                 "manifest.json diverge do registro de execução esperado; artefato adulterado (fail-closed).");
         }
+
+        if (!Guid.TryParse(manifest!.CorrelationId, out var correlationValue) || correlationValue == Guid.Empty)
+        {
+            throw new PartitionExecutionOutputTamperedException(
+                "manifest.json possui correlation_id ausente ou malformado; artefato adulterado (fail-closed).");
+        }
+
+        var correlation = new CorrelationId(correlationValue);
+        if (expected.Correlation is { } expectedCorrelation && correlation != expectedCorrelation)
+        {
+            throw new PartitionExecutionOutputTamperedException(
+                "manifest.json diverge da correlação esperada; artefato adulterado (fail-closed).");
+        }
+
+        if (manifest.StartedAtUtc == default || manifest.CompletedAtUtc == default || manifest.CompletedAtUtc < manifest.StartedAtUtc)
+        {
+            throw new PartitionExecutionOutputTamperedException(
+                "manifest.json possui started_at_utc/completed_at_utc ausentes ou inconsistentes; artefato adulterado (fail-closed).");
+        }
+
+        if (expected.StartedAtUtc is { } expectedStarted && manifest.StartedAtUtc != expectedStarted)
+        {
+            throw new PartitionExecutionOutputTamperedException(
+                "manifest.json diverge de started_at_utc esperado; artefato adulterado (fail-closed).");
+        }
+
+        if (expected.CompletedAtUtc is { } expectedCompleted && manifest.CompletedAtUtc != expectedCompleted)
+        {
+            throw new PartitionExecutionOutputTamperedException(
+                "manifest.json diverge de completed_at_utc esperado; artefato adulterado (fail-closed).");
+        }
+
+        return new ManifestLineage(new Sha256Hash(manifest.SourceHash), correlation, manifest.StartedAtUtc, manifest.CompletedAtUtc);
     }
 
     internal static async Task<(Sha256Hash Hash, long Size)> HashFileAsync(string path, CancellationToken cancellationToken)
@@ -165,7 +235,13 @@ internal static class PartitionOutputBundleValidator
     /// <summary>
     /// Forma serializada do manifesto (SÓ IDs opacos, hashes e metadados de execução — nunca caminho, UPN,
     /// assunto, corpo, nome de anexo ou segredo). Compartilhada entre a escrita (<see cref="LocalSinglePartExecutionWriter"/>)
-    /// e a leitura/validação (aqui).
+    /// e a leitura/validação (aqui). Inclui <see cref="SourceHash"/>/<see cref="CorrelationId"/>/
+    /// <see cref="StartedAtUtc"/>/<see cref="CompletedAtUtc"/> (work order AB-4B-006 item 7, correção
+    /// AB-4B-008) — o manifesto físico por part/conjunto precisa ser autoconsistente como evidência local de
+    /// lineage/auditoria, sem depender exclusivamente do banco. <see cref="SourceHash"/> é persistido
+    /// explicitamente mesmo sendo, neste Passo, sempre igual a <see cref="OutputHash"/> (invariante
+    /// <c>SinglePartWithinTarget</c>) — preserva a semântica de lineage sem ambiguidade e permite evolução
+    /// futura (split real onde as duas divergem).
     /// </summary>
     internal sealed record PartitionExecutionManifestJson(
         Guid Tenant,
@@ -175,8 +251,12 @@ internal static class PartitionOutputBundleValidator
         string PlanHash,
         int PartSequence,
         string PartKey,
+        string SourceHash,
         string OutputHash,
         long OutputSizeBytes,
         string ExecutorName,
-        string ExecutorVersion);
+        string ExecutorVersion,
+        string CorrelationId,
+        DateTimeOffset StartedAtUtc,
+        DateTimeOffset CompletedAtUtc);
 }
