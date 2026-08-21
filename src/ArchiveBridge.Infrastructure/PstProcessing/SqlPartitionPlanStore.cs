@@ -42,6 +42,14 @@ public sealed class SqlPartitionPlanStore(TenantConnectionFactory connectionFact
         WHERE is_canonical = 1 AND artifact_id = @artifact AND project_id = @project AND plan_hash = @planHash;
         """;
 
+    private const string FindByIdSql =
+        $"""
+        SET NOCOUNT ON;
+        SELECT {PlanColumns}
+        FROM dbo.pst_partition_plans
+        WHERE plan_id = @planId AND project_id = @project;
+        """;
+
     private const string FindPartsSql =
         """
         SET NOCOUNT ON;
@@ -95,6 +103,30 @@ public sealed class SqlPartitionPlanStore(TenantConnectionFactory connectionFact
             command.Parameters.Add(new SqlParameter("@artifact", SqlDbType.UniqueIdentifier) { Value = artifact.Value });
             command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
             command.Parameters.Add(new SqlParameter("@planHash", SqlDbType.Char, 64) { Value = planHash.Value });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return null;
+            }
+
+            row = ReadPlanRow(reader);
+        }
+
+        var parts = await ReadPartsAsync(connection.Connection, transaction: null, row.Id, scope, cancellationToken)
+            .ConfigureAwait(false);
+        return row.ToPlan(parts);
+    }
+
+    /// <inheritdoc />
+    public async Task<PartitionPlan?> FindByIdAsync(TenantScope scope, PartitionPlanId id, CancellationToken cancellationToken)
+    {
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+
+        PlanRow row;
+        await using (var command = new SqlCommand(FindByIdSql, connection.Connection))
+        {
+            command.Parameters.Add(new SqlParameter("@planId", SqlDbType.UniqueIdentifier) { Value = id.Value });
+            command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {

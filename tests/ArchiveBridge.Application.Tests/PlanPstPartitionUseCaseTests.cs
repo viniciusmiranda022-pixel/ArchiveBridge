@@ -393,6 +393,9 @@ public sealed class PlanPstPartitionUseCaseTests
                     : null);
         }
 
+        public Task<PartitionPlan?> FindByIdAsync(TenantScope scope, PartitionPlanId id, CancellationToken cancellationToken) =>
+            Task.FromResult(_stored is not null && _stored.Id == id ? _stored : null);
+
         public Task<PartitionPlan> SaveAsync(PartitionPlan plan, CancellationToken cancellationToken)
         {
             SaveCount++;
