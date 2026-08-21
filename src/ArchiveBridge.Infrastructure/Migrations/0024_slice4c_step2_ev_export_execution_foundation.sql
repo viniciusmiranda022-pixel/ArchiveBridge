@@ -1,7 +1,9 @@
 -- Slice 4C (Passo 2) — Enterprise Vault Export Command & Throttling Foundation (AB-4C-005).
 --
--- Aditiva e não destrutiva: cria SEIS tabelas novas. Nenhum DROP, nenhum UPDATE de dados, nenhuma
--- redefinição de 0001-0023 — os arquivos das migrations anteriores permanecem byte-for-byte intactos.
+-- Aditiva e não destrutiva: cria SETE tabelas novas (AB-4C-007 substituiu o ledger único de throttling por
+-- DOIS slots recuperáveis — connector e archive — ver comentário abaixo). Nenhum DROP, nenhum UPDATE de
+-- dados, nenhuma redefinição de 0001-0023 — os arquivos das migrations anteriores permanecem byte-for-byte
+-- intactos.
 --
 -- Persiste APENAS metadados estruturais/decisórios: identidade opaca do pedido/tentativa, política efetiva
 -- (MaxThreads/MaxPSTSizeMB), resultado estruturado, hash/tamanho de cada output PST calculados após
@@ -54,45 +56,85 @@ ALTER SECURITY POLICY rls.tenant_isolation_policy
     ADD BLOCK PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_requests AFTER INSERT;
 GO
 
--- Leases de throttling (dbo.ev_export_throttle_leases, AB-4C-005 item 4): impede concorrência não
--- autorizada por CONNECTOR e por ARCHIVE simultaneamente. Os DOIS índices únicos FILTRADOS
--- (WHERE released_at_utc IS NULL) sobre a MESMA linha são o backstop atômico: um único INSERT só sucede se
--- NENHUM dos dois já estiver em uso — nunca uma aquisição parcial (só connector, ou só archive).
-CREATE TABLE dbo.ev_export_throttle_leases
+-- Slots de throttling (AB-4C-005 item 4 + AB-4C-007 blocker 1): impede concorrência não autorizada por
+-- CONNECTOR e por ARCHIVE simultaneamente, e é RECUPERÁVEL — nunca um mutex órfão permanente. Ao contrário
+-- do desenho original (ledger insert-only sem expiração), cada slot é uma linha MUTÁVEL de "propriedade
+-- atual" com deadline durável (expires_at_utc) e identidade do titular (lease_id): um titular antigo nunca
+-- consegue liberar/renovar um slot já reassumido, porque a condição WHERE sempre exige lease_id = @lease.
+--
+-- dbo.ev_export_connector_throttle_slots: UMA linha por connector (globalmente — um connector pertence a
+-- exatamente um tenant/projeto, então esta exclusividade é efetivamente por connector em todo o sistema,
+-- preservando o desenho original). dbo.ev_export_archive_throttle_slots: UMA linha por
+-- (tenant, projeto, archive). Em ambas: lease_id/attempt_id/correlation_id/acquired_at_utc/expires_at_utc
+-- são NULOS quando o slot está livre, e SEMPRE preenchidos juntos quando ocupado (CHECK de consistência).
+--
+-- Aquisição (SqlEvExportThrottleLeaseStore.TryAcquireAsync) é um UPSERT condicional atômico por slot,
+-- dentro de UMA transação cobrindo os DOIS slots: cada UPSERT só sucede se o slot estiver livre
+-- (lease_id IS NULL) OU expirado (expires_at_utc < @now) — nunca rouba um lease ainda válido. Se qualquer
+-- um dos dois falhar, a transação inteira é revertida (nenhuma aquisição parcial). Renovação
+-- (TryRenewAsync) exige o MESMO lease_id e um deadline ainda não vencido — nunca ressuscita um lease já
+-- expirado (mesmo padrão de SqlJobLeaseManager.RenewSql). Liberação (ReleaseAsync) é idempotente: libera
+-- só se lease_id ainda corresponde (0 linhas afetadas se já liberado/reassumido — nunca lança).
+CREATE TABLE dbo.ev_export_connector_throttle_slots
 (
-    lease_id           UNIQUEIDENTIFIER NOT NULL,
-    tenant_id            UNIQUEIDENTIFIER NOT NULL,
-    project_id             UNIQUEIDENTIFIER NOT NULL,
-    connector_id              UNIQUEIDENTIFIER NOT NULL,
-    external_archive_id         NVARCHAR(300)    NOT NULL,
-    attempt_id                    UNIQUEIDENTIFIER NOT NULL,
-    correlation_id                   UNIQUEIDENTIFIER NOT NULL,
-    acquired_at_utc                    DATETIME2(3)     NOT NULL,
-    released_at_utc                      DATETIME2(3)     NULL,
-    CONSTRAINT PK_ev_export_throttle_leases PRIMARY KEY (lease_id),
-    CONSTRAINT CK_ev_export_throttle_leases_released CHECK (released_at_utc IS NULL OR released_at_utc >= acquired_at_utc)
+    connector_id      UNIQUEIDENTIFIER NOT NULL,
+    tenant_id         UNIQUEIDENTIFIER NOT NULL,
+    project_id        UNIQUEIDENTIFIER NOT NULL,
+    lease_id          UNIQUEIDENTIFIER NULL,
+    attempt_id        UNIQUEIDENTIFIER NULL,
+    correlation_id    UNIQUEIDENTIFIER NULL,
+    acquired_at_utc   DATETIME2(3)     NULL,
+    expires_at_utc    DATETIME2(3)     NULL,
+    CONSTRAINT PK_ev_export_connector_throttle_slots PRIMARY KEY (connector_id),
+    CONSTRAINT CK_ev_export_connector_throttle_slots_consistency CHECK (
+        (lease_id IS NULL AND attempt_id IS NULL AND correlation_id IS NULL
+             AND acquired_at_utc IS NULL AND expires_at_utc IS NULL)
+        OR (lease_id IS NOT NULL AND attempt_id IS NOT NULL AND correlation_id IS NOT NULL
+             AND acquired_at_utc IS NOT NULL AND expires_at_utc IS NOT NULL AND expires_at_utc > acquired_at_utc))
 );
 GO
 
-CREATE UNIQUE INDEX UX_ev_export_throttle_leases_connector
-    ON dbo.ev_export_throttle_leases (connector_id) WHERE released_at_utc IS NULL;
+GRANT SELECT, INSERT ON dbo.ev_export_connector_throttle_slots TO ab_app_role;
 GO
-
-CREATE UNIQUE INDEX UX_ev_export_throttle_leases_archive
-    ON dbo.ev_export_throttle_leases (tenant_id, project_id, external_archive_id) WHERE released_at_utc IS NULL;
-GO
-
--- Aplicação recebe INSERT e UPDATE restrito a released_at_utc (liberação do lease) — nenhum outro campo
--- muda depois de adquirido.
-GRANT SELECT, INSERT ON dbo.ev_export_throttle_leases TO ab_app_role;
-GO
-GRANT UPDATE (released_at_utc) ON dbo.ev_export_throttle_leases TO ab_app_role;
+GRANT UPDATE (tenant_id, project_id, lease_id, attempt_id, correlation_id, acquired_at_utc, expires_at_utc)
+    ON dbo.ev_export_connector_throttle_slots TO ab_app_role;
 GO
 
 ALTER SECURITY POLICY rls.tenant_isolation_policy
-    ADD FILTER PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_throttle_leases,
-    ADD BLOCK PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_throttle_leases AFTER INSERT,
-    ADD BLOCK PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_throttle_leases AFTER UPDATE;
+    ADD FILTER PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_connector_throttle_slots,
+    ADD BLOCK PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_connector_throttle_slots AFTER INSERT,
+    ADD BLOCK PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_connector_throttle_slots AFTER UPDATE;
+GO
+
+CREATE TABLE dbo.ev_export_archive_throttle_slots
+(
+    tenant_id             UNIQUEIDENTIFIER NOT NULL,
+    project_id            UNIQUEIDENTIFIER NOT NULL,
+    external_archive_id   NVARCHAR(300)    NOT NULL,
+    lease_id              UNIQUEIDENTIFIER NULL,
+    attempt_id            UNIQUEIDENTIFIER NULL,
+    correlation_id        UNIQUEIDENTIFIER NULL,
+    acquired_at_utc       DATETIME2(3)     NULL,
+    expires_at_utc        DATETIME2(3)     NULL,
+    CONSTRAINT PK_ev_export_archive_throttle_slots PRIMARY KEY (tenant_id, project_id, external_archive_id),
+    CONSTRAINT CK_ev_export_archive_throttle_slots_consistency CHECK (
+        (lease_id IS NULL AND attempt_id IS NULL AND correlation_id IS NULL
+             AND acquired_at_utc IS NULL AND expires_at_utc IS NULL)
+        OR (lease_id IS NOT NULL AND attempt_id IS NOT NULL AND correlation_id IS NOT NULL
+             AND acquired_at_utc IS NOT NULL AND expires_at_utc IS NOT NULL AND expires_at_utc > acquired_at_utc))
+);
+GO
+
+GRANT SELECT, INSERT ON dbo.ev_export_archive_throttle_slots TO ab_app_role;
+GO
+GRANT UPDATE (lease_id, attempt_id, correlation_id, acquired_at_utc, expires_at_utc)
+    ON dbo.ev_export_archive_throttle_slots TO ab_app_role;
+GO
+
+ALTER SECURITY POLICY rls.tenant_isolation_policy
+    ADD FILTER PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_archive_throttle_slots,
+    ADD BLOCK PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_archive_throttle_slots AFTER INSERT,
+    ADD BLOCK PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_archive_throttle_slots AFTER UPDATE;
 GO
 
 -- Tentativas de exportação (dbo.ev_export_attempts, AB-4C-005 items 11/12): append-only — evidência

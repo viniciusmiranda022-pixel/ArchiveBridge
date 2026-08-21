@@ -84,6 +84,7 @@ public sealed class EvExportCommandProcessor(
         var command = claimed.Command;
         var lease = new LeaseCommand(scope, claimed.Job.JobId, worker, claimed.Job.Epoch, command.Correlation);
         var fence = new JobFence(scope, claimed.Job.JobId, worker, claimed.Job.Epoch);
+        var throttleHolder = new ThrottleLeaseHolder();
 
         EvExportRunResult? result = null;
         try
@@ -91,8 +92,9 @@ public sealed class EvExportCommandProcessor(
             var beat = await _heartbeat.RunWhileAsync(
                 lease,
                 HeartbeatInterval(leaseDuration),
-                async token => result = await DispatchAsync(scope, claimed, fence, token).ConfigureAwait(false),
-                cancellationToken).ConfigureAwait(false);
+                async token => result = await DispatchAsync(scope, claimed, fence, leaseDuration, throttleHolder, token).ConfigureAwait(false),
+                cancellationToken,
+                onBeatAsync: token => RenewThrottleLeaseAsync(scope, throttleHolder, leaseDuration, token)).ConfigureAwait(false);
             if (beat.Lost)
             {
                 return new EvExportCommandExecution(claimed.Job.JobId, claimed.Request, EvExportCommandOutcome.Fenced, beat.LastOutcome);
@@ -114,11 +116,34 @@ public sealed class EvExportCommandProcessor(
             return new EvExportCommandExecution(claimed.Job.JobId, claimed.Request, OutcomeFor(retried, EvExportCommandOutcome.Retried), retried);
         }
 
-        return await FinalizeJobAsync(claimed.Job.JobId, claimed.Request, lease, result!, cancellationToken).ConfigureAwait(false);
+        return await FinalizeJobAsync(
+            claimed.Job.JobId, claimed.Request, lease, result!, command.Correlation, cancellationToken).ConfigureAwait(false);
+    }
+
+    // Estado mutável POR CHAMADA de ProcessNextAsync (nunca compartilhado entre invocações concorrentes):
+    // o laço de batimento (rodando em paralelo à operação) só pode renovar o lease de throttle DEPOIS que
+    // DispatchAsync efetivamente o adquiriu — antes disso (ex.: ainda revalidando capability) não há nada a
+    // renovar, e isso é um no-op válido (nunca um cercamento perdido).
+    private sealed class ThrottleLeaseHolder
+    {
+        public EvExportThrottleLease? Lease;
+    }
+
+    // (AB-4C-007 blocker 1 item 4) Renovação do lease de throttle SOB O MESMO laço de batimento do Job:
+    // perda da renovação (deadline vencido ou titular trocado) é tratada por PlanningHeartbeat exatamente
+    // como perda do cercamento do Job — cancela a operação em curso ANTES que qualquer efeito novo seja
+    // persistido.
+    private async Task<bool> RenewThrottleLeaseAsync(
+        TenantScope scope, ThrottleLeaseHolder holder, TimeSpan leaseDuration, CancellationToken cancellationToken)
+    {
+        var current = holder.Lease;
+        return current is null
+            || await _throttle.TryRenewAsync(scope, current, leaseDuration, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<EvExportCommandExecution> FinalizeJobAsync(
-        JobId jobId, ExportRequestId request, LeaseCommand lease, EvExportRunResult result, CancellationToken cancellationToken)
+        JobId jobId, ExportRequestId request, LeaseCommand lease, EvExportRunResult result, CorrelationId correlation,
+        CancellationToken cancellationToken)
     {
         switch (result.Outcome)
         {
@@ -137,13 +162,34 @@ public sealed class EvExportCommandProcessor(
             case EvExportAttemptOutcome.Throttled:
                 var throttled = await _jobs.ScheduleRetryAsync(
                     lease, ErrorCode.ResourceExhaustion, _clock.UtcNow + ThrottleBackoff, cancellationToken).ConfigureAwait(false);
+                await AuditRetryScheduledIfAppliedAsync(
+                    lease.Scope, request, result.Attempt, correlation, throttled, cancellationToken).ConfigureAwait(false);
                 return new EvExportCommandExecution(jobId, request, OutcomeFor(throttled, EvExportCommandOutcome.Retried), throttled);
 
             default: // Failed (falha transitória do processo do exporter): candidata a retry.
                 var retried = await _jobs.ScheduleRetryAsync(
                     lease, ErrorCode.TransientProvider, _clock.UtcNow + RetryBackoff, cancellationToken).ConfigureAwait(false);
+                await AuditRetryScheduledIfAppliedAsync(
+                    lease.Scope, request, result.Attempt, correlation, retried, cancellationToken).ConfigureAwait(false);
                 return new EvExportCommandExecution(jobId, request, OutcomeFor(retried, EvExportCommandOutcome.Retried), retried);
         }
+    }
+
+    // (AB-4C-007 blocker 2) Audita RetryScheduled SOMENTE quando a transição do Job foi de fato aplicada (ou
+    // é um replay idempotente coerente) — nunca quando o cercamento foi perdido (FencedOut/NotFound), o que
+    // evitaria auditar um retry que nunca foi persistido (duplicação/evidência ambígua em replay/fenced).
+    private async Task AuditRetryScheduledIfAppliedAsync(
+        TenantScope scope, ExportRequestId request, ExportAttemptId attempt, CorrelationId correlation,
+        JobCommandOutcome jobOutcome, CancellationToken cancellationToken)
+    {
+        if (jobOutcome is not (JobCommandOutcome.Applied or JobCommandOutcome.IdempotentReplay))
+        {
+            return;
+        }
+
+        await _audit.AppendAsync(
+            scope, new EvExportAuditEvent(request, attempt, EvExportAuditEventCode.RetryScheduled, null, correlation, _clock.UtcNow),
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static TimeSpan HeartbeatInterval(TimeSpan leaseDuration) =>
@@ -158,7 +204,8 @@ public sealed class EvExportCommandProcessor(
     // outputs, persiste attempt + auditoria. NUNCA lança para sinalizar desfecho de negócio — desfechos
     // são sempre um EvExportRunResult explícito (o Job só é transitado DEPOIS do heartbeat terminar).
     private async Task<EvExportRunResult> DispatchAsync(
-        TenantScope scope, ClaimedEvExportCommand claimed, JobFence fence, CancellationToken cancellationToken)
+        TenantScope scope, ClaimedEvExportCommand claimed, JobFence fence, TimeSpan leaseDuration,
+        ThrottleLeaseHolder throttleHolder, CancellationToken cancellationToken)
     {
         var command = claimed.Command;
         var request = claimed.Request;
@@ -186,19 +233,23 @@ public sealed class EvExportCommandProcessor(
             return blocked;
         }
 
-        // (item 4) Throttle por connector E archive — adquirido ANTES de qualquer efeito externo.
-        var lease = await _throttle
-            .TryAcquireAsync(scope, command.Connector, command.ExternalArchiveId, attempt, command.Correlation, cancellationToken)
+        // (item 4; recuperável desde AB-4C-007 blocker 1) Throttle por connector E archive — adquirido
+        // ANTES de qualquer efeito externo, com deadline durável renovado pelo MESMO batimento do Job
+        // (ver ThrottleLeaseHolder/RenewThrottleLeaseAsync em ProcessNextAsync).
+        var acquired = await _throttle
+            .TryAcquireAsync(scope, command.Connector, command.ExternalArchiveId, attempt, command.Correlation, leaseDuration, cancellationToken)
             .ConfigureAwait(false);
-        if (lease is null)
+        if (acquired is null)
         {
-            await _audit.AppendAsync(
-                scope,
-                new EvExportAuditEvent(request, attempt, EvExportAuditEventCode.Throttled, null, command.Correlation, _clock.UtcNow),
-                cancellationToken).ConfigureAwait(false);
-            return EvExportEvaluator.EvaluateThrottled(request, attempt, attemptNumber, byConnector: true, _clock.UtcNow);
+            // (AB-4C-007 blocker 3) A tentativa throttled é persistida no attempt history — nunca some do
+            // evidence chain — sob o MESMO fencing do restante do pipeline; um retry subsequente terá outro
+            // AttemptNumber e preserva toda a lineage.
+            var throttled = EvExportEvaluator.EvaluateThrottled(request, attempt, attemptNumber, byConnector: true, _clock.UtcNow);
+            await PersistAndAuditAsync(scope, command, throttled, fence, cancellationToken).ConfigureAwait(false);
+            return throttled;
         }
 
+        throttleHolder.Lease = acquired;
         try
         {
             return await RunAttemptAsync(
@@ -207,7 +258,32 @@ public sealed class EvExportCommandProcessor(
         }
         finally
         {
-            await _throttle.ReleaseAsync(scope, lease, cancellationToken).ConfigureAwait(false);
+            // (AB-4C-007 blocker 1 item 5) Melhor esforço, com um token BOUNDED e INDEPENDENTE do token da
+            // operação (que pode já estar cancelado — perda de cercamento, shutdown cooperativo): a
+            // liberação nunca deve depender exclusivamente dele, e uma falha aqui NUNCA mascara uma exceção
+            // original de RunAttemptAsync (ver ReleaseThrottleLeaseBestEffortAsync). O deadline durável do
+            // lease (TryAcquireAsync/TryRenewAsync) é o fail-safe real — esta liberação é só uma otimização
+            // de latência.
+            throttleHolder.Lease = null;
+            await ReleaseThrottleLeaseBestEffortAsync(scope, acquired).ConfigureAwait(false);
+        }
+    }
+
+    private static readonly TimeSpan ThrottleReleaseTimeout = TimeSpan.FromSeconds(10);
+
+    private async Task ReleaseThrottleLeaseBestEffortAsync(TenantScope scope, EvExportThrottleLease lease)
+    {
+        using var timeout = new CancellationTokenSource(ThrottleReleaseTimeout);
+        try
+        {
+            await _throttle.ReleaseAsync(scope, lease, timeout.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Melhor esforço: liberar é uma otimização de latência, nunca uma dependência de correção — o
+            // deadline durável do lease garante que ele nunca fica órfão permanentemente mesmo que esta
+            // liberação falhe ou não seja tentada a tempo (crash, shutdown, timeout do cleanup). Engolida
+            // deliberadamente para NUNCA mascarar a exceção original que motivou este `finally`.
         }
     }
 
@@ -293,6 +369,7 @@ public sealed class EvExportCommandProcessor(
         {
             EvExportAttemptOutcome.Completed => EvExportAuditEventCode.Completed,
             EvExportAttemptOutcome.IntegrityFailed => EvExportAuditEventCode.IntegrityFailed,
+            EvExportAttemptOutcome.Throttled => EvExportAuditEventCode.Throttled,
             _ => EvExportAuditEventCode.Failed,
         };
         await _audit.AppendAsync(

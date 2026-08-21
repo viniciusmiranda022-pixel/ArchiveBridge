@@ -238,7 +238,8 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     {
         // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
         // 0001–0023 tivesse divergido (inclusive as do Passo 1 do Slice 4C), isto lançaria. Em seguida
-        // confirmamos a 0024 e as seis tabelas da fundação de EXECUÇÃO de export EV (Slice 4C, Passo 2).
+        // confirmamos a 0024 e as SETE tabelas da fundação de EXECUÇÃO de export EV (Slice 4C, Passo 2;
+        // o throttling recuperável de AB-4C-007 substituiu o ledger único original por DOIS slots).
         var runner = new MigrationRunner(fixture.AdminConnectionString);
         await runner.ApplyAsync(CancellationToken.None); // não lança
 
@@ -254,25 +255,37 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
         await using (var tables = new SqlCommand(
             """
             SELECT COUNT(*) FROM sys.tables WHERE name IN (
-                'ev_export_requests', 'ev_export_throttle_leases', 'ev_export_attempts',
-                'ev_export_manifest_entries', 'ev_export_oversized_items', 'ev_export_events');
+                'ev_export_requests', 'ev_export_connector_throttle_slots', 'ev_export_archive_throttle_slots',
+                'ev_export_attempts', 'ev_export_manifest_entries', 'ev_export_oversized_items', 'ev_export_events');
             """,
             connection))
         {
-            Assert.Equal(6, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+            Assert.Equal(7, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
         }
 
-        // Backstop atômico de throttling (item 4): os DOIS índices únicos FILTRADOS sobre a mesma tabela.
-        await using (var throttleIndexes = new SqlCommand(
+        // Backstop de throttling recuperável (item 4; AB-4C-007 blocker 1): cada slot é uma PK própria
+        // (connector_id / tenant+projeto+archive) — a exclusividade em si vem da PK, não de um índice
+        // filtrado (o slot é reutilizado/reclamado, nunca reinserido).
+        await using (var slotPrimaryKeys = new SqlCommand(
             """
-            SELECT COUNT(*) FROM sys.indexes
-            WHERE object_id = OBJECT_ID('dbo.ev_export_throttle_leases')
-              AND name IN ('UX_ev_export_throttle_leases_connector', 'UX_ev_export_throttle_leases_archive')
-              AND is_unique = 1 AND has_filter = 1;
+            SELECT COUNT(*) FROM sys.key_constraints
+            WHERE name IN ('PK_ev_export_connector_throttle_slots', 'PK_ev_export_archive_throttle_slots');
             """,
             connection))
         {
-            Assert.Equal(2, Convert.ToInt32(await throttleIndexes.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+            Assert.Equal(2, Convert.ToInt32(await slotPrimaryKeys.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // A consistência dos DOIS slots (todos os campos de lease nulos juntos, ou todos preenchidos) é
+        // reforçada no BANCO como defesa em profundidade.
+        await using (var slotChecks = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.check_constraints
+            WHERE name IN ('CK_ev_export_connector_throttle_slots_consistency', 'CK_ev_export_archive_throttle_slots_consistency');
+            """,
+            connection))
+        {
+            Assert.Equal(2, Convert.ToInt32(await slotChecks.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
         }
 
         // Manifesto/engine só existem quando a tentativa foi Completed — reforçado no BANCO (defesa em
@@ -285,8 +298,8 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
         }
 
         // Append-only: a aplicação recebe apenas SELECT/INSERT nas tabelas de evidência histórica (attempts,
-        // manifesto, oversized, eventos, requests); throttle_leases é a ÚNICA exceção (permite UPDATE
-        // restrito a released_at_utc, a liberação do lease).
+        // manifesto, oversized, eventos, requests); os DOIS slots de throttle são a exceção (permitem UPDATE
+        // restrito aos campos mutáveis do lease — nunca DELETE).
         await using var grants = new SqlCommand(
             """
             SELECT COUNT(*) FROM sys.database_permissions AS p
@@ -299,6 +312,18 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
             """,
             connection);
         Assert.Equal(0, Convert.ToInt32(await grants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+
+        await using var throttleSlotGrants = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.database_permissions AS p
+            JOIN sys.objects AS o ON o.object_id = p.major_id
+            JOIN sys.database_principals AS r ON r.principal_id = p.grantee_principal_id
+            WHERE r.name = 'ab_app_role'
+              AND o.name IN ('ev_export_connector_throttle_slots', 'ev_export_archive_throttle_slots')
+              AND p.permission_name NOT IN ('SELECT', 'INSERT', 'UPDATE');
+            """,
+            connection);
+        Assert.Equal(0, Convert.ToInt32(await throttleSlotGrants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
     }
 
     [Fact]

@@ -30,15 +30,25 @@ public sealed class PlanningHeartbeat(IJobLeaseManager leases)
     /// própria operação lança (erro de domínio, concorrência, <see cref="FencedOutException"/> na
     /// gravação cercada), a exceção PROPAGA — o batimento apenas para e é aguardado.
     /// </summary>
+    /// <param name="onBeatAsync">
+    /// Renovação ADICIONAL opcional, invocada a cada batimento IMEDIATAMENTE após a renovação do lease do
+    /// Job ter sucesso (nunca antes — se o Job já perdeu o cercamento, a adicional nem é tentada). Deve
+    /// devolver <see langword="false"/> quando o recurso adicional (ex.: um lease de throttling externo)
+    /// não pôde ser renovado — tratado exatamente como perda de cercamento do Job (cancela a operação,
+    /// <see cref="HeartbeatResult.Lost"/>). Uma exceção transitória também é fail-closed, igual à renovação
+    /// do Job. Permite compor DOIS leases (Job + recurso externo) sob o MESMO laço de batimento, sem
+    /// duplicar o ciclo de <c>Task.Delay</c>/cancelamento.
+    /// </param>
     public async Task<HeartbeatResult> RunWhileAsync(
-        LeaseCommand lease, TimeSpan interval, Func<CancellationToken, Task> operation, CancellationToken cancellationToken)
+        LeaseCommand lease, TimeSpan interval, Func<CancellationToken, Task> operation, CancellationToken cancellationToken,
+        Func<CancellationToken, Task<bool>>? onBeatAsync = null)
     {
         ArgumentNullException.ThrowIfNull(lease);
         ArgumentNullException.ThrowIfNull(operation);
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var state = new HeartbeatState();
-        var beat = BeatLoopAsync(lease, interval, cts, state);
+        var beat = BeatLoopAsync(lease, interval, cts, state, onBeatAsync);
         try
         {
             await operation(cts.Token).ConfigureAwait(false);
@@ -58,7 +68,8 @@ public sealed class PlanningHeartbeat(IJobLeaseManager leases)
     }
 
     private async Task BeatLoopAsync(
-        LeaseCommand lease, TimeSpan interval, CancellationTokenSource cts, HeartbeatState state)
+        LeaseCommand lease, TimeSpan interval, CancellationTokenSource cts, HeartbeatState state,
+        Func<CancellationToken, Task<bool>>? onBeatAsync)
     {
         var beatToken = cts.Token;
         while (!beatToken.IsCancellationRequested)
@@ -91,16 +102,43 @@ public sealed class PlanningHeartbeat(IJobLeaseManager leases)
             }
 
             state.LastOutcome = outcome;
-            if (outcome is JobCommandOutcome.Applied or JobCommandOutcome.IdempotentReplay)
+            if (outcome is not (JobCommandOutcome.Applied or JobCommandOutcome.IdempotentReplay))
             {
-                state.Renewals++;
-                continue;
+                // FencedOut/NotFound: cercamento perdido — cancela a operação; nenhum efeito novo é iniciado.
+                state.Lost = true;
+                await cts.CancelAsync().ConfigureAwait(false);
+                return;
             }
 
-            // FencedOut/NotFound: cercamento perdido — cancela a operação; nenhum efeito novo é iniciado.
-            state.Lost = true;
-            await cts.CancelAsync().ConfigureAwait(false);
-            return;
+            if (onBeatAsync is not null)
+            {
+                bool additionalRenewed;
+                try
+                {
+                    additionalRenewed = await onBeatAsync(beatToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return; // cancelado durante a renovação adicional: a operação terminou
+                }
+                catch
+                {
+                    // Mesma postura fail-closed da renovação do Job: uma falha transitória na renovação
+                    // adicional não prova que o recurso externo continua sob nosso controle.
+                    state.Lost = true;
+                    await cts.CancelAsync().ConfigureAwait(false);
+                    return;
+                }
+
+                if (!additionalRenewed)
+                {
+                    state.Lost = true;
+                    await cts.CancelAsync().ConfigureAwait(false);
+                    return;
+                }
+            }
+
+            state.Renewals++;
         }
     }
 

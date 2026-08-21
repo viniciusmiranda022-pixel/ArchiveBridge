@@ -154,8 +154,10 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var throttle = Throttle(clock);
         var connector = ConnectorId.New();
 
-        var first = await throttle.TryAcquireAsync(scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), CancellationToken.None);
-        var second = await throttle.TryAcquireAsync(scope, connector, "arch-2", ExportAttemptId.New(), CorrelationId.New(), CancellationToken.None);
+        var first = await throttle.TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), Slice2Support.Lease, CancellationToken.None);
+        var second = await throttle.TryAcquireAsync(
+            scope, connector, "arch-2", ExportAttemptId.New(), CorrelationId.New(), Slice2Support.Lease, CancellationToken.None);
 
         Assert.NotNull(first);
         Assert.Null(second); // MESMO connector, archive diferente — ainda assim throttled.
@@ -169,9 +171,9 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var throttle = Throttle(clock);
 
         var first = await throttle.TryAcquireAsync(
-            scope, ConnectorId.New(), "shared-archive", ExportAttemptId.New(), CorrelationId.New(), CancellationToken.None);
+            scope, ConnectorId.New(), "shared-archive", ExportAttemptId.New(), CorrelationId.New(), Slice2Support.Lease, CancellationToken.None);
         var second = await throttle.TryAcquireAsync(
-            scope, ConnectorId.New(), "shared-archive", ExportAttemptId.New(), CorrelationId.New(), CancellationToken.None);
+            scope, ConnectorId.New(), "shared-archive", ExportAttemptId.New(), CorrelationId.New(), Slice2Support.Lease, CancellationToken.None);
 
         Assert.NotNull(first);
         Assert.Null(second);
@@ -185,11 +187,13 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var throttle = Throttle(clock);
         var connector = ConnectorId.New();
 
-        var first = await throttle.TryAcquireAsync(scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), CancellationToken.None);
+        var first = await throttle.TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), Slice2Support.Lease, CancellationToken.None);
         Assert.NotNull(first);
         await throttle.ReleaseAsync(scope, first!, CancellationToken.None);
 
-        var second = await throttle.TryAcquireAsync(scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), CancellationToken.None);
+        var second = await throttle.TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), Slice2Support.Lease, CancellationToken.None);
         Assert.NotNull(second);
     }
 
@@ -200,10 +204,151 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var clock = new MutableClock(Now);
         var throttle = Throttle(clock);
         var lease = await throttle.TryAcquireAsync(
-            scope, ConnectorId.New(), "arch-1", ExportAttemptId.New(), CorrelationId.New(), CancellationToken.None);
+            scope, ConnectorId.New(), "arch-1", ExportAttemptId.New(), CorrelationId.New(), Slice2Support.Lease, CancellationToken.None);
 
         await throttle.ReleaseAsync(scope, lease!, CancellationToken.None);
         await throttle.ReleaseAsync(scope, lease!, CancellationToken.None); // não lança
+    }
+
+    // ---- Recuperação de lease órfão/expirado (AB-4C-007 blocker 1) -----------------------------------
+
+    [Fact]
+    public async Task AnExpiredLeaseIsReclaimedByANewAcquisitionEvenWithoutAnExplicitRelease()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var clock = new MutableClock(Now);
+        var throttle = Throttle(clock);
+        var connector = ConnectorId.New();
+        var lease = TimeSpan.FromMinutes(1);
+
+        var first = await throttle.TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.NotNull(first);
+
+        // Simula um worker que morreu ANTES de liberar (nenhum ReleaseAsync foi chamado) — o slot NUNCA
+        // pode ficar órfão permanentemente.
+        clock.Advance(lease + TimeSpan.FromSeconds(1));
+
+        var second = await throttle.TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.NotNull(second);
+        Assert.NotEqual(first!.LeaseId, second!.LeaseId);
+    }
+
+    [Fact]
+    public async Task ALeaseStillWithinItsDeadlineIsNeverStolen()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var clock = new MutableClock(Now);
+        var throttle = Throttle(clock);
+        var connector = ConnectorId.New();
+        var lease = TimeSpan.FromMinutes(5);
+
+        var first = await throttle.TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.NotNull(first);
+
+        clock.Advance(lease - TimeSpan.FromSeconds(1)); // ainda dentro do deadline
+        var second = await throttle.TryAcquireAsync(
+            scope, connector, "arch-2", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.Null(second);
+    }
+
+    [Fact]
+    public async Task TwoConcurrentAcquisitionsAfterExpiryProduceExactlyOneWinner()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var clock = new MutableClock(Now);
+        var connector = ConnectorId.New();
+        var lease = TimeSpan.FromMinutes(1);
+
+        var first = await Throttle(clock).TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.NotNull(first);
+        clock.Advance(lease + TimeSpan.FromSeconds(1));
+
+        var results = await Task.WhenAll(
+            Throttle(clock).TryAcquireAsync(scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None),
+            Throttle(clock).TryAcquireAsync(scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None));
+
+        Assert.Single(results, r => r is not null); // corrida de dois reclaimers ⇒ exatamente UM vencedor.
+    }
+
+    [Fact]
+    public async Task RenewingBeforeExpiryExtendsTheDeadlineAndPreventsReclaim()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var clock = new MutableClock(Now);
+        var throttle = Throttle(clock);
+        var connector = ConnectorId.New();
+        var lease = TimeSpan.FromMinutes(1);
+
+        var acquired = await throttle.TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.NotNull(acquired);
+
+        clock.Advance(TimeSpan.FromSeconds(50)); // ainda dentro do deadline original (60s)
+        var renewed = await throttle.TryRenewAsync(scope, acquired!, lease, CancellationToken.None);
+        Assert.True(renewed);
+
+        clock.Advance(TimeSpan.FromSeconds(20)); // passou do deadline ORIGINAL (70s), mas não do renovado (110s)
+        var stolen = await throttle.TryAcquireAsync(
+            scope, connector, "arch-2", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.Null(stolen);
+    }
+
+    [Fact]
+    public async Task RenewingAnAlreadyExpiredLeaseFails()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var clock = new MutableClock(Now);
+        var throttle = Throttle(clock);
+        var connector = ConnectorId.New();
+        var lease = TimeSpan.FromMinutes(1);
+
+        var acquired = await throttle.TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.NotNull(acquired);
+
+        clock.Advance(lease + TimeSpan.FromSeconds(1));
+        var renewed = await throttle.TryRenewAsync(scope, acquired!, lease, CancellationToken.None);
+        Assert.False(renewed); // nunca ressuscita um lease já vencido.
+    }
+
+    [Fact]
+    public async Task AnOldOwnerCannotReleaseOrRenewALeaseAlreadyReassumedByANewOwner()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var clock = new MutableClock(Now);
+        var throttle = Throttle(clock);
+        var connector = ConnectorId.New();
+        var lease = TimeSpan.FromMinutes(1);
+
+        var first = await throttle.TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.NotNull(first);
+
+        clock.Advance(lease + TimeSpan.FromSeconds(1));
+        var second = await throttle.TryAcquireAsync(
+            scope, connector, "arch-1", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.NotNull(second);
+        Assert.NotEqual(first!.LeaseId, second!.LeaseId);
+
+        // O titular ANTIGO não consegue renovar o slot já reassumido (não é "seu" mais).
+        var renewedByOldOwner = await throttle.TryRenewAsync(scope, first, lease, CancellationToken.None);
+        Assert.False(renewedByOldOwner);
+
+        // Nem liberá-lo — a liberação do titular antigo é um NO-OP (idempotente), nunca afeta o novo titular.
+        await throttle.ReleaseAsync(scope, first, CancellationToken.None);
+        var stillHeldByNewOwner = await throttle.TryAcquireAsync(
+            scope, connector, "arch-2", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.Null(stillHeldByNewOwner); // o slot do connector ainda pertence ao SEGUNDO titular.
+
+        // O titular ATUAL, por sua vez, consegue liberar normalmente.
+        await throttle.ReleaseAsync(scope, second, CancellationToken.None);
+        var freedByCurrentOwner = await throttle.TryAcquireAsync(
+            scope, connector, "arch-3", ExportAttemptId.New(), CorrelationId.New(), lease, CancellationToken.None);
+        Assert.NotNull(freedByCurrentOwner);
     }
 
     // ---- História de tentativas append-only (items 11/12/14) ----------------------------------------
@@ -366,6 +511,99 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
 
         await Assert.ThrowsAsync<EvExportIntegrityViolationException>(
             () => resultUseCase.ExecuteAsync(scope, requested.RequestId, CorrelationId.New(), CancellationToken.None));
+    }
+
+    // ---- Throttled attempt persistido + RetryScheduled auditado (AB-4C-007 blockers 2/3) -------------
+
+    [Fact]
+    public async Task AThrottledAttemptIsPersistedWithRetryScheduledAuditedAndTheRetryPreservesLineage()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var clock = new MutableClock(Now);
+        var identity = await RegisterExportCapableConnectorAsync(scope, clock);
+
+        var requestUseCase = new RequestEvExportUseCase(Connectors, Capabilities, Inbox(clock), Audit, EvExportPolicy.Default, clock);
+        var requested = await requestUseCase.ExecuteAsync(
+            new RequestEvExport(scope, identity.Id, "arch-1", null, null, "operator", CorrelationId.New()), CancellationToken.None);
+
+        // Um outro titular já detém o throttle do MESMO connector (archive diferente) — a primeira
+        // tentativa do processor será bloqueada por concorrência antes de invocar o executor.
+        var blocker = await Throttle(clock).TryAcquireAsync(
+            scope, identity.Id, "other-archive", ExportAttemptId.New(), CorrelationId.New(), Slice2Support.Lease, CancellationToken.None);
+        Assert.NotNull(blocker);
+
+        var executor = new FakeExecutor(new EvExportProcessResult(0, false, false, "15.0", "1.0.0", [], null));
+        var inspector = new FakeInspector([new EvExportOutputCandidate("out1.pst", 1024, DeterministicHash.Compute(["out1"]))]);
+        var processor = new EvExportCommandProcessor(
+            Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
+            Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
+            EvExportPolicy.Default, Path.GetTempPath(), clock);
+
+        var firstExecution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
+        Assert.NotNull(firstExecution);
+        Assert.Equal(EvExportCommandOutcome.Retried, firstExecution!.Outcome);
+        Assert.False(executor.WasCalled); // bloqueado ANTES de qualquer efeito externo.
+
+        // (blocker 3) A tentativa throttled NUNCA some do evidence chain — aparece no attempt history.
+        var afterFirst = await Attempts(clock).ListAttemptsAsync(scope, requested.RequestId, CancellationToken.None);
+        Assert.Single(afterFirst);
+        Assert.Equal(EvExportAttemptOutcome.Throttled, afterFirst[0].Outcome);
+        Assert.Equal(1, afterFirst[0].AttemptNumber);
+
+        // (blocker 2) RetryScheduled é auditado quando o retry foi de fato agendado (Applied) — sem duplicar.
+        var auditReader = new SqlEvExportAuditReader(fixture.Factory);
+        var eventsAfterFirst = await auditReader.GetEventsAsync(scope, requested.RequestId, CancellationToken.None);
+        Assert.Contains(eventsAfterFirst, e => e.EventCode == EvExportAuditEventCode.Throttled);
+        Assert.Single(eventsAfterFirst, e => e.EventCode == EvExportAuditEventCode.RetryScheduled);
+
+        // Libera o bloqueio e avança além do backoff de throttle (15s) — o retry deve convergir com outro
+        // AttemptNumber, preservando toda a lineage anterior.
+        await Throttle(clock).ReleaseAsync(scope, blocker!, CancellationToken.None);
+        clock.Advance(TimeSpan.FromSeconds(16));
+
+        var secondExecution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
+        Assert.NotNull(secondExecution);
+        Assert.Equal(EvExportCommandOutcome.Completed, secondExecution!.Outcome);
+        Assert.True(executor.WasCalled);
+
+        var finalHistory = await Attempts(clock).ListAttemptsAsync(scope, requested.RequestId, CancellationToken.None);
+        Assert.Equal(2, finalHistory.Count);
+        Assert.Equal(EvExportAttemptOutcome.Throttled, finalHistory[0].Outcome);
+        Assert.Equal(1, finalHistory[0].AttemptNumber);
+        Assert.Equal(EvExportAttemptOutcome.Completed, finalHistory[1].Outcome);
+        Assert.Equal(2, finalHistory[1].AttemptNumber); // outro AttemptNumber — nunca sobrescreve a evidência anterior.
+    }
+
+    [Fact]
+    public async Task RetryScheduledIsAlsoAuditedForATransientProcessFailure()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var clock = new MutableClock(Now);
+        var identity = await RegisterExportCapableConnectorAsync(scope, clock);
+
+        var requestUseCase = new RequestEvExportUseCase(Connectors, Capabilities, Inbox(clock), Audit, EvExportPolicy.Default, clock);
+        var requested = await requestUseCase.ExecuteAsync(
+            new RequestEvExport(scope, identity.Id, "arch-1", null, null, "operator", CorrelationId.New()), CancellationToken.None);
+
+        // Exit code não-zero: falha TRANSITÓRIA do processo do exporter (candidata a retry), não bloqueio.
+        var executor = new FakeExecutor(new EvExportProcessResult(1, false, false, "15.0", "1.0.0", [], "PROCESS_EXIT_NON_ZERO"));
+        var inspector = new FakeInspector([]);
+        var processor = new EvExportCommandProcessor(
+            Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
+            Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
+            EvExportPolicy.Default, Path.GetTempPath(), clock);
+
+        var execution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
+
+        Assert.NotNull(execution);
+        Assert.Equal(EvExportCommandOutcome.Retried, execution!.Outcome);
+        Assert.True(executor.WasCalled);
+
+        var latest = await Attempts(clock).GetLatestAsync(scope, requested.RequestId, CancellationToken.None);
+        Assert.Equal(EvExportAttemptOutcome.Failed, latest!.Outcome);
+
+        var events = await new SqlEvExportAuditReader(fixture.Factory).GetEventsAsync(scope, requested.RequestId, CancellationToken.None);
+        Assert.Single(events, e => e.EventCode == EvExportAuditEventCode.RetryScheduled);
     }
 
     private sealed class FakeExecutor(EvExportProcessResult result) : IEvArchiveExportExecutor
