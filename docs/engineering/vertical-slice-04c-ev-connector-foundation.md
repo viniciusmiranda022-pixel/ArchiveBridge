@@ -78,6 +78,23 @@ comparando-o com o `snapshot_hash` gravado. Uma linha adulterada ou corrompida �
 idempotente do caso de uso (que releé exatamente esse latest) falha fechado pelo mesmo motivo, em vez de
 classificar incorretamente a corrupção como réplay idêntico ou perder a evidência em silêncio.
 
+**Codec de persistência de `CapabilityDiagnostics` (AB-4C-004)**: `InventoryArchiveRecord` canoniza
+(ordena por `StringComparer.Ordinal` e deduplica) a lista de diagnósticos no construtor — o MESMO
+construtor usado tanto por `Create` (coleta fresca do adapter) quanto por `Rehydrate` (via
+`SqlConnectorInventoryStore.ReadArchivesAsync`), então o mesmo conjunto lógico reportado em ordem diferente
+converge para a MESMA representação e o MESMO `SnapshotHash`. A representação persistida usa
+`InventoryArchiveRecord.DiagnosticsPersistenceDelimiter` (U+001F, caractere de CONTROLE) em vez do antigo
+`';'` imprimível: como `TextValue.Require` recusa caracteres de controle em qualquer código de diagnóstico,
+o delimitador nunca pode aparecer dentro de um código válido — a codificação é lossless e sem ambiguidade
+(um diagnóstico `"EV;CODE"` volta exatamente como um único código, não mais como dois). O construtor também
+valida que a representação canônica cabe em `DiagnosticsPersistedMaxLength` (1000 chars, o tamanho da
+coluna `nvarchar`) ANTES de aceitar o agregado — os limites individuais de contagem (20) e tamanho por
+código (50) não bastavam sozinhos, pois 20 códigos de 50 chars unidos geram 1019 chars. Na leitura,
+`DecodeCapabilityDiagnostics` NÃO remove entradas vazias: um payload persistido malformado (ex.: delimitador
+duplicado) produz uma entrada vazia que o construtor recusa, e `ReadArchivesAsync` converte essa falha em
+`InventorySnapshotIntegrityViolationException` — o mesmo vocabulário fail-closed do AB-4C-003, agora também
+sobre o campo de diagnósticos.
+
 ## Política de exportação — validada, nunca executada (AB-4C-001 itens 9-11)
 
 `ExportRequestPolicy` valida os limites documentados do cmdlet `Export-EVArchive` (§16.3): `MaxPstSizeMb`
@@ -180,6 +197,24 @@ em `ev_connector_enrollment_tokens` (ver [Idempotência, concorrência e órfão
   `GetLatestFailsClosedWhenTheStoredSnapshotHashIsForgedButChildrenStayIntact`. Um snapshot íntegro continua
   round-trip normalmente (`GetLatestOfAnUntamperedSnapshotStillRoundTripsAfterTheIntegrityChecksWereAdded`),
   e a concorrência do AB-4C-002 permanece verde sem alteração.
+- **Codec de `CapabilityDiagnostics` não ambíguo (AB-4C-004)**: o codec antigo unia/separava diagnósticos
+  por `';'` — um delimitador IMPRIMÍVEL que também podia aparecer dentro de um código válido. Um único
+  diagnóstico `"EV;CODE"` voltava da persistência como dois códigos `["EV", "CODE"]`, recompunha um hash
+  diferente do gravado e a reidratação (AB-4C-003) acusava corrupção sobre um snapshot que a própria
+  aplicação havia gravado corretamente. `InventoryArchiveRecord` passou a usar
+  `DiagnosticsPersistenceDelimiter` (U+001F, caractere de controle recusado por `TextValue.Require` em
+  qualquer código) — lossless por construção — e a canonicalizar (ordenar + deduplicar) a lista no
+  construtor, compartilhado por `Create`/`Rehydrate`, para que o mesmo conjunto lógico em ordem diferente
+  convirja para o mesmo `SnapshotHash` em vez de ser tratado como mudança real
+  (`SnapshotHashConvergesRegardlessOfCapabilityDiagnosticsOrderWithinAnArchive`,
+  `SubmissionsWithTheSameDiagnosticsInDifferentOrderConvergeToTheSameSnapshotAsAnIdenticalReplay`). O
+  construtor também recusa qualquer combinação de diagnósticos cuja representação canônica exceda a coluna
+  persistida de 1000 chars (`CapabilityDiagnosticsExceedingThePersistedRepresentationLimitIsRejected`) — os
+  limites individuais de contagem/tamanho por código, sozinhos, permitiam construir um agregado válido mas
+  não persistível sem truncar. Um payload persistido malformado (delimitador duplicado) falha fechado na
+  leitura com `InventorySnapshotIntegrityViolationException`
+  (`GetLatestFailsClosedWhenThePersistedCapabilityDiagnosticsFieldIsMalformed`), nunca é tratado como uma
+  lista canônica ambígua.
 
 ## Segurança e minimização de PII (delta sobre o Passo 3 do Slice 4B)
 
@@ -215,14 +250,14 @@ connector (mTLS/workload identity, §15.1 item 25) ficam para um Passo futuro �
 | 3 | Enrollment/registro inválido, replay, tenant mismatch ou identity mismatch falha fechado | `RegisterConnectorMalformedSecretIsIndistinguishableFromUnknownToken`, `RegisterConnectorUnknownSecretThrowsNotFound` |
 | 4 | Capability discovery incompatível impede export capability com diagnóstico estruturado | `HandshakeWithUnknownVersionBlocksExportWithSchemaUnknownDiagnostic`, `HandshakeWithCompatibleFamilyButNoSnapinBlocksExport` |
 | 5 | Inventory adapter atrás de interface; Domain/Application sem tipos PowerShell/EV/vendor | `IEvInventoryAdapter` (Contracts, sem dependência de vendor); `VendorBoundaryTests`/`DependencyRuleTests` inalterados |
-| 6 | Snapshot determinístico, hashado, scoped e versionado; replay não duplica; leitura falha fechado sobre evidência persistida adulterada/corrompida (AB-4C-003) | `HashIsDeterministicRegardlessOfInputOrder`, `SubmitInventorySnapshotIdenticalResubmissionIsAnIdempotentReplayWithoutANewRow`, `RehydrateFailsClosedWhenStoredHashDoesNotMatchTheLoadedChildren`, `RehydrateFailsClosedWhenArchiveCountDoesNotMatchTheLoadedChildren`, `GetLatestFailsClosedWhenTheStoredSnapshotHashIsForgedButChildrenStayIntact`, `GetLatestFailsClosedWhenAChildArchiveIsRemovedButTheStoredHashAndCountStayStale` |
+| 6 | Snapshot determinístico, hashado, scoped e versionado; replay não duplica; leitura falha fechado sobre evidência persistida adulterada/corrompida (AB-4C-003); codec de `CapabilityDiagnostics` lossless, canônico e persistível no schema efetivo (AB-4C-004) | `HashIsDeterministicRegardlessOfInputOrder`, `SubmitInventorySnapshotIdenticalResubmissionIsAnIdempotentReplayWithoutANewRow`, `RehydrateFailsClosedWhenStoredHashDoesNotMatchTheLoadedChildren`, `RehydrateFailsClosedWhenArchiveCountDoesNotMatchTheLoadedChildren`, `GetLatestFailsClosedWhenTheStoredSnapshotHashIsForgedButChildrenStayIntact`, `GetLatestFailsClosedWhenAChildArchiveIsRemovedButTheStoredHashAndCountStayStale`, `CapabilityDiagnosticsContainingTheOldDelimiterRoundTripsLosslessThroughEncodeAndDecode`, `SnapshotHashConvergesRegardlessOfCapabilityDiagnosticsOrderWithinAnArchive`, `CapabilityDiagnosticsExceedingThePersistedRepresentationLimitIsRejected`, `GetLatestFailsClosedWhenThePersistedCapabilityDiagnosticsFieldIsMalformed` |
 | 7 | Mudança real gera nova versão sem reescrever evidência anterior | `SubmitInventorySnapshotChangedArchivesCreatesANewVersionWithoutRewritingThePrevious`, `GetLatestReturnsTheHighestVersionAcrossMultipleSnapshots` |
 | 8 | Nenhum path/credential/token/PII/conteúdo de item em logs/evidência | `InventoryArchiveRecord` (campos fechados, sanitizados); ver [Segurança e minimização de PII](#segurança-e-minimização-de-pii-delta-sobre-o-passo-3-do-slice-4b) |
 | 9 | Desenho outbound-only; nenhum SMB/inbound Control Plane → EV introduzido | Nenhum novo endpoint/porta inbound; `IEvInventoryAdapter` roda perto do dado (contrato) |
 | 10 | ExportRequest/Policy valida limites; nenhum export real ocorre | `CreateRejectsLimitsOutsideTheDocumentedEnvelope`, `CreateAcceptsTheDocumentedBoundaryValues`, `DefaultPolicyMatchesTheRunbookDefaults` |
 | 11 | Cross-tenant/cross-project/forged connector negados sem revelar existência | `GetFromAnotherProjectIsIndistinguishableFromNotFound`, `RevokingATokenFromTheWrongProjectIsIndistinguishableFromNotFound`, `InventoryIsIsolatedAcrossProjectsOfTheSameTenant` |
 | 12 | Migrations anteriores byte-for-byte; novas migrations passam hash/determinismo e least-privilege | `MigrationHashTests.Migration0023AppliesCleanlyAndPriorHashesRemainStable` |
-| 13 | CI completo verde no HEAD final | `dotnet test` (1148/1148), `dotnet format --verify-no-changes`, SCA, `git diff --check` |
+| 13 | CI completo verde no HEAD final | `dotnet test` (1158/1158), `dotnet format --verify-no-changes`, SCA, `git diff --check` |
 
 ## Fora do escopo — STOP-THE-LINE
 

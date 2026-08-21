@@ -132,7 +132,9 @@ public sealed class SqlConnectorInventoryStore(TenantConnectionFactory connectio
                 insertArchive.Parameters.Add(new SqlParameter("@status", SqlDbType.TinyInt) { Value = (byte)archive.Status });
                 insertArchive.Parameters.Add(new SqlParameter("@diagnostics", SqlDbType.NVarChar, 1000)
                 {
-                    Value = string.Join(';', archive.CapabilityDiagnostics),
+                    // Codec lossless e sem ambiguidade (AB-4C-004): CapabilityDiagnostics já chega aqui
+                    // canonicamente ordenado/deduplicado pelo construtor de InventoryArchiveRecord.
+                    Value = InventoryArchiveRecord.EncodeCapabilityDiagnostics(archive.CapabilityDiagnostics),
                 });
                 await insertArchive.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -224,17 +226,31 @@ public sealed class SqlConnectorInventoryStore(TenantConnectionFactory connectio
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            var diagnosticsRaw = reader.GetString(4);
-            var diagnostics = diagnosticsRaw.Length == 0
-                ? []
-                : diagnosticsRaw.Split(';', StringSplitOptions.RemoveEmptyEntries);
+            var externalId = reader.GetString(0);
+            // Codec lossless e sem ambiguidade (AB-4C-004): DecodeCapabilityDiagnostics NÃO remove entradas
+            // vazias — um payload persistido malformado (ex.: delimitador duplicado) produz uma entrada
+            // vazia que o construtor abaixo recusa via TextValue.Require, em vez de ser silenciosamente
+            // tratada como um código de diagnóstico válido.
+            var diagnostics = InventoryArchiveRecord.DecodeCapabilityDiagnostics(reader.GetString(4));
 
-            archives.Add(new InventoryArchiveRecord(
-                reader.GetString(0),
-                reader.GetString(1),
-                reader.IsDBNull(2) ? null : reader.GetString(2),
-                (InventoryArchiveStatus)reader.GetByte(3),
-                diagnostics));
+            try
+            {
+                archives.Add(new InventoryArchiveRecord(
+                    externalId,
+                    reader.GetString(1),
+                    reader.IsDBNull(2) ? null : reader.GetString(2),
+                    (InventoryArchiveStatus)reader.GetByte(3),
+                    diagnostics));
+            }
+            catch (ArgumentException ex)
+            {
+                // A leitura é fronteira NÃO CONFIÁVEL (mesmo princípio de InventorySnapshot.Rehydrate,
+                // AB-4C-003): um archive filho persistido que não reconstrói como um InventoryArchiveRecord
+                // válido (ex.: capability_diagnostics corrompido) nunca é devolvido como evidência canônica.
+                throw new InventorySnapshotIntegrityViolationException(
+                    $"Archive {externalId} do snapshot {snapshotId.Value} não pôde ser reidratado a partir da " +
+                    "linha persistida — payload malformado ou corrompido.", ex);
+            }
         }
 
         return archives;

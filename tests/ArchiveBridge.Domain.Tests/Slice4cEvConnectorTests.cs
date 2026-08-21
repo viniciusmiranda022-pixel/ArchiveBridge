@@ -375,6 +375,93 @@ public sealed class Slice4cEvConnectorTests
             InventorySnapshot.ComputeHash(archives), archives.Length, archives, CorrelationId.New(), DateTimeOffset.UtcNow));
     }
 
+    // ---- InventoryArchiveRecord.CapabilityDiagnostics — codec/canonicalização (AB-4C-004) ---------
+
+    [Fact]
+    public void CapabilityDiagnosticsContainingTheOldDelimiterRoundTripsLosslessThroughEncodeAndDecode()
+    {
+        // ';' quebrava o codec antigo (string.Join(';', ...) / Split(';', ...)): um único diagnóstico
+        // "EV;CODE" voltava como dois códigos ["EV", "CODE"] após a persistência.
+        var archive = new InventoryArchiveRecord("arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, ["EV;CODE"]);
+
+        var persisted = InventoryArchiveRecord.EncodeCapabilityDiagnostics(archive.CapabilityDiagnostics);
+        var decoded = InventoryArchiveRecord.DecodeCapabilityDiagnostics(persisted);
+
+        Assert.Equal(["EV;CODE"], decoded);
+        Assert.DoesNotContain(InventoryArchiveRecord.DiagnosticsPersistenceDelimiter, "EV;CODE");
+    }
+
+    [Fact]
+    public void CapabilityDiagnosticsCanonicalizesOrderAndDeduplicatesRegardlessOfInputOrder()
+    {
+        var a = new InventoryArchiveRecord(
+            "arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, ["B", "A", "A"]);
+        var b = new InventoryArchiveRecord(
+            "arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, ["A", "B"]);
+
+        Assert.Equal(["A", "B"], a.CapabilityDiagnostics);
+        Assert.Equal(a.CapabilityDiagnostics, b.CapabilityDiagnostics);
+    }
+
+    [Fact]
+    public void SnapshotHashConvergesRegardlessOfCapabilityDiagnosticsOrderWithinAnArchive()
+    {
+        var connector = ConnectorId.New();
+        var correlation = CorrelationId.New();
+        var now = DateTimeOffset.UtcNow;
+
+        var a = InventorySnapshot.Create(
+            InventorySnapshotId.New(), connector, Tenant, Project, 1,
+            [new InventoryArchiveRecord("arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, ["ALPHA", "BETA"])],
+            correlation, now);
+        var b = InventorySnapshot.Create(
+            InventorySnapshotId.New(), connector, Tenant, Project, 1,
+            [new InventoryArchiveRecord("arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, ["BETA", "ALPHA"])],
+            correlation, now);
+
+        Assert.Equal(a.SnapshotHash, b.SnapshotHash);
+    }
+
+    [Fact]
+    public void CapabilityDiagnosticsAtTheDomainAcceptedBoundaryStillFitsThePersistedColumnLimit()
+    {
+        // 20 códigos únicos de 49 chars: 20*49 + 19 separadores = 999 <= 1000 — o maior payload aceito pelo
+        // Domain hoje ainda cabe integralmente na coluna persistida.
+        var diagnostics = Enumerable.Range(0, 20).Select(i => new string((char)('A' + i), 49)).ToArray();
+
+        var archive = new InventoryArchiveRecord("arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, diagnostics);
+
+        var persisted = InventoryArchiveRecord.EncodeCapabilityDiagnostics(archive.CapabilityDiagnostics);
+        Assert.True(persisted.Length <= InventoryArchiveRecord.DiagnosticsPersistedMaxLength);
+        Assert.Equal(999, persisted.Length);
+    }
+
+    [Fact]
+    public void CapabilityDiagnosticsExceedingThePersistedRepresentationLimitIsRejected()
+    {
+        // 20 códigos únicos de 50 chars (o máximo individual permitido): 20*50 + 19 = 1019 > 1000 — os
+        // limites individuais de contagem/tamanho, sozinhos, não bastam; a representação unida também
+        // precisa caber na coluna persistida (AB-4C-004 critério 2).
+        var diagnostics = Enumerable.Range(0, 20).Select(i => new string((char)('A' + i), 50)).ToArray();
+
+        Assert.Throws<ArgumentException>(() => new InventoryArchiveRecord(
+            "arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, diagnostics));
+    }
+
+    [Fact]
+    public void ReconstructingFromAMalformedPersistedPayloadFailsClosedInsteadOfProducingAnAmbiguousCode()
+    {
+        // Delimitador duplicado (corrupção simulada) produz uma entrada vazia após o decode — o construtor
+        // recusa (TextValue.Require) em vez de aceitar como um código de diagnóstico válido (crit. 4).
+        var corrupted = "EV" + InventoryArchiveRecord.DiagnosticsPersistenceDelimiter +
+            InventoryArchiveRecord.DiagnosticsPersistenceDelimiter + "CODE";
+
+        var decoded = InventoryArchiveRecord.DecodeCapabilityDiagnostics(corrupted);
+
+        Assert.Throws<ArgumentException>(() => new InventoryArchiveRecord(
+            "arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, decoded));
+    }
+
     // ---- ExportRequestPolicy / ExportRequest (STOP-THE-LINE — nunca executado, AB-4C-001 crit. 10) -
 
     [Theory]

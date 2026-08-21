@@ -38,6 +38,26 @@ public sealed record InventoryArchiveRecord
     private const int DiagnosticCodeMaxLength = 50;
     private const int MaxDiagnostics = 20;
 
+    /// <summary>
+    /// Delimitador usado para persistir <see cref="CapabilityDiagnostics"/> como um único campo
+    /// (<c>nvarchar</c>). É um caractere de CONTROLE (U+001F, "unit separator") — <see cref="TextValue.Require"/>
+    /// recusa caracteres de controle em qualquer código de diagnóstico, logo o delimitador NUNCA pode
+    /// aparecer dentro de um código válido: a codificação é lossless e sem ambiguidade, ao contrário de um
+    /// delimitador imprimível como <c>';'</c> (AB-4C-004 — um único diagnóstico contendo <c>';'</c> não pode
+    /// mais voltar da persistência como dois códigos).
+    /// </summary>
+    public const char DiagnosticsPersistenceDelimiter = '\u001F';
+
+    /// <summary>
+    /// Tamanho máximo da representação persistida canônica de <see cref="CapabilityDiagnostics"/> (códigos
+    /// únicos, ordenados, unidos por <see cref="DiagnosticsPersistenceDelimiter"/>) — deve caber na coluna
+    /// <c>ev_connector_inventory_archives.capability_diagnostics nvarchar(1000)</c>. Validado aqui, no
+    /// Domain, para que TODO valor aceito pelo agregado seja garantidamente persistível no schema efetivo
+    /// (AB-4C-004 critério 2): os limites individuais de contagem/tamanho por código, sozinhos, permitiam
+    /// construir um agregado válido cuja representação unida excedia a coluna.
+    /// </summary>
+    public const int DiagnosticsPersistedMaxLength = 1000;
+
     /// <summary>Cria um registro de archive normalizado — cada campo é sanitizado na FORMA (fail-closed).</summary>
     public InventoryArchiveRecord(
         string externalArchiveId,
@@ -60,12 +80,45 @@ public sealed record InventoryArchiveRecord
                 $"No máximo {MaxDiagnostics} diagnósticos de capacidade por archive.", nameof(capabilityDiagnostics));
         }
 
+        var validated = capabilityDiagnostics
+            .Select(static code => TextValue.Require(code, "capabilityDiagnostics", DiagnosticCodeMaxLength))
+            .ToArray();
+
+        // Canonicaliza (ordem determinística + deduplicação) ANTES de aceitar o agregado (AB-4C-004
+        // critério 3): o MESMO construtor é usado por InventorySnapshot.Create (coleta fresca do adapter) e
+        // por InventorySnapshot.Rehydrate (via SqlConnectorInventoryStore.ReadArchivesAsync), então Create e
+        // Rehydrate nunca podem divergir sobre a ordem/duplicidade canônica — o mesmo conjunto lógico de
+        // diagnósticos, reportado em ordem diferente pelo adapter em coletas distintas, converge para a
+        // MESMA representação e o MESMO SnapshotHash em vez de gerar uma "mudança" espúria.
         CapabilityDiagnostics =
-        [
-            .. capabilityDiagnostics.Select(
-                static code => TextValue.Require(code, "capabilityDiagnostics", DiagnosticCodeMaxLength)),
-        ];
+            [.. validated.Distinct(StringComparer.Ordinal).OrderBy(static code => code, StringComparer.Ordinal)];
+
+        var persistedLength = EncodeCapabilityDiagnostics(CapabilityDiagnostics).Length;
+        if (persistedLength > DiagnosticsPersistedMaxLength)
+        {
+            throw new ArgumentException(
+                $"A representação canônica de capabilityDiagnostics ({persistedLength} chars) excede o limite " +
+                $"persistível de {DiagnosticsPersistedMaxLength} chars.", nameof(capabilityDiagnostics));
+        }
     }
+
+    /// <summary>
+    /// Codifica diagnósticos JÁ canonicamente ordenados/deduplicados (ex.: <see cref="CapabilityDiagnostics"/>)
+    /// como um único campo persistível, unidos por <see cref="DiagnosticsPersistenceDelimiter"/> — lossless e
+    /// sem ambiguidade, porque nenhum código válido pode conter o delimitador (AB-4C-004).
+    /// </summary>
+    public static string EncodeCapabilityDiagnostics(IReadOnlyList<string> canonicalDiagnostics) =>
+        string.Join(DiagnosticsPersistenceDelimiter, canonicalDiagnostics);
+
+    /// <summary>
+    /// Decodifica um campo persistido de volta para a lista de diagnósticos. Deliberadamente NÃO remove
+    /// entradas vazias: um payload malformado (ex.: delimitador duplicado corrompendo a codificação) produz
+    /// uma entrada vazia que o construtor de <see cref="InventoryArchiveRecord"/> recusa via
+    /// <see cref="TextValue.Require"/> — fail-closed, em vez de ser silenciosamente descartada e o dado
+    /// corrompido tratado como uma lista canônica válida (AB-4C-004 critério 4).
+    /// </summary>
+    public static string[] DecodeCapabilityDiagnostics(string persisted) =>
+        string.IsNullOrEmpty(persisted) ? [] : persisted.Split(DiagnosticsPersistenceDelimiter);
 
     /// <summary>Identidade externa estável e opaca do archive no Enterprise Vault.</summary>
     public string ExternalArchiveId { get; }

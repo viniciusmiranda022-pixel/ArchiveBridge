@@ -375,6 +375,94 @@ public sealed class Slice4cEvConnectorTests(SqlServerFixture fixture)
         Assert.Null(latest);
     }
 
+    // ---- CapabilityDiagnostics — codec/canonicalização sob SQL real (AB-4C-004) ----------------------
+
+    [Fact]
+    public async Task AppendAndGetLatestRoundTripADiagnosticContainingTheOldDelimiterCharacter()
+    {
+        // ';' quebrava o codec antigo (string.Join(';', ...) / Split(';', ...)): um único diagnóstico
+        // "EV;CODE" voltava da persistência como dois códigos ["EV", "CODE"].
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('6', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+        var archive = new InventoryArchiveRecord("arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, ["EV;CODE"]);
+        var snapshot = InventorySnapshot.Create(
+            InventorySnapshotId.New(), identity.Id, scope.Tenant, scope.Project, 1, [archive], CorrelationId.New(), now);
+
+        await Inventory.AppendAsync(snapshot, CancellationToken.None);
+        var latest = await Inventory.GetLatestAsync(scope, identity.Id, CancellationToken.None);
+
+        Assert.Equal(["EV;CODE"], Assert.Single(latest!.Archives).CapabilityDiagnostics);
+    }
+
+    [Fact]
+    public async Task AppendAndGetLatestRoundTripTheMaximumDiagnosticsPayloadAcceptedByTheDomain()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('a', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+
+        // 20 códigos únicos de 49 chars: o maior payload que o Domain aceita hoje sem exceder a coluna
+        // persistida (20*49 + 19 separadores = 999 <= 1000).
+        var diagnostics = Enumerable.Range(0, 20).Select(i => new string((char)('A' + i), 49)).ToArray();
+        var archive = new InventoryArchiveRecord("arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, diagnostics);
+        var snapshot = InventorySnapshot.Create(
+            InventorySnapshotId.New(), identity.Id, scope.Tenant, scope.Project, 1, [archive], CorrelationId.New(), now);
+
+        await Inventory.AppendAsync(snapshot, CancellationToken.None);
+        var latest = await Inventory.GetLatestAsync(scope, identity.Id, CancellationToken.None);
+
+        Assert.Equal(archive.CapabilityDiagnostics, Assert.Single(latest!.Archives).CapabilityDiagnostics);
+    }
+
+    [Fact]
+    public async Task SubmissionsWithTheSameDiagnosticsInDifferentOrderConvergeToTheSameSnapshotAsAnIdenticalReplay()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('b', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+
+        var winner = new InventoryArchiveRecord("arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, ["ALPHA", "BETA"]);
+        var sameSetDifferentOrder = new InventoryArchiveRecord("arch-1", "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, ["BETA", "ALPHA"]);
+        var winnerSnapshot = InventorySnapshot.Create(
+            InventorySnapshotId.New(), identity.Id, scope.Tenant, scope.Project, 1, [winner], CorrelationId.New(), now);
+        var replaySnapshot = InventorySnapshot.Create(
+            InventorySnapshotId.New(), identity.Id, scope.Tenant, scope.Project, 1, [sameSetDifferentOrder], CorrelationId.New(), now);
+        Assert.Equal(winnerSnapshot.SnapshotHash, replaySnapshot.SnapshotHash);
+
+        var first = await Inventory.AppendAsync(winnerSnapshot, CancellationToken.None);
+        var second = await Inventory.AppendAsync(replaySnapshot, CancellationToken.None);
+
+        Assert.True(first.Created);
+        Assert.False(second.Created); // mesmo conjunto lógico, ordem diferente — réplay idêntico, não muda versão
+        Assert.Equal(first.Snapshot.Id, second.Snapshot.Id);
+    }
+
+    [Fact]
+    public async Task GetLatestFailsClosedWhenThePersistedCapabilityDiagnosticsFieldIsMalformed()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('d', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+        var seeded = await SeedBaselineSnapshotAsync(scope, identity.Id, now, "arch-1");
+
+        // Delimitador de persistência duplicado por fora (corrupção simulada) — produz uma entrada vazia ao
+        // decodificar, que InventoryArchiveRecord recusa (fail-closed), nunca uma lista canônica ambígua.
+        var corrupted = "EV" + InventoryArchiveRecord.DiagnosticsPersistenceDelimiter +
+            InventoryArchiveRecord.DiagnosticsPersistenceDelimiter + "CODE";
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.ev_connector_inventory_archives SET capability_diagnostics = @diagnostics " +
+            "WHERE snapshot_id = @snapshot AND external_archive_id = @external;",
+            ("@diagnostics", corrupted), ("@snapshot", seeded.Snapshot.Id.Value), ("@external", "arch-1"));
+
+        await AssertCorruptSnapshotFailsClosedAsync(scope, identity.Id, now);
+    }
+
     // ---- InventorySnapshot: a persistência é fronteira NÃO CONFIÁVEL (AB-4C-003) ----------------------
     //
     // Cada cenário abaixo persiste um snapshot válido pela aplicação e então o corrompe POR FORA (via a
