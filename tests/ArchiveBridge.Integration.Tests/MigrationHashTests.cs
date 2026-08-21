@@ -234,6 +234,74 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Migration0024AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0023 tivesse divergido (inclusive as do Passo 1 do Slice 4C), isto lançaria. Em seguida
+        // confirmamos a 0024 e as seis tabelas da fundação de EXECUÇÃO de export EV (Slice 4C, Passo 2).
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 24;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var tables = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.tables WHERE name IN (
+                'ev_export_requests', 'ev_export_throttle_leases', 'ev_export_attempts',
+                'ev_export_manifest_entries', 'ev_export_oversized_items', 'ev_export_events');
+            """,
+            connection))
+        {
+            Assert.Equal(6, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // Backstop atômico de throttling (item 4): os DOIS índices únicos FILTRADOS sobre a mesma tabela.
+        await using (var throttleIndexes = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.indexes
+            WHERE object_id = OBJECT_ID('dbo.ev_export_throttle_leases')
+              AND name IN ('UX_ev_export_throttle_leases_connector', 'UX_ev_export_throttle_leases_archive')
+              AND is_unique = 1 AND has_filter = 1;
+            """,
+            connection))
+        {
+            Assert.Equal(2, Convert.ToInt32(await throttleIndexes.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // Manifesto/engine só existem quando a tentativa foi Completed — reforçado no BANCO (defesa em
+        // profundidade da mesma regra do Domain).
+        await using (var manifestCheck = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.check_constraints WHERE name = 'CK_ev_export_attempts_manifest_only_when_completed';",
+            connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await manifestCheck.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // Append-only: a aplicação recebe apenas SELECT/INSERT nas tabelas de evidência histórica (attempts,
+        // manifesto, oversized, eventos, requests); throttle_leases é a ÚNICA exceção (permite UPDATE
+        // restrito a released_at_utc, a liberação do lease).
+        await using var grants = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.database_permissions AS p
+            JOIN sys.objects AS o ON o.object_id = p.major_id
+            JOIN sys.database_principals AS r ON r.principal_id = p.grantee_principal_id
+            WHERE r.name = 'ab_app_role'
+              AND o.name IN ('ev_export_requests', 'ev_export_attempts', 'ev_export_manifest_entries',
+                              'ev_export_oversized_items', 'ev_export_events')
+              AND p.permission_name NOT IN ('SELECT', 'INSERT');
+            """,
+            connection);
+        Assert.Equal(0, Convert.ToInt32(await grants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
         var original = await ReadHashAsync(1);

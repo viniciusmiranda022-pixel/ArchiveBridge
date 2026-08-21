@@ -56,4 +56,45 @@ public sealed partial class VendorBoundaryTests
 
         Assert.DoesNotContain("ArchiveBridge.Infrastructure", referenced);
     }
+
+    // Estende a MESMA regra de fronteira (não cria uma verificação paralela) para os tipos de export
+    // (AB-4C-005): nenhum arquivo-fonte de Domain/Application pode DEPENDER estruturalmente do
+    // processo/EV concreto — a execução real (System.Diagnostics.Process, ProcessStartInfo, o snap-in
+    // Symantec.EnterpriseVault.PowerShell) fica exclusivamente em Infrastructure/Workers.Ev. A checagem por
+    // texto complementa as checagens por assembly acima porque System.Diagnostics.Process é BCL (nenhum
+    // PackageReference apareceria) e por isso não seria pego pelas asserções de dependência de
+    // pacote/assembly sozinhas. Não inclui "PowerShell"/"Export-EVArchive" soltos: esses termos já aparecem
+    // legitimamente em comentários de domínio pré-existentes (ex.: ExportRequestPolicy, EvDiscoveryPolicy,
+    // EvPowerShellProbeKind) ao DOCUMENTAR o cmdlet/host que o Domain nunca invoca — o sinal estrutural
+    // preciso é o TIPO/namespace concreto, não a palavra em prosa.
+    [Theory]
+    [InlineData("System.Diagnostics.Process")]
+    [InlineData("ProcessStartInfo")]
+    [InlineData("Symantec.EnterpriseVault.PowerShell")]
+    public void DomainAndApplicationSourceNeverReferencesProcessOrEvVendorTypes(string forbidden)
+    {
+        foreach (var file in DomainAndApplicationSourceFiles())
+        {
+            Assert.False(
+                File.ReadAllText(file).Contains(forbidden, StringComparison.Ordinal),
+                $"{Path.GetFileName(file)} (Domain/Application) contém o token proibido: {forbidden}");
+        }
+    }
+
+    private static IEnumerable<string> DomainAndApplicationSourceFiles()
+    {
+        var root = ProjectGraph.RepositoryRoot;
+        foreach (var project in new[] { "ArchiveBridge.Domain", "ArchiveBridge.Application" })
+        {
+            var dir = Path.Combine(root, "src", project);
+            foreach (var file in Directory.EnumerateFiles(dir, "*.cs", SearchOption.AllDirectories))
+            {
+                if (!file.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.Ordinal)
+                    && !file.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
+                {
+                    yield return file;
+                }
+            }
+        }
+    }
 }

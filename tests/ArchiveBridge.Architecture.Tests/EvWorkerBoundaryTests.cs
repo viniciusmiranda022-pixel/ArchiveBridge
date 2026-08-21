@@ -48,9 +48,17 @@ public sealed class EvWorkerBoundaryTests
         Assert.DoesNotContain(typeof(WindowsEvPowerShellHost), parameters);
     }
 
-    // (2) O host do worker não introduz nenhuma integração/execução de Slice 4B.
+    // (2) O host do worker não introduz nenhuma integração/execução de Slice 4B (engine PST de
+    // inspeção/particionamento — Aspose/libpff) nem de M365/Purview/Graph/AzCopy/EWS, que permanecem
+    // INTEIRAMENTE fora do escopo deste worker. "Export-EVArchive" DEIXOU de constar desta lista a partir
+    // de AB-4C-005 (Slice 4C, Passo 2): este Passo AUTORIZA explicitamente e implementa, com rigor
+    // arquitetural completo (capability handshake revalidado, throttling, argumentos tipados sem command
+    // injection, containment de output, integridade pós-execução), a CONSTRUÇÃO do comando — nunca a
+    // execução contra um Enterprise Vault real de cliente (STOP-THE-LINE preservado; ver
+    // WindowsEvArchiveExportExecutor e o corpus de testes de injection/containment). O token nunca
+    // pertenceu à fronteira de Slice 4B — era um marcador de "ainda não autorizado" do Passo 1, substituído
+    // agora pela autorização explícita e testada deste Passo.
     [Theory]
-    [InlineData("Export-EVArchive")]
     [InlineData("AzCopy")]
     [InlineData("Purview")]
     [InlineData("Microsoft.Graph")]
@@ -87,14 +95,16 @@ public sealed class EvWorkerBoundaryTests
     }
 
     // (3) A fronteira de MANUTENÇÃO é restrita a operações técnicas cross-tenant APROVADAS. No caminho EV
-    // específico (Infrastructure/EnterpriseVault), duas identidades de manutenção são aprovadas: a
-    // ENUMERAÇÃO de escopos de descoberta (SqlEvDiscoveryPendingScopeReader) e o RESGATE de enrollment
-    // tokens (SqlEnrollmentTokenStore.RedeemAsync, AB-4C-001) — o resgate precisa localizar o token
-    // SOMENTE pelo hash do segredo apresentado, antes de o tenant/projeto serem conhecidos (é o PRÓPRIO
-    // token quem os determina), então não há como abrir uma conexão tenant-scoped de antemão. A
-    // recuperação de leases expirados (a outra operação aprovada fora deste diretório) vive no
-    // SqlJobLeaseManager do Slice 1. Nenhum efeito de negócio EV (claim/discovery/evidência/conclusão/
-    // capability/inventário) usa a identidade de manutenção além destes dois casos explicitamente aprovados.
+    // específico (Infrastructure/EnterpriseVault), TRÊS identidades de manutenção são aprovadas: a
+    // ENUMERAÇÃO de escopos de descoberta (SqlEvDiscoveryPendingScopeReader), a ENUMERAÇÃO de escopos de
+    // EXPORTAÇÃO (SqlEvExportPendingScopeReader, AB-4C-005 — mesmo padrão read-only, nunca uma regra
+    // paralela) e o RESGATE de enrollment tokens (SqlEnrollmentTokenStore.RedeemAsync, AB-4C-001) — o
+    // resgate precisa localizar o token SOMENTE pelo hash do segredo apresentado, antes de o
+    // tenant/projeto serem conhecidos (é o PRÓPRIO token quem os determina), então não há como abrir uma
+    // conexão tenant-scoped de antemão. A recuperação de leases expirados (a outra operação aprovada fora
+    // deste diretório) vive no SqlJobLeaseManager do Slice 1. Nenhum efeito de negócio EV (claim/
+    // discovery/export/evidência/conclusão/capability/inventário/throttle/manifesto) usa a identidade de
+    // manutenção além destes três casos explicitamente aprovados.
     [Fact]
     public void MaintenanceIdentityIsRestrictedToApprovedCrossTenantInfrastructureOperations()
     {
@@ -104,7 +114,10 @@ public sealed class EvWorkerBoundaryTests
             .Order(StringComparer.Ordinal)
             .ToList();
 
-        string[] approved = ["SqlEnrollmentTokenStore.cs", "SqlEvDiscoveryPendingScopeReader.cs"];
+        string[] approved =
+        [
+            "SqlEnrollmentTokenStore.cs", "SqlEvDiscoveryPendingScopeReader.cs", "SqlEvExportPendingScopeReader.cs",
+        ];
         Assert.Equal(approved, usingMaintenance);
     }
 }
