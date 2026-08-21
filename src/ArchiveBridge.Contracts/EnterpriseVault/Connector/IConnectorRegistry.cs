@@ -32,4 +32,13 @@ public interface IConnectorRegistry
     /// próprio connector.
     /// </summary>
     Task<ConnectorIdentity?> GetAsync(TenantScope scope, ConnectorId connector, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Revoga explicitamente a identidade dentro do escopo autenticado (ação idempotente — revogar um
+    /// connector já revogado não lança): bloqueia handshakes, inventário, exportação e reinstalação
+    /// futuros sem novo enrollment (item 8 de AB-4C-005). Mesmo padrão de
+    /// <see cref="IEnrollmentTokenStore.RevokeAsync"/>.
+    /// </summary>
+    /// <exception cref="ConnectorNotFoundException">Connector inexistente/fora do escopo (anti-IDOR).</exception>
+    Task RevokeAsync(TenantScope scope, ConnectorId connector, DateTimeOffset nowUtc, CancellationToken cancellationToken);
 }

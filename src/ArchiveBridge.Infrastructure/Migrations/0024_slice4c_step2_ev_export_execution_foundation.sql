@@ -43,6 +43,11 @@ GO
 
 GRANT SELECT, INSERT ON dbo.ev_export_requests TO ab_app_role;
 GO
+-- A identidade de MANUTENÇÃO precisa enxergar esta tabela: SqlEvExportPendingScopeReader (mesmo padrão de
+-- SqlEvDiscoveryPendingScopeReader) faz EXISTS(...) sobre dbo.ev_export_requests para enumerar escopos
+-- elegíveis entre tenants — sem este GRANT, a leitura de manutenção falha fechado por permissão negada.
+GRANT SELECT ON dbo.ev_export_requests TO ab_maintenance_role;
+GO
 
 ALTER SECURITY POLICY rls.tenant_isolation_policy
     ADD FILTER PREDICATE rls.fn_tenant_access(tenant_id) ON dbo.ev_export_requests,

@@ -25,6 +25,14 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
 {
     private static readonly WorkerId Worker = new("ev-export-worker-e2e");
 
+    // Instante fixo (mesma convenção de Slice2Support.Now/Slice3Support): DateTimeOffset.UtcNow carrega
+    // fração de milissegundo genuína, que o SQL Server ARREDONDA (não trunca) ao persistir em
+    // DATETIME2(3) — o parâmetro @now sem escala explícita permanece com a fração completa, então
+    // next_attempt_at_utc <= @now falha de forma intermitente exatamente quando o arredondamento do banco
+    // empurra o valor gravado para cima do @now não arredondado. Um instante alinhado ao segundo elimina a
+    // fração e torna o claim determinístico, como em todas as outras suítes SQL do repositório.
+    private static readonly DateTimeOffset Now = new(2026, 8, 1, 0, 0, 0, TimeSpan.Zero);
+
     private SqlConnectorRegistry Connectors => new(fixture.Factory);
 
     private SqlConnectorCapabilityStore Capabilities => new(fixture.Factory);
@@ -57,13 +65,28 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         return identity;
     }
 
+    // Cria o pedido pai (dbo.ev_export_requests) exigido por FK_ev_export_attempts_request. Os testes da
+    // seção "História de tentativas" abaixo exercitam o STORE de tentativas isoladamente, mas uma tentativa
+    // só pode existir sob um pedido de verdade já persistido — nunca um ExportRequestId solto/nunca
+    // enfileirado (o append-only de dbo.ev_export_attempts referencia dbo.ev_export_requests por design).
+    private async Task<ExportRequestId> EnqueueRequestAsync(
+        TenantScope scope, ConnectorIdentity identity, string externalArchiveId, MutableClock clock)
+    {
+        var policy = ExportRequestPolicy.Default;
+        var command = new EvExportCommand(
+            scope, identity.Id, externalArchiveId, policy.MaxThreads, policy.MaxPstSizeMb, "operator", CorrelationId.New());
+        var key = EvExportRequestIdentity.Compute(scope.Tenant, scope.Project, identity.Id, externalArchiveId, policy).ToIdempotencyKey();
+        var enqueued = await Inbox(clock).EnqueueIdempotentAsync(command, key, CancellationToken.None);
+        return enqueued.RequestId;
+    }
+
     // ---- Idempotência por identidade CANÔNICA (item 5) --------------------------------------------------
 
     [Fact]
     public async Task DuplicateConcurrentRequestsWithTheSameCanonicalIdentityConvergeToOneLogicalRequest()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var identity = await RegisterExportCapableConnectorAsync(scope, clock);
         var inbox = Inbox(clock);
         var policy = ExportRequestPolicy.Default;
@@ -84,7 +107,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task ADifferentCanonicalIdentityCreatesASeparateLogicalRequest()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var identity = await RegisterExportCapableConnectorAsync(scope, clock);
         var inbox = Inbox(clock);
         var policy = ExportRequestPolicy.Default;
@@ -106,7 +129,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task ClaimNextReturnsTheEnqueuedCommandWithMatchingRequestId()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var identity = await RegisterExportCapableConnectorAsync(scope, clock);
         var inbox = Inbox(clock);
         var policy = ExportRequestPolicy.Default;
@@ -127,7 +150,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task AcquiringTheSameConnectorTwiceIsThrottled()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var throttle = Throttle(clock);
         var connector = ConnectorId.New();
 
@@ -142,7 +165,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task AcquiringTheSameArchiveTwiceIsThrottledEvenFromDifferentConnectors()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var throttle = Throttle(clock);
 
         var first = await throttle.TryAcquireAsync(
@@ -158,7 +181,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task ReleasingALeaseAllowsANewAcquisition()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var throttle = Throttle(clock);
         var connector = ConnectorId.New();
 
@@ -174,7 +197,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task ReleasingALeaseTwiceIsIdempotent()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var throttle = Throttle(clock);
         var lease = await throttle.TryAcquireAsync(
             scope, ConnectorId.New(), "arch-1", ExportAttemptId.New(), CorrelationId.New(), CancellationToken.None);
@@ -189,10 +212,10 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task AppendedCompletedAttemptRoundTripsTheManifestAndOversizedItems()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var identity = await RegisterExportCapableConnectorAsync(scope, clock);
         var attempts = Attempts(clock);
-        var request = ExportRequestId.New();
+        var request = await EnqueueRequestAsync(scope, identity, "arch-1", clock);
         var attempt = ExportAttemptId.New();
         var manifest = EvExportManifest.Create(
             request, attempt, "arch-1", [new EvExportManifestEntry("out1.pst", 1024, DeterministicHash.Compute(["h1"]))], "15.0", "1.0.0");
@@ -220,10 +243,10 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task RetryPreservesAttemptHistoryAcrossMultipleAppends()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var identity = await RegisterExportCapableConnectorAsync(scope, clock);
         var attempts = Attempts(clock);
-        var request = ExportRequestId.New();
+        var request = await EnqueueRequestAsync(scope, identity, "arch-1", clock);
 
         var failed = new EvExportAttemptRecord(
             request, ExportAttemptId.New(), 1, identity.Id, "arch-1", EvExportAttemptOutcome.Failed,
@@ -253,7 +276,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task RequestFlowsDurablyThroughTheProcessorToACompletedManifestWithoutRealEv()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var identity = await RegisterExportCapableConnectorAsync(scope, clock);
 
         var requestUseCase = new RequestEvExportUseCase(
@@ -290,7 +313,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task CapabilityRevokedBetweenRequestAndExecutionBlocksFailClosed()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var identity = await RegisterExportCapableConnectorAsync(scope, clock);
 
         var requestUseCase = new RequestEvExportUseCase(Connectors, Capabilities, Inbox(clock), Audit, EvExportPolicy.Default, clock);
@@ -298,7 +321,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
             new RequestEvExport(scope, identity.Id, "arch-1", null, null, "operator", CorrelationId.New()), CancellationToken.None);
 
         // O connector é revogado DEPOIS do enfileiramento, ANTES da execução — item 8.
-        await Connectors.RegisterAsync(identity.Revoke(clock.UtcNow), CancellationToken.None);
+        await Connectors.RevokeAsync(scope, identity.Id, clock.UtcNow, CancellationToken.None);
 
         var executor = new FakeExecutor(new EvExportProcessResult(0, false, false, "15.0", "1.0.0", [], null));
         var inspector = new FakeInspector([]);
@@ -321,7 +344,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
     public async Task ReplayAfterTheOutputWasRemovedFailsClosed()
     {
         var scope = SqlServerFixture.NewScope();
-        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var clock = new MutableClock(Now);
         var identity = await RegisterExportCapableConnectorAsync(scope, clock);
 
         var requestUseCase = new RequestEvExportUseCase(Connectors, Capabilities, Inbox(clock), Audit, EvExportPolicy.Default, clock);

@@ -277,6 +277,18 @@ internal sealed class FakeConnectorRegistryForExport : IConnectorRegistry
         var found = _identities.FirstOrDefault(i => i.Id == connector && i.Tenant == scope.Tenant && i.Project == scope.Project);
         return Task.FromResult(found);
     }
+
+    public Task RevokeAsync(TenantScope scope, ConnectorId connector, DateTimeOffset nowUtc, CancellationToken cancellationToken)
+    {
+        var index = _identities.FindIndex(i => i.Id == connector && i.Tenant == scope.Tenant && i.Project == scope.Project);
+        if (index < 0)
+        {
+            throw new ConnectorNotFoundException();
+        }
+
+        _identities[index] = _identities[index].Revoke(nowUtc);
+        return Task.CompletedTask;
+    }
 }
 
 internal sealed class FakeConnectorCapabilityStoreForExport : IConnectorCapabilityStore
