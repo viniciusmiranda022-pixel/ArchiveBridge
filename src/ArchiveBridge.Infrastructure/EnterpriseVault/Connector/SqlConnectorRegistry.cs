@@ -53,6 +53,14 @@ public sealed class SqlConnectorRegistry(TenantConnectionFactory connectionFacto
         WHERE connector_id = @id AND project_id = @project;
         """;
 
+    // Revogado (1) é terminal e idempotente: revogar duas vezes só atualiza updated_at_utc de novo.
+    private const string RevokeSql =
+        """
+        UPDATE dbo.ev_connectors
+        SET status = 1, updated_at_utc = @updated
+        WHERE connector_id = @id AND tenant_id = @tenant AND project_id = @project;
+        """;
+
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
 
     /// <inheritdoc />
@@ -143,6 +151,22 @@ public sealed class SqlConnectorRegistry(TenantConnectionFactory connectionFacto
         }
 
         return ReadRow(reader);
+    }
+
+    /// <inheritdoc />
+    public async Task RevokeAsync(TenantScope scope, ConnectorId connector, DateTimeOffset nowUtc, CancellationToken cancellationToken)
+    {
+        await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var command = new SqlCommand(RevokeSql, tenant.Connection);
+        command.Parameters.Add(new SqlParameter("@id", SqlDbType.UniqueIdentifier) { Value = connector.Value });
+        command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        command.Parameters.Add(new SqlParameter("@updated", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(nowUtc) });
+        var rows = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        if (rows == 0)
+        {
+            throw new ConnectorNotFoundException();
+        }
     }
 
     private static async Task<ConnectorIdentity?> FindByThumbprintAsync(

@@ -469,7 +469,19 @@ internal sealed class FakeConnectorRegistry : IConnectorRegistry
         return Task.FromResult(found);
     }
 
-    /// <summary>Auxiliar de teste: revoga diretamente (sem caso de uso dedicado neste Passo).</summary>
+    public Task RevokeAsync(TenantScope scope, ConnectorId connector, DateTimeOffset nowUtc, CancellationToken cancellationToken)
+    {
+        var index = _identities.FindIndex(i => i.Id == connector && i.Tenant == scope.Tenant && i.Project == scope.Project);
+        if (index < 0)
+        {
+            throw new ConnectorNotFoundException();
+        }
+
+        _identities[index] = _identities[index].Revoke(nowUtc);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Auxiliar de teste: revoga diretamente sem passar pelo escopo (usada pelos testes já existentes).</summary>
     public void ForceRevoke(ConnectorId connector, DateTimeOffset nowUtc)
     {
         var index = _identities.FindIndex(i => i.Id == connector);
