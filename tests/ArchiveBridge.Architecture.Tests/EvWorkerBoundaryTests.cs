@@ -87,18 +87,24 @@ public sealed class EvWorkerBoundaryTests
     }
 
     // (3) A fronteira de MANUTENÇÃO é restrita a operações técnicas cross-tenant APROVADAS. No caminho EV
-    // específico (Infrastructure/EnterpriseVault), a única identidade de manutenção é a ENUMERAÇÃO de escopos;
-    // a recuperação de leases expirados (a outra operação aprovada) vive no SqlJobLeaseManager do Slice 1.
-    // Nenhum efeito de negócio EV (claim/discovery/evidência/conclusão) usa a identidade de manutenção.
+    // específico (Infrastructure/EnterpriseVault), duas identidades de manutenção são aprovadas: a
+    // ENUMERAÇÃO de escopos de descoberta (SqlEvDiscoveryPendingScopeReader) e o RESGATE de enrollment
+    // tokens (SqlEnrollmentTokenStore.RedeemAsync, AB-4C-001) — o resgate precisa localizar o token
+    // SOMENTE pelo hash do segredo apresentado, antes de o tenant/projeto serem conhecidos (é o PRÓPRIO
+    // token quem os determina), então não há como abrir uma conexão tenant-scoped de antemão. A
+    // recuperação de leases expirados (a outra operação aprovada fora deste diretório) vive no
+    // SqlJobLeaseManager do Slice 1. Nenhum efeito de negócio EV (claim/discovery/evidência/conclusão/
+    // capability/inventário) usa a identidade de manutenção além destes dois casos explicitamente aprovados.
     [Fact]
     public void MaintenanceIdentityIsRestrictedToApprovedCrossTenantInfrastructureOperations()
     {
         var usingMaintenance = Directory.EnumerateFiles(InfrastructureEvDir, "*.cs", SearchOption.AllDirectories)
             .Where(file => File.ReadAllText(file).Contains("OpenForMaintenanceAsync", StringComparison.Ordinal))
             .Select(file => Path.GetFileName(file))
+            .Order(StringComparer.Ordinal)
             .ToList();
 
-        // No código EV específico, manutenção = SOMENTE enumeração de escopos.
-        Assert.Equal("SqlEvDiscoveryPendingScopeReader.cs", Assert.Single(usingMaintenance));
+        string[] approved = ["SqlEnrollmentTokenStore.cs", "SqlEvDiscoveryPendingScopeReader.cs"];
+        Assert.Equal(approved, usingMaintenance);
     }
 }
