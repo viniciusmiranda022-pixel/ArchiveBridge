@@ -11,11 +11,15 @@ using Microsoft.Data.SqlClient;
 namespace ArchiveBridge.Infrastructure.EnterpriseVault.Connector;
 
 /// <summary>
-/// Store SQL append-only de snapshots de inventário (pai + archives filhos). A decisão "isto é um réplay
-/// idêntico" já foi tomada pela Application ANTES de chamar <see cref="AppendAsync"/> — este store apenas
-/// insere a versão decidida; o índice único <c>(connector_id, version)</c> é o backstop de concorrência:
-/// duas submissões concorrentes calculando a MESMA próxima versão para o mesmo connector convergem para a
-/// linha já persistida pela primeira, em vez de duplicar ou falhar.
+/// Store SQL append-only de snapshots de inventário (pai + archives filhos). O índice único
+/// <c>(connector_id, version)</c> é o backstop de concorrência: duas submissões concorrentes calculando a
+/// MESMA próxima versão para o mesmo connector nunca duplicam nem corrompem a linha vencedora. O que a
+/// segunda submissão recebe depende do CONTEÚDO, nunca só da versão colidida (AB-4C-002): se o snapshot já
+/// persistido nessa versão tem o MESMO <see cref="Sha256Hash"/> do candidate, é um réplay idêntico e
+/// converge (<c>Created=false</c>); se o hash diverge, a versão foi legitimamente ocupada por uma mudança
+/// real de outro writer — <see cref="AppendAsync"/> lança <see cref="ConcurrencyException"/> em vez de
+/// mascarar a mudança perdida como réplay; a Application (<c>SubmitInventorySnapshotUseCase</c>) releé o
+/// latest e tenta de novo com a próxima versão disponível.
 /// </summary>
 public sealed class SqlConnectorInventoryStore(TenantConnectionFactory connectionFactory) : IConnectorInventoryStore
 {
@@ -132,8 +136,14 @@ public sealed class SqlConnectorInventoryStore(TenantConnectionFactory connectio
         }
         catch (SqlException sql) when (sql.Number is 2601 or 2627)
         {
-            // Corrida perdida: outra submissão concorrente do MESMO connector já gravou esta versão —
-            // converge relendo o snapshot já persistido (nunca duplica, nunca falha por corrida transitória).
+            // Colisão de versão: outra submissão concorrente do MESMO connector já gravou esta versão. Isso
+            // NÃO significa, por si só, que é um réplay — duas submissões concorrentes com conteúdo
+            // DIFERENTE podem calcular a mesma próxima versão (AB-4C-002). Compara semanticamente o
+            // snapshot já persistido com o candidate: só converge (Created=false) se forem o MESMO
+            // conteúdo (mesmo SnapshotHash). Caso contrário, a versão foi legitimamente ocupada por outra
+            // mudança real — sinaliza concorrência explícita (nunca reprova o adapter, nunca perde a
+            // mudança silenciosamente) para o chamador reler o latest e tentar de novo com a próxima versão
+            // disponível.
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             var existing = await GetByVersionAsync(scope, snapshot.Connector, snapshot.Version, cancellationToken).ConfigureAwait(false);
             if (existing is null)
@@ -141,7 +151,14 @@ public sealed class SqlConnectorInventoryStore(TenantConnectionFactory connectio
                 throw;
             }
 
-            return new InventorySnapshotAppendResult(existing, Created: false);
+            if (existing.SnapshotHash == snapshot.SnapshotHash)
+            {
+                return new InventorySnapshotAppendResult(existing, Created: false);
+            }
+
+            throw new ConcurrencyException(
+                $"Connector {snapshot.Connector.Value}: a versão {snapshot.Version.ToString(System.Globalization.CultureInfo.InvariantCulture)} " +
+                "já foi ocupada por outra submissão concorrente com conteúdo diferente. Releia o latest e tente novamente.");
         }
         catch
         {

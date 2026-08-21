@@ -1,3 +1,4 @@
+using ArchiveBridge.Application.EnterpriseVault.Connector;
 using ArchiveBridge.Contracts.EnterpriseVault.Connector;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
@@ -218,18 +219,21 @@ public sealed class Slice4cEvConnectorTests(SqlServerFixture fixture)
     }
 
     [Fact]
-    public async Task ConcurrentAppendsOfTheSameConnectorVersionConvergeToOneRowWithoutDuplicating()
+    public async Task ConcurrentAppendsOfTheSameConnectorVersionWithIdenticalContentConvergeToOneRowWithoutDuplicating()
     {
         var scope = SqlServerFixture.NewScope();
         var now = DateTimeOffset.UtcNow;
         var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('f', 64)), now);
         await Connectors.RegisterAsync(identity, CancellationToken.None);
 
+        // MESMA versão, MESMO conteúdo lógico (mesmo archive id) — Id/InventorySnapshotId diferentes, mas
+        // SnapshotHash igual: réplay concorrente genuíno (AB-4C-002 critério 7), não uma mudança perdida.
         var winner = NewSnapshot(identity.Id, scope, 1, now, "arch-1");
-        var loser = NewSnapshot(identity.Id, scope, 1, now, "arch-2"); // MESMA versão, conteúdo diferente
+        var identicalReplay = NewSnapshot(identity.Id, scope, 1, now, "arch-1");
+        Assert.Equal(winner.SnapshotHash, identicalReplay.SnapshotHash);
 
         var first = await Inventory.AppendAsync(winner, CancellationToken.None);
-        var second = await Inventory.AppendAsync(loser, CancellationToken.None);
+        var second = await Inventory.AppendAsync(identicalReplay, CancellationToken.None);
 
         Assert.True(first.Created);
         Assert.False(second.Created);
@@ -238,6 +242,103 @@ public sealed class Slice4cEvConnectorTests(SqlServerFixture fixture)
         var latest = await Inventory.GetLatestAsync(scope, identity.Id, CancellationToken.None);
         Assert.Equal(1, latest!.Version);
         Assert.Equal("arch-1", Assert.Single(latest.Archives).ExternalArchiveId);
+    }
+
+    [Fact]
+    public async Task ConcurrentAppendsOfTheSameConnectorVersionWithDifferentContentSurfaceAnExplicitConcurrencyConflict()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('3', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+
+        var winner = NewSnapshot(identity.Id, scope, 1, now, "arch-1");
+        var loser = NewSnapshot(identity.Id, scope, 1, now, "arch-2"); // MESMA versão, conteúdo DIFERENTE
+
+        var first = await Inventory.AppendAsync(winner, CancellationToken.None);
+
+        // AB-4C-002: uma versão colidida com conteúdo diferente NUNCA é tratada como réplay (o que
+        // silenciosamente perderia "arch-2") — o store falha fechado com um sinal de concorrência explícito
+        // e retriable para o chamador reler o latest e tentar de novo com a próxima versão livre.
+        await Assert.ThrowsAsync<ConcurrencyException>(() => Inventory.AppendAsync(loser, CancellationToken.None));
+
+        Assert.True(first.Created);
+        var latest = await Inventory.GetLatestAsync(scope, identity.Id, CancellationToken.None);
+        Assert.Equal(1, latest!.Version);
+        Assert.Equal("arch-1", Assert.Single(latest.Archives).ExternalArchiveId); // evidência do winner intacta
+    }
+
+    // ---- SubmitInventorySnapshotUseCase sobre SQL real: convergência determinística sob corrida real ----
+
+    private static InventoryArchiveRecord ArchiveRecord(string externalId) =>
+        new(externalId, "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, []);
+
+    [Fact]
+    public async Task ConcurrentSubmissionsOfDifferentInventoriesFromTheSameLatestBothPersistAtDistinctVersions()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('4', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+
+        var firstUseCase = new SubmitInventorySnapshotUseCase(
+            Connectors, Inventory, new StubEvInventoryAdapter(new EvInventoryProbeResult("14.2.2", true, [ArchiveRecord("arch-A")])),
+            new MutableClock(now));
+        var secondUseCase = new SubmitInventorySnapshotUseCase(
+            Connectors, Inventory, new StubEvInventoryAdapter(new EvInventoryProbeResult("14.2.2", true, [ArchiveRecord("arch-B")])),
+            new MutableClock(now));
+
+        var firstTask = firstUseCase.ExecuteAsync(
+            new SubmitInventorySnapshotRequest(scope, identity.Id, CorrelationId.New()), CancellationToken.None);
+        var secondTask = secondUseCase.ExecuteAsync(
+            new SubmitInventorySnapshotRequest(scope, identity.Id, CorrelationId.New()), CancellationToken.None);
+        var results = await Task.WhenAll(firstTask, secondTask);
+
+        // Nenhuma das duas mudanças reais foi descartada como réplay: ambas Created=true, em versões
+        // distintas — nunca uma delas apontando Created=false para o conteúdo da outra (AB-4C-002).
+        Assert.True(results[0].Created);
+        Assert.True(results[1].Created);
+        Assert.NotEqual(results[0].Snapshot.Version, results[1].Snapshot.Version);
+
+        var versions = results.Select(r => r.Snapshot.Version).OrderBy(v => v).ToArray();
+        Assert.Equal([1, 2], versions);
+
+        // Qual submissão convergiu para a versão 1 (vs. 2) depende da corrida real — não é assumido aqui,
+        // só que AMBOS os conteúdos sobreviveram, cada um na sua própria versão.
+        var archiveIds = results.Select(r => Assert.Single(r.Snapshot.Archives).ExternalArchiveId).ToHashSet();
+        Assert.Equal(new HashSet<string> { "arch-A", "arch-B" }, archiveIds);
+
+        var latest = await Inventory.GetLatestAsync(scope, identity.Id, CancellationToken.None);
+        Assert.Equal(2, latest!.Version);
+    }
+
+    [Fact]
+    public async Task ConcurrentSubmissionsOfIdenticalInventoriesConvergeToASingleLogicalSnapshot()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('5', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+
+        var probeResult = new EvInventoryProbeResult("14.2.2", true, [ArchiveRecord("arch-same")]);
+        var firstUseCase = new SubmitInventorySnapshotUseCase(
+            Connectors, Inventory, new StubEvInventoryAdapter(probeResult), new MutableClock(now));
+        var secondUseCase = new SubmitInventorySnapshotUseCase(
+            Connectors, Inventory, new StubEvInventoryAdapter(probeResult), new MutableClock(now));
+
+        var firstTask = firstUseCase.ExecuteAsync(
+            new SubmitInventorySnapshotRequest(scope, identity.Id, CorrelationId.New()), CancellationToken.None);
+        var secondTask = secondUseCase.ExecuteAsync(
+            new SubmitInventorySnapshotRequest(scope, identity.Id, CorrelationId.New()), CancellationToken.None);
+        var results = await Task.WhenAll(firstTask, secondTask);
+
+        Assert.True(results[0].Created ^ results[1].Created); // exatamente UMA linha nova; a outra convergiu
+        Assert.Equal(results[0].Snapshot.Id, results[1].Snapshot.Id);
+        Assert.Equal(1, results[0].Snapshot.Version);
+        Assert.Equal(1, results[1].Snapshot.Version);
+
+        var latest = await Inventory.GetLatestAsync(scope, identity.Id, CancellationToken.None);
+        Assert.Equal(1, latest!.Version);
     }
 
     [Fact]
@@ -272,4 +373,11 @@ public sealed class Slice4cEvConnectorTests(SqlServerFixture fixture)
 
         Assert.Null(latest);
     }
+}
+
+/// <summary>Duplo de teste da porta <see cref="IEvInventoryAdapter"/> — determinístico, sem PowerShell.</summary>
+internal sealed class StubEvInventoryAdapter(EvInventoryProbeResult result) : IEvInventoryAdapter
+{
+    public Task<EvInventoryProbeResult> ProbeAsync(ConnectorId connector, CorrelationId correlation, CancellationToken cancellationToken) =>
+        Task.FromResult(result);
 }

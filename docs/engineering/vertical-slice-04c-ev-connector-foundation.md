@@ -141,12 +141,19 @@ em `ev_connector_enrollment_tokens` (ver [Idempotência, concorrência e órfão
   (`UPDLOCK, HOLDLOCK`) antes de inserir; uma corrida perdida contra outra instalação concorrente do MESMO
   thumbprint (violação de `UQ_ev_connectors_thumbprint`) é reconciliada relendo na próxima tentativa —
   nunca duplica identidade (`ReRegisteringTheSameThumbprintConvergesWithoutDuplicatingIdentity`).
-- **Inventário sob corrida**: duas submissões concorrentes do MESMO connector que calculam a mesma próxima
-  versão convergem para a linha já persistida pela primeira (violação de `UX_ev_cis_connector_version`
-  reconciliada por releitura), nunca duplicam nem falham por corrida transitória
-  (`ConcurrentAppendsOfTheSameConnectorVersionConvergeToOneRowWithoutDuplicating`). A decisão "isto é um
-  réplay idêntico" (mesmo hash do último snapshot) é tomada pela Application ANTES de chamar
-  `AppendAsync` — o store nunca reimplementa essa comparação.
+- **Inventário sob corrida (AB-4C-002)**: duas submissões concorrentes do MESMO connector podem calcular a
+  MESMA próxima versão com conteúdo DIFERENTE — a violação de `UX_ev_cis_connector_version` sozinha NUNCA
+  é tratada como réplay. `SqlConnectorInventoryStore.AppendAsync` relê o snapshot já persistido nessa versão
+  e compara semanticamente (`SnapshotHash`): hash igual converge para a linha já gravada
+  (`Created = false`, réplay idêntico genuíno —
+  `ConcurrentAppendsOfTheSameConnectorVersionWithIdenticalContentConvergeToOneRowWithoutDuplicating`); hash
+  diferente lança `ConcurrencyException` em vez de mascarar a mudança perdida como réplay
+  (`ConcurrentAppendsOfTheSameConnectorVersionWithDifferentContentSurfaceAnExplicitConcurrencyConflict`).
+  `SubmitInventorySnapshotUseCase` releé o latest e tenta de novo com a próxima versão livre, até
+  `MaxConvergenceAttempts` tentativas (falha fechado com `ConcurrencyException` se a contenção nunca
+  convergir) — nenhuma mudança real é descartada em silêncio, comprovado sob corrida real contra SQL Server
+  (`ConcurrentSubmissionsOfDifferentInventoriesFromTheSameLatestBothPersistAtDistinctVersions`,
+  `ConcurrentSubmissionsOfIdenticalInventoriesConvergeToASingleLogicalSnapshot`).
 
 ## Segurança e minimização de PII (delta sobre o Passo 3 do Slice 4B)
 

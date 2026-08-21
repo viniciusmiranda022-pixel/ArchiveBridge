@@ -265,6 +265,122 @@ public sealed class Slice4cEvConnectorUseCaseTests
         Assert.Equal(2, inventory.AppendCallCount);
     }
 
+    // ---- AB-4C-002: corrida em SubmitInventorySnapshotUseCase — mudança real nunca vira réplay falso ---
+
+    [Fact]
+    public async Task SubmitInventorySnapshotRetriesAndConvergesWhenAConcurrentWriterTakesTheComputedVersionWithDifferentContent()
+    {
+        var scope = Scope();
+        var now = DateTimeOffset.UtcNow;
+        var connectors = new FakeConnectorRegistry();
+        var identity = ConnectorIdentity.Register(
+            ConnectorId.New(), scope.Tenant, scope.Project, new ConnectorPublicKeyThumbprint(new string('3', 64)),
+            "host01", "Site-A", "1.0.0", EnrollmentTokenId.New(), now);
+        await connectors.RegisterAsync(identity, CancellationToken.None);
+
+        var inventory = new FakeConnectorInventoryStore();
+        var adapter = new FakeEvInventoryAdapter(new EvInventoryProbeResult("14.2.2", true, [Archive("arch-mine")]));
+        var useCase = new SubmitInventorySnapshotUseCase(connectors, inventory, adapter, new StubClock(now));
+
+        var injected = false;
+        inventory.BeforeAppendAttempt = candidate =>
+        {
+            if (!injected && candidate.Version == 1)
+            {
+                injected = true;
+
+                // Simula OUTRO writer publicando a versão 1 com conteúdo DIFERENTE exatamente entre a
+                // leitura do latest feita pelo useCase e este append — a corrida que AB-4C-002 corrige.
+                inventory.SeedDirectly(InventorySnapshot.Create(
+                    InventorySnapshotId.New(), identity.Id, identity.Tenant, identity.Project, 1,
+                    [Archive("arch-competitor")], CorrelationId.New(), now));
+            }
+        };
+
+        var result = await useCase.ExecuteAsync(
+            new SubmitInventorySnapshotRequest(scope, identity.Id, CorrelationId.New()), CancellationToken.None);
+
+        // A mudança real (arch-mine) nunca é descartada como réplay falso: converge na próxima versão livre.
+        Assert.True(result.Created);
+        Assert.Equal(2, result.Snapshot.Version);
+        Assert.Equal("arch-mine", Assert.Single(result.Snapshot.Archives).ExternalArchiveId);
+
+        var latest = await inventory.GetLatestAsync(scope, identity.Id, CancellationToken.None);
+        Assert.Equal(2, latest!.Version);
+        Assert.Equal("arch-mine", Assert.Single(latest.Archives).ExternalArchiveId);
+
+        // Append-only: a 1ª tentativa (versão 1) colide e lança; a 2ª (versão 2) persiste — nada é reescrito.
+        Assert.Equal(2, inventory.AppendCallCount);
+    }
+
+    [Fact]
+    public async Task SubmitInventorySnapshotIdenticalConcurrentContentConvergesWithoutRetryingAsANewVersion()
+    {
+        var scope = Scope();
+        var now = DateTimeOffset.UtcNow;
+        var connectors = new FakeConnectorRegistry();
+        var identity = ConnectorIdentity.Register(
+            ConnectorId.New(), scope.Tenant, scope.Project, new ConnectorPublicKeyThumbprint(new string('4', 64)),
+            "host01", "Site-A", "1.0.0", EnrollmentTokenId.New(), now);
+        await connectors.RegisterAsync(identity, CancellationToken.None);
+
+        var inventory = new FakeConnectorInventoryStore();
+        var adapter = new FakeEvInventoryAdapter(new EvInventoryProbeResult("14.2.2", true, [Archive("arch-1")]));
+        var useCase = new SubmitInventorySnapshotUseCase(connectors, inventory, adapter, new StubClock(now));
+
+        var injected = false;
+        inventory.BeforeAppendAttempt = candidate =>
+        {
+            if (!injected && candidate.Version == 1)
+            {
+                injected = true;
+
+                // Outro writer publica a MESMA versão com o MESMO conteúdo lógico (hash igual, Id/correlação
+                // diferentes) — réplay concorrente genuíno, não uma mudança real perdida.
+                inventory.SeedDirectly(InventorySnapshot.Create(
+                    InventorySnapshotId.New(), identity.Id, identity.Tenant, identity.Project, 1,
+                    [Archive("arch-1")], CorrelationId.New(), now));
+            }
+        };
+
+        var result = await useCase.ExecuteAsync(
+            new SubmitInventorySnapshotRequest(scope, identity.Id, CorrelationId.New()), CancellationToken.None);
+
+        Assert.False(result.Created);
+        Assert.Equal(1, result.Snapshot.Version);
+        Assert.Equal("arch-1", Assert.Single(result.Snapshot.Archives).ExternalArchiveId);
+    }
+
+    [Fact]
+    public async Task SubmitInventorySnapshotFailsClosedWhenConcurrentContentionNeverConverges()
+    {
+        var scope = Scope();
+        var now = DateTimeOffset.UtcNow;
+        var connectors = new FakeConnectorRegistry();
+        var identity = ConnectorIdentity.Register(
+            ConnectorId.New(), scope.Tenant, scope.Project, new ConnectorPublicKeyThumbprint(new string('5', 64)),
+            "host01", "Site-A", "1.0.0", EnrollmentTokenId.New(), now);
+        await connectors.RegisterAsync(identity, CancellationToken.None);
+
+        var inventory = new FakeConnectorInventoryStore();
+        var adapter = new FakeEvInventoryAdapter(new EvInventoryProbeResult("14.2.2", true, [Archive("arch-mine")]));
+        var useCase = new SubmitInventorySnapshotUseCase(connectors, inventory, adapter, new StubClock(now));
+
+        // Um "writer" adversarial ocupa CADA versão candidate, sempre com conteúdo diferente do nosso —
+        // contenção que nunca converge dentro do limite de tentativas.
+        var nextCompetitorArchiveSuffix = 0;
+        inventory.BeforeAppendAttempt = candidate =>
+        {
+            nextCompetitorArchiveSuffix++;
+            inventory.SeedDirectly(InventorySnapshot.Create(
+                InventorySnapshotId.New(), identity.Id, identity.Tenant, identity.Project, candidate.Version,
+                [Archive($"arch-competitor-{nextCompetitorArchiveSuffix}")], CorrelationId.New(), now));
+        };
+
+        await Assert.ThrowsAsync<ConcurrencyException>(() => useCase.ExecuteAsync(
+            new SubmitInventorySnapshotRequest(scope, identity.Id, CorrelationId.New()), CancellationToken.None));
+    }
+
     [Fact]
     public async Task SubmitInventorySnapshotRevokedConnectorFailsClosed()
     {
@@ -383,12 +499,25 @@ internal sealed class FakeConnectorCapabilityStore : IConnectorCapabilityStore
     }
 }
 
-/// <summary>Duplo de teste da porta <see cref="IConnectorInventoryStore"/> — em memória, sem SQL.</summary>
+/// <summary>
+/// Duplo de teste da porta <see cref="IConnectorInventoryStore"/> — em memória, sem SQL. Reproduz
+/// fielmente a semântica de concorrência exigida de <c>SqlConnectorInventoryStore</c> (AB-4C-002): uma
+/// colisão de versão só converge (<c>Created=false</c>) quando o hash já persistido é IGUAL ao candidate;
+/// hash diferente lança <see cref="ConcurrencyException"/>, nunca mascara a mudança como réplay.
+/// </summary>
 internal sealed class FakeConnectorInventoryStore : IConnectorInventoryStore
 {
     private readonly List<InventorySnapshot> _snapshots = [];
 
     public int AppendCallCount { get; private set; }
+
+    /// <summary>
+    /// Hook de teste: invocado imediatamente antes de CADA tentativa de append, ainda dentro da mesma
+    /// chamada a <see cref="AppendAsync"/> — permite simular outra escrita concorrente que ocupa a versão
+    /// candidate entre a leitura do latest (pelo chamador) e este append, exercitando o retry da
+    /// Application de forma determinística (sem depender de threads reais).
+    /// </summary>
+    public Action<InventorySnapshot>? BeforeAppendAttempt { get; set; }
 
     public Task<InventorySnapshot?> GetLatestAsync(TenantScope scope, ConnectorId connector, CancellationToken cancellationToken)
     {
@@ -401,10 +530,27 @@ internal sealed class FakeConnectorInventoryStore : IConnectorInventoryStore
 
     public Task<InventorySnapshotAppendResult> AppendAsync(InventorySnapshot snapshot, CancellationToken cancellationToken)
     {
+        BeforeAppendAttempt?.Invoke(snapshot);
         AppendCallCount++;
+
+        var existing = _snapshots.FirstOrDefault(s => s.Connector == snapshot.Connector && s.Version == snapshot.Version);
+        if (existing is not null)
+        {
+            if (existing.SnapshotHash == snapshot.SnapshotHash)
+            {
+                return Task.FromResult(new InventorySnapshotAppendResult(existing, Created: false));
+            }
+
+            throw new ConcurrencyException(
+                $"Versão {snapshot.Version} já ocupada por outro snapshot com hash diferente.");
+        }
+
         _snapshots.Add(snapshot);
         return Task.FromResult(new InventorySnapshotAppendResult(snapshot, Created: true));
     }
+
+    /// <summary>Auxiliar de teste: injeta diretamente um snapshot "de outro writer", sem passar por AppendAsync/hook.</summary>
+    public void SeedDirectly(InventorySnapshot snapshot) => _snapshots.Add(snapshot);
 }
 
 /// <summary>Duplo de teste da porta <see cref="IEvInventoryAdapter"/> — determinístico, sem PowerShell.</summary>
