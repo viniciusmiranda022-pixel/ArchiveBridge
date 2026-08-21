@@ -15,7 +15,15 @@ public sealed record InventorySnapshotAppendResult(InventorySnapshot Snapshot, b
 /// </summary>
 public interface IConnectorInventoryStore
 {
-    /// <summary>Devolve o snapshot de maior versão dentro do escopo; <see langword="null"/> se nenhum existir.</summary>
+    /// <summary>
+    /// Devolve o snapshot de maior versão dentro do escopo; <see langword="null"/> se nenhum existir. A
+    /// persistência é fronteira NÃO CONFIÁVEL (AB-4C-003): uma linha cuja evidência hashada não corresponde
+    /// aos archives filhos realmente carregados falha fechado em vez de ser devolvida como canônica.
+    /// </summary>
+    /// <exception cref="ArchiveBridge.Domain.EnterpriseVault.Connector.InventorySnapshotIntegrityViolationException">
+    /// O snapshot persistido está corrompido ou adulterado (hash/archive_count divergente, ou IDs de archive
+    /// duplicados entre os filhos carregados).
+    /// </exception>
     Task<InventorySnapshot?> GetLatestAsync(TenantScope scope, ConnectorId connector, CancellationToken cancellationToken);
 
     /// <summary>

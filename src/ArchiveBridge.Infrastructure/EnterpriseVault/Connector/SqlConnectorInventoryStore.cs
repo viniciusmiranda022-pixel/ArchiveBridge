@@ -20,6 +20,12 @@ namespace ArchiveBridge.Infrastructure.EnterpriseVault.Connector;
 /// real de outro writer — <see cref="AppendAsync"/> lança <see cref="ConcurrencyException"/> em vez de
 /// mascarar a mudança perdida como réplay; a Application (<c>SubmitInventorySnapshotUseCase</c>) releé o
 /// latest e tenta de novo com a próxima versão disponível.
+/// <para>
+/// A leitura também é fronteira NÃO CONFIÁVEL (AB-4C-003): <see cref="GetLatestAsync"/> e o probe interno de
+/// conflito reidratam via <see cref="InventorySnapshot.Rehydrate"/>, que recomputa o hash a partir dos
+/// archives filhos REALMENTE carregados e valida <c>archive_count</c> contra essa mesma quantidade —
+/// nenhuma linha corrompida ou adulterada é devolvida como snapshot canônico.
+/// </para>
 /// </summary>
 public sealed class SqlConnectorInventoryStore(TenantConnectionFactory connectionFactory) : IConnectorInventoryStore
 {
@@ -83,7 +89,7 @@ public sealed class SqlConnectorInventoryStore(TenantConnectionFactory connectio
         var archives = await ReadArchivesAsync(tenant.Connection, null, header.Value.Id, cancellationToken).ConfigureAwait(false);
         return InventorySnapshot.Rehydrate(
             header.Value.Id, header.Value.Connector, header.Value.Tenant, header.Value.Project, header.Value.Version,
-            header.Value.SnapshotHash, archives, header.Value.Correlation, header.Value.CollectedAtUtc);
+            header.Value.SnapshotHash, header.Value.ArchiveCount, archives, header.Value.Correlation, header.Value.CollectedAtUtc);
     }
 
     /// <inheritdoc />
@@ -185,7 +191,7 @@ public sealed class SqlConnectorInventoryStore(TenantConnectionFactory connectio
         var archives = await ReadArchivesAsync(tenant.Connection, null, header.Value.Id, cancellationToken).ConfigureAwait(false);
         return InventorySnapshot.Rehydrate(
             header.Value.Id, header.Value.Connector, header.Value.Tenant, header.Value.Project, header.Value.Version,
-            header.Value.SnapshotHash, archives, header.Value.Correlation, header.Value.CollectedAtUtc);
+            header.Value.SnapshotHash, header.Value.ArchiveCount, archives, header.Value.Correlation, header.Value.CollectedAtUtc);
     }
 
     private static async Task<SnapshotHeader?> ReadSnapshotHeaderAsync(SqlCommand command, CancellationToken cancellationToken)

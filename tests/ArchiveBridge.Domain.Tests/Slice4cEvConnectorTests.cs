@@ -310,6 +310,71 @@ public sealed class Slice4cEvConnectorTests
         Assert.Equal(64, snapshot.SnapshotHash.Value.Length);
     }
 
+    // ---- InventorySnapshot.Rehydrate — a persistência é fronteira NÃO CONFIÁVEL (AB-4C-003) -----------
+
+    [Fact]
+    public void RehydrateOfAnUntamperedSnapshotRoundTripsExactlyAsCreated()
+    {
+        var created = InventorySnapshot.Create(
+            InventorySnapshotId.New(), ConnectorId.New(), Tenant, Project, 3,
+            [Archive("arch-2"), Archive("arch-1")], CorrelationId.New(), DateTimeOffset.UtcNow);
+
+        var rehydrated = InventorySnapshot.Rehydrate(
+            created.Id, created.Connector, created.Tenant, created.Project, created.Version,
+            created.SnapshotHash, created.Archives.Count, created.Archives, created.Correlation, created.CollectedAtUtc);
+
+        Assert.Equal(created.SnapshotHash, rehydrated.SnapshotHash);
+        Assert.Equal(created.Version, rehydrated.Version);
+        Assert.Equal(created.Id, rehydrated.Id);
+        Assert.Equal(["arch-1", "arch-2"], rehydrated.Archives.Select(a => a.ExternalArchiveId));
+    }
+
+    [Fact]
+    public void RehydrateFailsClosedWhenStoredHashDoesNotMatchTheLoadedChildren()
+    {
+        var created = InventorySnapshot.Create(
+            InventorySnapshotId.New(), ConnectorId.New(), Tenant, Project, 1,
+            [Archive("arch-1")], CorrelationId.New(), DateTimeOffset.UtcNow);
+        var forgedHash = DeterministicHash.Compute(["not-the-real-snapshot-hash"]);
+
+        Assert.Throws<InventorySnapshotIntegrityViolationException>(() => InventorySnapshot.Rehydrate(
+            created.Id, created.Connector, created.Tenant, created.Project, created.Version,
+            forgedHash, created.Archives.Count, created.Archives, created.Correlation, created.CollectedAtUtc));
+    }
+
+    [Fact]
+    public void RehydrateFailsClosedWhenArchiveCountDoesNotMatchTheLoadedChildren()
+    {
+        var created = InventorySnapshot.Create(
+            InventorySnapshotId.New(), ConnectorId.New(), Tenant, Project, 1,
+            [Archive("arch-1")], CorrelationId.New(), DateTimeOffset.UtcNow);
+
+        // O header persistido diz 2, mas só 1 filho foi realmente carregado (ex.: filho removido por fora).
+        Assert.Throws<InventorySnapshotIntegrityViolationException>(() => InventorySnapshot.Rehydrate(
+            created.Id, created.Connector, created.Tenant, created.Project, created.Version,
+            created.SnapshotHash, archiveCount: 2, created.Archives, created.Correlation, created.CollectedAtUtc));
+    }
+
+    [Fact]
+    public void RehydrateFailsClosedOnDuplicateExternalArchiveIdsAmongLoadedChildren()
+    {
+        var duplicated = new[] { Archive("arch-1"), Archive("arch-1") };
+
+        Assert.Throws<InventorySnapshotIntegrityViolationException>(() => InventorySnapshot.Rehydrate(
+            InventorySnapshotId.New(), ConnectorId.New(), Tenant, Project, 1,
+            InventorySnapshot.ComputeHash(duplicated), duplicated.Length, duplicated, CorrelationId.New(), DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public void RehydrateFailsClosedOnNonPositivePersistedVersion()
+    {
+        var archives = new[] { Archive("arch-1") };
+
+        Assert.Throws<InventorySnapshotIntegrityViolationException>(() => InventorySnapshot.Rehydrate(
+            InventorySnapshotId.New(), ConnectorId.New(), Tenant, Project, version: 0,
+            InventorySnapshot.ComputeHash(archives), archives.Length, archives, CorrelationId.New(), DateTimeOffset.UtcNow));
+    }
+
     // ---- ExportRequestPolicy / ExportRequest (STOP-THE-LINE — nunca executado, AB-4C-001 crit. 10) -
 
     [Theory]

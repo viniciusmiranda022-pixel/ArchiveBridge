@@ -68,6 +68,16 @@ qualquer escrita, se o resultado é idêntico ao último snapshot persistido —
 linha nova (`InventorySnapshotAppendResult.Created == false`) — ou se representa mudança real, gerando uma
 nova versão sem jamais reescrever a evidência anterior.
 
+**Leitura/reidratação como fronteira NÃO CONFIÁVEL (AB-4C-003)**: `InventorySnapshot.Rehydrate` (mesmo
+padrão de `PartitionPlan.Rehydrate`, Slice 4B) reaplica o MESMO caminho de canonicalização/deduplicação de
+`Create` sobre os archives filhos REALMENTE carregados, valida `archive_count` do header contra a
+quantidade real de filhos (antes um campo persistido e nunca conferido) e recomputa `ComputeHash`
+comparando-o com o `snapshot_hash` gravado. Uma linha adulterada ou corrompida — filho alterado/removido,
+`snapshot_hash` forjado, `archive_count` divergente — nunca é devolvida como snapshot canônico:
+`SqlConnectorInventoryStore.GetLatestAsync` lança `InventorySnapshotIntegrityViolationException`, e o réplay
+idempotente do caso de uso (que releé exatamente esse latest) falha fechado pelo mesmo motivo, em vez de
+classificar incorretamente a corrupção como réplay idêntico ou perder a evidência em silêncio.
+
 ## Política de exportação — validada, nunca executada (AB-4C-001 itens 9-11)
 
 `ExportRequestPolicy` valida os limites documentados do cmdlet `Export-EVArchive` (§16.3): `MaxPstSizeMb`
@@ -154,6 +164,22 @@ em `ev_connector_enrollment_tokens` (ver [Idempotência, concorrência e órfão
   convergir) — nenhuma mudança real é descartada em silêncio, comprovado sob corrida real contra SQL Server
   (`ConcurrentSubmissionsOfDifferentInventoriesFromTheSameLatestBothPersistAtDistinctVersions`,
   `ConcurrentSubmissionsOfIdenticalInventoriesConvergeToASingleLogicalSnapshot`).
+- **Evidência de inventário persistida adulterada/corrompida (AB-4C-003)**: a corrida entre writers
+  (AB-4C-002) protege quem ESCREVE; nada garantia, até então, que quem LÊ de volta obtinha exatamente o que
+  foi gravado — `archive_count` era um campo persistido nunca conferido. `InventorySnapshot.Rehydrate`
+  passou a reaplicar o mesmo caminho de canonicalização/deduplicação de `Create` sobre os archives filhos
+  REALMENTE carregados, validar `archive_count` contra essa quantidade e recomputar `ComputeHash`
+  comparando-o com o `snapshot_hash` gravado. Filho alterado/removido, hash forjado ou contagem divergente
+  — qualquer um desses cenários faz `SqlConnectorInventoryStore.GetLatestAsync` e o réplay idempotente do
+  caso de uso falharem fechado com `InventorySnapshotIntegrityViolationException`, comprovado sob SQL Server
+  real corrompendo a linha por fora da aplicação (identidade administrativa; `ab_app_role` só tem
+  `SELECT`/`INSERT` nestas tabelas):
+  `GetLatestFailsClosedWhenPersistedArchiveCountDivergesFromLoadedChildren`,
+  `GetLatestFailsClosedWhenAChildArchiveIsRemovedButTheStoredHashAndCountStayStale`,
+  `GetLatestFailsClosedWhenAChildArchiveIsAlteredButTheStoredHashAndCountStayStale`,
+  `GetLatestFailsClosedWhenTheStoredSnapshotHashIsForgedButChildrenStayIntact`. Um snapshot íntegro continua
+  round-trip normalmente (`GetLatestOfAnUntamperedSnapshotStillRoundTripsAfterTheIntegrityChecksWereAdded`),
+  e a concorrência do AB-4C-002 permanece verde sem alteração.
 
 ## Segurança e minimização de PII (delta sobre o Passo 3 do Slice 4B)
 
@@ -189,14 +215,14 @@ connector (mTLS/workload identity, §15.1 item 25) ficam para um Passo futuro �
 | 3 | Enrollment/registro inválido, replay, tenant mismatch ou identity mismatch falha fechado | `RegisterConnectorMalformedSecretIsIndistinguishableFromUnknownToken`, `RegisterConnectorUnknownSecretThrowsNotFound` |
 | 4 | Capability discovery incompatível impede export capability com diagnóstico estruturado | `HandshakeWithUnknownVersionBlocksExportWithSchemaUnknownDiagnostic`, `HandshakeWithCompatibleFamilyButNoSnapinBlocksExport` |
 | 5 | Inventory adapter atrás de interface; Domain/Application sem tipos PowerShell/EV/vendor | `IEvInventoryAdapter` (Contracts, sem dependência de vendor); `VendorBoundaryTests`/`DependencyRuleTests` inalterados |
-| 6 | Snapshot determinístico, hashado, scoped e versionado; replay não duplica | `HashIsDeterministicRegardlessOfInputOrder`, `SubmitInventorySnapshotIdenticalResubmissionIsAnIdempotentReplayWithoutANewRow` |
+| 6 | Snapshot determinístico, hashado, scoped e versionado; replay não duplica; leitura falha fechado sobre evidência persistida adulterada/corrompida (AB-4C-003) | `HashIsDeterministicRegardlessOfInputOrder`, `SubmitInventorySnapshotIdenticalResubmissionIsAnIdempotentReplayWithoutANewRow`, `RehydrateFailsClosedWhenStoredHashDoesNotMatchTheLoadedChildren`, `RehydrateFailsClosedWhenArchiveCountDoesNotMatchTheLoadedChildren`, `GetLatestFailsClosedWhenTheStoredSnapshotHashIsForgedButChildrenStayIntact`, `GetLatestFailsClosedWhenAChildArchiveIsRemovedButTheStoredHashAndCountStayStale` |
 | 7 | Mudança real gera nova versão sem reescrever evidência anterior | `SubmitInventorySnapshotChangedArchivesCreatesANewVersionWithoutRewritingThePrevious`, `GetLatestReturnsTheHighestVersionAcrossMultipleSnapshots` |
 | 8 | Nenhum path/credential/token/PII/conteúdo de item em logs/evidência | `InventoryArchiveRecord` (campos fechados, sanitizados); ver [Segurança e minimização de PII](#segurança-e-minimização-de-pii-delta-sobre-o-passo-3-do-slice-4b) |
 | 9 | Desenho outbound-only; nenhum SMB/inbound Control Plane → EV introduzido | Nenhum novo endpoint/porta inbound; `IEvInventoryAdapter` roda perto do dado (contrato) |
 | 10 | ExportRequest/Policy valida limites; nenhum export real ocorre | `CreateRejectsLimitsOutsideTheDocumentedEnvelope`, `CreateAcceptsTheDocumentedBoundaryValues`, `DefaultPolicyMatchesTheRunbookDefaults` |
 | 11 | Cross-tenant/cross-project/forged connector negados sem revelar existência | `GetFromAnotherProjectIsIndistinguishableFromNotFound`, `RevokingATokenFromTheWrongProjectIsIndistinguishableFromNotFound`, `InventoryIsIsolatedAcrossProjectsOfTheSameTenant` |
 | 12 | Migrations anteriores byte-for-byte; novas migrations passam hash/determinismo e least-privilege | `MigrationHashTests.Migration0023AppliesCleanlyAndPriorHashesRemainStable` |
-| 13 | CI completo verde no HEAD final | `dotnet test` (572/572), `dotnet format --verify-no-changes`, SCA, `git diff --check` |
+| 13 | CI completo verde no HEAD final | `dotnet test` (1148/1148), `dotnet format --verify-no-changes`, SCA, `git diff --check` |
 
 ## Fora do escopo — STOP-THE-LINE
 

@@ -1,3 +1,4 @@
+using System.Data;
 using ArchiveBridge.Application.EnterpriseVault.Connector;
 using ArchiveBridge.Contracts.EnterpriseVault.Connector;
 using ArchiveBridge.Contracts.Jobs;
@@ -372,6 +373,152 @@ public sealed class Slice4cEvConnectorTests(SqlServerFixture fixture)
         var latest = await Inventory.GetLatestAsync(otherProjectScope, identity.Id, CancellationToken.None);
 
         Assert.Null(latest);
+    }
+
+    // ---- InventorySnapshot: a persistência é fronteira NÃO CONFIÁVEL (AB-4C-003) ----------------------
+    //
+    // Cada cenário abaixo persiste um snapshot válido pela aplicação e então o corrompe POR FORA (via a
+    // identidade administrativa, nunca pela aplicação — ab_app só tem SELECT/INSERT nestas tabelas), de um
+    // jeito que nenhum CHECK row-local consegue recusar. Reidratar (GetLatestAsync) e o réplay idempotente
+    // do caso de uso (que releé exatamente o mesmo latest) têm de falhar fechado, nunca devolver a linha
+    // corrompida como snapshot canônico.
+
+    private async Task<InventorySnapshotAppendResult> SeedBaselineSnapshotAsync(
+        TenantScope scope, ConnectorId connector, DateTimeOffset now, params string[] archiveIds)
+    {
+        var archives = archiveIds
+            .Select(id => new InventoryArchiveRecord(id, "Mailbox", "VaultStore-1", InventoryArchiveStatus.Active, ["EV_POWERSHELL_AVAILABLE"]))
+            .ToArray();
+        var snapshot = InventorySnapshot.Create(
+            InventorySnapshotId.New(), connector, scope.Tenant, scope.Project, 1, archives, CorrelationId.New(), now);
+        return await Inventory.AppendAsync(snapshot, CancellationToken.None);
+    }
+
+    private async Task ExecuteAdminSqlAsync(TenantScope scope, string sql, params (string Name, object Value)[] parameters)
+    {
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+        await using (var context = new SqlCommand(
+            "EXEC sys.sp_set_session_context @key = N'tenant_id', @value = @tenant;", connection))
+        {
+            context.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+            await context.ExecuteNonQueryAsync();
+        }
+
+        await using var command = new SqlCommand(sql, connection);
+        foreach (var (name, value) in parameters)
+        {
+            command.Parameters.AddWithValue(name, value);
+        }
+
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>Prova que a leitura e o réplay idempotente falham fechado contra o snapshot corrompido informado.</summary>
+    private async Task AssertCorruptSnapshotFailsClosedAsync(TenantScope scope, ConnectorId connector, DateTimeOffset now)
+    {
+        await Assert.ThrowsAsync<InventorySnapshotIntegrityViolationException>(
+            () => Inventory.GetLatestAsync(scope, connector, CancellationToken.None));
+
+        // O réplay do caso de uso releé exatamente o mesmo latest corrompido — também tem de falhar fechado,
+        // nunca gravar uma segunda versão por cima nem devolver o conteúdo corrompido como convergido.
+        var useCase = new SubmitInventorySnapshotUseCase(
+            Connectors, Inventory,
+            new StubEvInventoryAdapter(new EvInventoryProbeResult("14.2.2", true, [ArchiveRecord("arch-replay-probe")])),
+            new MutableClock(now));
+        await Assert.ThrowsAsync<InventorySnapshotIntegrityViolationException>(() => useCase.ExecuteAsync(
+            new SubmitInventorySnapshotRequest(scope, connector, CorrelationId.New()), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetLatestFailsClosedWhenPersistedArchiveCountDivergesFromLoadedChildren()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('7', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+        var seeded = await SeedBaselineSnapshotAsync(scope, identity.Id, now, "arch-1");
+
+        // O header persistido passa a afirmar 2 archives — nenhum CHECK row-local consegue recusar isto,
+        // só um único filho realmente existe. archive_count deixa de ser dado morto.
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.ev_connector_inventory_snapshots SET archive_count = 2 WHERE snapshot_id = @snapshot;",
+            ("@snapshot", seeded.Snapshot.Id.Value));
+
+        await AssertCorruptSnapshotFailsClosedAsync(scope, identity.Id, now);
+    }
+
+    [Fact]
+    public async Task GetLatestFailsClosedWhenAChildArchiveIsRemovedButTheStoredHashAndCountStayStale()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('8', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+        var seeded = await SeedBaselineSnapshotAsync(scope, identity.Id, now, "arch-1", "arch-2");
+
+        // Um dos dois filhos é removido por fora — snapshot_hash e archive_count do header continuam
+        // afirmando os DOIS archives originais.
+        await ExecuteAdminSqlAsync(
+            scope,
+            "DELETE FROM dbo.ev_connector_inventory_archives WHERE snapshot_id = @snapshot AND external_archive_id = @external;",
+            ("@snapshot", seeded.Snapshot.Id.Value), ("@external", "arch-2"));
+
+        await AssertCorruptSnapshotFailsClosedAsync(scope, identity.Id, now);
+    }
+
+    [Fact]
+    public async Task GetLatestFailsClosedWhenAChildArchiveIsAlteredButTheStoredHashAndCountStayStale()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('9', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+        var seeded = await SeedBaselineSnapshotAsync(scope, identity.Id, now, "arch-1");
+
+        // O único filho é alterado por fora (status muda de Active=1 para Inactive=2) — archive_count
+        // continua batendo (ainda 1 filho), só o CONTEÚDO diverge do que o snapshot_hash gravado afirma.
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.ev_connector_inventory_archives SET status = 2 WHERE snapshot_id = @snapshot AND external_archive_id = @external;",
+            ("@snapshot", seeded.Snapshot.Id.Value), ("@external", "arch-1"));
+
+        await AssertCorruptSnapshotFailsClosedAsync(scope, identity.Id, now);
+    }
+
+    [Fact]
+    public async Task GetLatestFailsClosedWhenTheStoredSnapshotHashIsForgedButChildrenStayIntact()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('0', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+        var seeded = await SeedBaselineSnapshotAsync(scope, identity.Id, now, "arch-1");
+
+        // Os filhos permanecem exatamente como gravados — só o snapshot_hash do header é forjado.
+        var forgedHash = DeterministicHash.Compute(["not-the-real-snapshot-hash"]);
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.ev_connector_inventory_snapshots SET snapshot_hash = @hash WHERE snapshot_id = @snapshot;",
+            ("@hash", forgedHash.Value), ("@snapshot", seeded.Snapshot.Id.Value));
+
+        await AssertCorruptSnapshotFailsClosedAsync(scope, identity.Id, now);
+    }
+
+    [Fact]
+    public async Task GetLatestOfAnUntamperedSnapshotStillRoundTripsAfterTheIntegrityChecksWereAdded()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var now = DateTimeOffset.UtcNow;
+        var identity = NewIdentity(scope, new ConnectorPublicKeyThumbprint(new string('c', 64)), now);
+        await Connectors.RegisterAsync(identity, CancellationToken.None);
+        var seeded = await SeedBaselineSnapshotAsync(scope, identity.Id, now, "arch-2", "arch-1");
+
+        var latest = await Inventory.GetLatestAsync(scope, identity.Id, CancellationToken.None);
+
+        Assert.Equal(seeded.Snapshot.SnapshotHash, latest!.SnapshotHash);
+        Assert.Equal(["arch-1", "arch-2"], latest.Archives.Select(a => a.ExternalArchiveId));
     }
 }
 
