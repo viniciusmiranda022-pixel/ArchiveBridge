@@ -120,6 +120,93 @@ public sealed class PlanningHeartbeatTests
         Assert.Equal(afterThrow, leases.Calls); // o laço parou junto com a operação
     }
 
+    // ---- Renovação ADICIONAL (AB-4C-007 blocker 1 item 4: throttle lease sob o MESMO batimento) ---------
+
+    [Fact]
+    public async Task AdditionalRenewSucceedsAlongsideJobRenewalAndBothAreCalledTheSameNumberOfTimes()
+    {
+        var leases = new CountingLeaseManager(JobCommandOutcome.Applied);
+        var heartbeat = new PlanningHeartbeat(leases);
+        var additionalCalls = 0;
+
+        var result = await heartbeat.RunWhileAsync(
+            Lease,
+            TimeSpan.FromMilliseconds(40),
+            async token => await Task.Delay(TimeSpan.FromMilliseconds(300), token),
+            CancellationToken.None,
+            onBeatAsync: _ => { Interlocked.Increment(ref additionalCalls); return Task.FromResult(true); });
+
+        Assert.False(result.Lost);
+        Assert.True(result.Renewals >= 2, $"esperado ≥2 renovações; contou {result.Renewals}.");
+        Assert.Equal(result.Renewals, leases.Calls);
+        Assert.Equal(result.Renewals, additionalCalls); // a renovação adicional acompanha CADA batimento do Job.
+    }
+
+    [Fact]
+    public async Task AdditionalRenewFailureCancelsOperationAndReportsLostEvenWhenTheJobLeaseIsFine()
+    {
+        var leases = new CountingLeaseManager(JobCommandOutcome.Applied);
+        var heartbeat = new PlanningHeartbeat(leases);
+        var effectApplied = false;
+
+        var result = await heartbeat.RunWhileAsync(
+            Lease,
+            TimeSpan.FromMilliseconds(40),
+            async token =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(30), token); // longa: será CANCELADA pela perda do lease adicional
+                effectApplied = true;                               // NÃO deve ocorrer
+            },
+            CancellationToken.None,
+            onBeatAsync: _ => Task.FromResult(false)); // recurso adicional (ex.: throttle) já perdido.
+
+        Assert.True(result.Lost);
+        Assert.Equal(JobCommandOutcome.Applied, result.LastOutcome); // o lease do Job em si nunca falhou.
+        Assert.False(effectApplied);
+    }
+
+    [Fact]
+    public async Task AdditionalRenewExceptionIsFailClosed()
+    {
+        var leases = new CountingLeaseManager(JobCommandOutcome.Applied);
+        var heartbeat = new PlanningHeartbeat(leases);
+        var effectApplied = false;
+
+        var result = await heartbeat.RunWhileAsync(
+            Lease,
+            TimeSpan.FromMilliseconds(40),
+            async token =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(30), token);
+                effectApplied = true;
+            },
+            CancellationToken.None,
+            onBeatAsync: Task<bool> (_) => throw new InvalidOperationException("falha transitória ao renovar o recurso adicional"));
+
+        Assert.True(result.Lost);
+        Assert.False(effectApplied);
+    }
+
+    [Fact]
+    public async Task AdditionalRenewIsNeverInvokedWhenTheJobLeaseItselfIsAlreadyLost()
+    {
+        // Perde o cercamento do Job na 1ª renovação — a adicional NUNCA deve ser tentada (o Job já não
+        // está mais sob controle, então não há sentido em renovar um recurso subordinado a ele).
+        var leases = new CountingLeaseManager(JobCommandOutcome.FencedOut);
+        var heartbeat = new PlanningHeartbeat(leases);
+        var additionalCalls = 0;
+
+        var result = await heartbeat.RunWhileAsync(
+            Lease,
+            TimeSpan.FromMilliseconds(40),
+            async token => await Task.Delay(TimeSpan.FromSeconds(30), token),
+            CancellationToken.None,
+            onBeatAsync: _ => { Interlocked.Increment(ref additionalCalls); return Task.FromResult(true); });
+
+        Assert.True(result.Lost);
+        Assert.Equal(0, additionalCalls);
+    }
+
     private sealed class CountingLeaseManager(params JobCommandOutcome[] outcomes) : IJobLeaseManager
     {
         private int _calls;

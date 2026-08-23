@@ -4,6 +4,20 @@ Operação do Source Connector com adapters multiversão
 ([ADR-0013](../adr/0013-exportacao-ev-multiversao.md)). Complementa os
 runbooks operacionais gerais do runbook de engenharia (§42).
 
+> [!NOTE]
+> **Status de implementação (2026-08).** Este documento descreve o desenho ALVO completo do conector de
+> exportação. O que está REALMENTE implementado hoje: enrollment/identidade/capability handshake/inventário
+> (Slice 4C Passo 1, AB-4C-001) e a fundação de EXECUÇÃO — comando `Export-EVArchive` construído por API
+> segura (sem command injection), throttling exclusivo por connector/archive, idempotência por identidade
+> canônica do pedido, captura estruturada de resultado, manifesto canônico com hash/tamanho por output,
+> revalidação de replay fail-closed e classificação de itens oversized (Slice 4C Passo 2, AB-4C-005; delta
+> de ameaças em [`threat-model-slice-04c.md`](../security/threat-model-slice-04c.md)). O que permanece
+> FORA de escopo (STOP-THE-LINE, nenhum código no repositório): execução contra um Enterprise Vault real de
+> cliente, automação Outlook/COM, NATIVE/EML real, delta/freeze operacional real, descomissionamento EV,
+> AzCopy/Azure staging/SAS, Purview/Graph/Exchange Online/import job e reconciliação M365 — as seções
+> abaixo (modo assistido, `ExportRequestId` operacional completo, `GetProgress`, retry automático de onda)
+> descrevem esse alvo e ainda não correspondem a código executável.
+
 ## Instalação
 
 1. Instalar o Source Connector no host indicado do ambiente do cliente
