@@ -154,13 +154,13 @@ public sealed class Slice5PurviewIntegrationTests(SqlServerFixture fixture)
     {
         var scope = SqlServerFixture.NewScope();
         var mailbox = ResolvedMailbox("user04@contoso.com");
-        var adapter = new StubMailboxPrecheckAdapter(ValidObservation());
+        var adapter = new StubMailboxPrecheckAdapter(ValidObservation(status: MailboxArchiveStatus.Disabled));
         var useCase = new SubmitMailboxPrecheckUseCase(PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
         var result = await useCase.ExecuteAsync(new SubmitMailboxPrecheckRequest(scope, mailbox, CorrelationId.New()), CancellationToken.None);
 
         await ExecuteAdminSqlAsync(
             scope,
-            "UPDATE dbo.purview_mailbox_prechecks SET archive_status = 3 WHERE snapshot_id = @id;", // Active forjado
+            "UPDATE dbo.purview_mailbox_prechecks SET archive_status = 3 WHERE snapshot_id = @id;", // Disabled (2) forjado para Active (3)
             ("@id", result.Snapshot.Id.Value));
 
         await Assert.ThrowsAsync<MailboxPrecheckIntegrityViolationException>(
