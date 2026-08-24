@@ -37,3 +37,33 @@ public sealed class PurviewValidationException : Exception
     {
     }
 }
+
+/// <summary>
+/// Um <see cref="PurviewSasUploadHandle"/> persistido não corresponde ao seu próprio <c>handle_hash</c> —
+/// mesma fronteira NÃO CONFIÁVEL de <see cref="CapabilityEvidenceIntegrityViolationException"/>. Nunca
+/// lançada por <see cref="PurviewSasUploadHandle.Intake"/>, apenas por <see cref="PurviewSasUploadHandle.Rehydrate"/>
+/// (AB-I5-004 item 8).
+/// </summary>
+public sealed class PurviewSasHandleIntegrityViolationException : Exception
+{
+    /// <summary>Cria a exceção com mensagem.</summary>
+    public PurviewSasHandleIntegrityViolationException(string message)
+        : base(message)
+    {
+    }
+}
+
+/// <summary>
+/// Transição de ciclo de vida do SAS fora da ordem determinística permitida (AB-I5-004 item 9, revisado
+/// por AB-I5-006 item 2) — <c>Stored -&gt; Available -&gt; Claimed -&gt; Consumed | Expired -&gt; Destroyed</c>.
+/// Também lançada quando uma finalização/reclaim viola o fencing por época (owner reassumido tentando
+/// finalizar com uma época antiga, ou reclaim de um lease ainda ativo). Nunca inclui o valor do segredo.
+/// </summary>
+public sealed class PurviewSasLifecycleException : Exception
+{
+    /// <summary>Cria a exceção com mensagem.</summary>
+    public PurviewSasLifecycleException(string message)
+        : base(message)
+    {
+    }
+}
