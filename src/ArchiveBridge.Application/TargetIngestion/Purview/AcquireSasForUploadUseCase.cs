@@ -163,9 +163,11 @@ public sealed class AcquireSasForUploadUseCase
         // Finaliza SOMENTE depois da leitura bem-sucedida do secret store (item 2), sob a MESMA época do
         // claim que fizemos acima (fencing): se outro adquirente já reivindicou este handle por reclaim
         // entre a aquisição do segredo e este ponto (janela mínima, sem I/O de rede entre as duas chamadas),
-        // a finalização falha por row_version divergente — o segredo já lido por ESTE requester não é
-        // "desfeito" (o caller decide o que fazer com uma leitura já concretizada), mas o handle nunca é
-        // deixado apontando para um estado que este requester não detém mais.
+        // a finalização falha por row_version divergente. AB-I5-007: isso NUNCA é best-effort — o segredo já
+        // lido por ESTE requester NUNCA é devolvido ao caller a menos que a transição Claimed -&gt; Consumed
+        // sob a MESMA época seja persistida com sucesso (prova, no momento da entrega, de que este requester
+        // ainda é o titular do claim). Um requester que perdeu o fencing falha fechado — a leitura já
+        // concretizada do secret store nunca chega ao caller.
         try
         {
             await _handles.SaveTransitionAsync(claimed.FinalizeClaim(request.Requester, claimed.ClaimEpoch, now), cancellationToken)
@@ -173,8 +175,11 @@ public sealed class AcquireSasForUploadUseCase
         }
         catch (ConcurrencyException)
         {
-            // Corrida residual e extremamente estreita (ver comentário acima) — best-effort: não bloqueia a
-            // entrega do segredo já lida com sucesso por este requester.
+            // Outro adquirente já reclamou este handle (owner/época rotacionados) antes desta finalização —
+            // este requester perdeu o fencing. Fail-closed: o segredo já lido NUNCA é retornado. O claim
+            // agora pertence ao novo owner/época; nenhuma ação de compensação é necessária aqui (nenhuma
+            // transição foi persistida por este requester).
+            throw new PurviewSasAcquisitionDeniedException(DenialMessage);
         }
 
         return secret;

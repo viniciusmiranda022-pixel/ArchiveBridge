@@ -404,6 +404,144 @@ public sealed class Slice5PurviewSasUseCaseTests
         Assert.True(handle.ClaimExpiresAtUtc <= handle.ExpiresAtUtc);
     }
 
+    // ---- AcquireSasForUploadUseCase: finalize fail-closed sob perda de fencing (AB-I5-007) -----------
+
+    [Fact]
+    public async Task AFinalizeClaimLostToAConcurrentReclaimNeverReturnsTheSecretToTheStaleClaimant()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(ValidSasUri(scope)), CorrelationId.New()), CancellationToken.None);
+
+        // Simula: entre a leitura bem-sucedida do secret store e a persistência de FinalizeClaim, o lease
+        // titular expira e outro processo com a MESMA identidade autorizada já reivindicou por Reclaim —
+        // rotacionando owner/época antes desta finalização tentar persistir.
+        var saveAttempts = 0;
+        handles.BeforeSaveTransitionAttempt = () =>
+        {
+            saveAttempts++;
+            if (saveAttempts == 2) // a 1ª tentativa é o Claim inicial; a 2ª é sempre a finalização
+            {
+                var stolen = handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None).GetAwaiter().GetResult();
+                handles.SeedDirectly(stolen!.Reclaim(WorkloadIdentities.UploadWorker, Now.AddMinutes(10), Now.AddMinutes(6)));
+            }
+        };
+
+        var useCase = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now));
+        await Assert.ThrowsAsync<PurviewSasAcquisitionDeniedException>(() => useCase.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        // O secret store FOI lido com sucesso pelo requester perdedor (o texto claro já tinha sido revelado
+        // internamente) — mas ele NUNCA chega a sair do use case: fail-closed, sem entrega dupla observável.
+        Assert.Equal(1, secrets.AcquireCallCount);
+        var handle = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, handle!.State); // permanece sob o owner/época do reclaim simulado, nunca Consumed
+    }
+
+    [Fact]
+    public async Task OnlyTheClaimantThatPersistsConsumedReceivesTheSecret()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        var rawSas = ValidSasUri(scope);
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(rawSas), CorrelationId.New()), CancellationToken.None);
+
+        var saveAttempts = 0;
+        handles.BeforeSaveTransitionAttempt = () =>
+        {
+            saveAttempts++;
+            if (saveAttempts == 2)
+            {
+                var stolen = handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None).GetAwaiter().GetResult();
+                handles.SeedDirectly(stolen!.Reclaim(WorkloadIdentities.UploadWorker, Now.AddMinutes(10), Now.AddMinutes(6)));
+            }
+        };
+
+        var loser = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now));
+        await Assert.ThrowsAsync<PurviewSasAcquisitionDeniedException>(() => loser.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        // Depois que o lease do "ladrão" simulado também expira, o próximo adquirente legítimo reclama e
+        // finaliza com sucesso — é o ÚNICO que efetivamente sai do use case com o segredo em mãos.
+        var winner = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now.AddMinutes(11)));
+        var acquired = await winner.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None);
+
+        Assert.Equal(rawSas, acquired.Reveal());
+        Assert.Equal(2, secrets.AcquireCallCount); // uma leitura pelo perdedor (nunca entregue) + uma pelo vencedor
+        var handle = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Consumed, handle!.State);
+    }
+
+    [Fact]
+    public async Task AStaleRowVersionAtFinalizeIsNeverTreatedAsASuccessfulDelivery()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(ValidSasUri(scope)), CorrelationId.New()), CancellationToken.None);
+
+        var available = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        var claimed = await handles.SaveTransitionAsync(
+            available!.Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now), CancellationToken.None);
+
+        // Outro processo reivindica novamente APÓS o lease expirar (avança o row_version/época) antes desta
+        // finalização persistir — a versão de linha que 'claimed' carrega em mãos agora está obsoleta.
+        await handles.SaveTransitionAsync(
+            claimed.Reclaim(WorkloadIdentities.UploadWorker, Now.AddMinutes(20), Now.AddMinutes(6)), CancellationToken.None);
+
+        var staleFinalize = claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Now.AddMinutes(1));
+        await Assert.ThrowsAsync<ConcurrencyException>(() => handles.SaveTransitionAsync(staleFinalize, CancellationToken.None));
+
+        var current = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, current!.State); // nunca Consumed por uma finalização com row_version obsoleto
+    }
+
+    [Fact]
+    public async Task CancellationOrFailureBeforeFinalizeRemainsRecoverableByReclaimWithoutDoubleDelivery()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        var rawSas = ValidSasUri(scope);
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(rawSas), CorrelationId.New()), CancellationToken.None);
+
+        var leaseDuration = TimeSpan.FromMinutes(5);
+        secrets.FailNextAcquireWith = () => new OperationCanceledException("Cancelamento simulado antes da finalização.");
+        var cancelledAttempt = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now), leaseDuration);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => cancelledAttempt.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        // Claim ainda ATIVO (nem finalizado nem liberado) — nunca queima a geração.
+        var afterCancellation = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, afterCancellation!.State);
+
+        // Depois do lease expirar: reclaim recupera e entrega o segredo com sucesso.
+        var recovered = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now.AddMinutes(6)), leaseDuration);
+        var acquired = await recovered.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None);
+        Assert.Equal(rawSas, acquired.Reveal());
+
+        // Nenhuma entrega dupla: uma nova tentativa sobre a mesma geração (já Consumed) é recusada.
+        await Assert.ThrowsAsync<PurviewSasAcquisitionDeniedException>(() => recovered.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+        Assert.Equal(2, secrets.AcquireCallCount);
+    }
+
     [Fact]
     public void ConstructingWithANonPositiveClaimLeaseDurationThrows()
     {

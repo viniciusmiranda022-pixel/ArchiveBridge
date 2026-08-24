@@ -196,14 +196,29 @@ Comprovado por `ClaimIncrementsTheEpochEachTimeItIsReivindicated`, `FinalizeClai
 `FinalizeClaimAfterAcquisitionPersistsAsConsumed`, `ClaimWithAStaleRowVersionFailsClosed`,
 `GetCanonicalFailsClosedWhenTheClaimOwnerIsTamperedDirectlyInTheRow` (Integration).
 
-**Risco residual aceito**: o fencing por época impede que um titular reassumido (`Reclaim`) finalize com a
-época antiga, mas não pode impedir uma corrida EXTREMAMENTE estreita em que o titular original lê o segredo
-com sucesso exatamente no instante em que seu lease expira e é reassumido por outro adquirente — uma
-propriedade inerente a qualquer esquema de lease por TTL sem heartbeat síncrono (o mesmo tradeoff aceito por
-esquemas de lease distribuído em geral). O lease default (5 minutos, configurável pelo composition root) é
-dimensionado para tornar essa janela desprezível na prática; nenhum reaper/worker de recuperação em segundo
-plano foi introduzido neste Passo (STOP-THE-LINE: nenhum processo externo) — a recuperação é OPORTUNISTA,
-disparada pelo próprio próximo adquirente dentro do fluxo síncrono de `AcquireSasForUploadUseCase`.
+**AB-I5-007 — entrega do segredo é fail-closed sob perda de fencing (corrigido, não mais risco residual)**:
+o desenho revisado por `AB-I5-006` deixava a janela ENTRE a leitura bem-sucedida do secret store e a
+persistência de `FinalizeClaim` tratada como "corrida residual best-effort" — se a finalização falhasse por
+`ConcurrencyException` (porque o lease titular expirou e outro adquirente já reivindicou por `Reclaim` nesse
+intervalo), a exceção era engolida e o segredo já lido era retornado ao caller antigo mesmo assim. Isso
+permitia, na janela de expiração do lease, que dois adquirentes recebessem o MESMO SAS — quebrando a
+garantia de uso único e o próprio propósito do fencing por época.
+
+**Correção**: `AcquireSasForUploadUseCase.ExecuteAsync` só devolve o segredo ao caller se a transição
+`Claimed -> Consumed` sob a MESMA época do claim for persistida com sucesso — a prova, no momento exato da
+entrega, de que este requester ainda é o titular do claim. Se `SaveTransitionAsync(FinalizeClaim(...))`
+falhar por `ConcurrencyException` (owner/época já rotacionados por `Reclaim` de outro adquirente), o método
+falha fechado com `PurviewSasAcquisitionDeniedException` — o segredo já lido pelo secret store NUNCA
+atravessa para o caller. Nenhuma compensação é necessária nesse ramo: nenhuma transição foi persistida por
+este requester, e o claim já pertence legitimamente ao novo owner/época. A recuperação de crash/cancelamento
+ANTES da leitura do segredo (lease expira, `Reclaim` recupera) permanece inalterada — apenas a entrega FINAL
+do segredo, após leitura bem-sucedida, deixou de ser best-effort.
+
+Comprovado por `AFinalizeClaimLostToAConcurrentReclaimNeverReturnsTheSecretToTheStaleClaimant`,
+`OnlyTheClaimantThatPersistsConsumedReceivesTheSecret`,
+`AStaleRowVersionAtFinalizeIsNeverTreatedAsASuccessfulDelivery`,
+`CancellationOrFailureBeforeFinalizeRemainsRecoverableByReclaimWithoutDoubleDelivery` (Application), e sob
+SQL Server real, `FinalizeClaimLostToAConcurrentReclaimFailsClosedUnderRealConcurrency` (Integration).
 
 ## Crash-consistency do lifecycle do secret material (item 3)
 

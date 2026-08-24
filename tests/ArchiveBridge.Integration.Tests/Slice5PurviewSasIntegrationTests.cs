@@ -232,6 +232,36 @@ public sealed class Slice5PurviewSasIntegrationTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task FinalizeClaimLostToAConcurrentReclaimFailsClosedUnderRealConcurrency()
+    {
+        // AB-I5-007: sob concorrência genuína, a finalização do titular original NUNCA pode ser tratada
+        // como sucesso depois que outro processo já reivindicou o handle por Reclaim (row_version/época
+        // rotacionados) — mesmo que o titular original já tenha lido o segredo com sucesso antes disso.
+        var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveAsync(scope);
+        var stored = await HandleStore.ReplaceCanonicalAsync(
+            scope, wave.Id, null, NewHandle(scope, wave.Id, 1, Slice2Support.Now), CancellationToken.None);
+        var available = await HandleStore.SaveTransitionAsync(stored.MarkAvailable(Slice2Support.Now), CancellationToken.None);
+        var claimed = await HandleStore.SaveTransitionAsync(
+            available.Claim(WorkloadIdentities.UploadWorker, Slice2Support.Now.AddMinutes(5), Slice2Support.Now), CancellationToken.None);
+
+        var clock = new MutableClock(Slice2Support.Now.AddMinutes(6)); // depois do lease titular expirar
+        var store = new SqlPurviewSasUploadHandleStore(fixture.Factory, clock);
+
+        // Outro processo reivindica por Reclaim (row_version avança) ANTES desta finalização persistir.
+        await store.SaveTransitionAsync(
+            claimed.Reclaim(new WorkloadIdentity("OtherWorker"), clock.UtcNow.AddMinutes(5), clock.UtcNow), CancellationToken.None);
+
+        // 'claimed' está STALE — a finalização do titular original nunca pode ser tratada como sucesso.
+        await Assert.ThrowsAsync<ConcurrencyException>(() => store.SaveTransitionAsync(
+            claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, clock.UtcNow), CancellationToken.None));
+
+        var reloaded = await store.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, reloaded!.State);
+        Assert.Equal(new WorkloadIdentity("OtherWorker"), reloaded.ClaimOwner);
+    }
+
+    [Fact]
     public async Task GetCanonicalFailsClosedWhenTheClaimOwnerIsTamperedDirectlyInTheRow()
     {
         var scope = SqlServerFixture.NewScope();
