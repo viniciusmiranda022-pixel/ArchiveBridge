@@ -1,0 +1,65 @@
+# Threat model — I5/EPIC-06, Passo 1 (Purview Capability Registry & Prechecks)
+
+Delta sobre o modelo de ameaças da plataforma (mesmo formato dos deltas de Slice 4C, incorporados abaixo do
+capítulo anterior em [`threat-model-slice-04c.md`](threat-model-slice-04c.md)). Escopo: capability
+discovery/evidence do adapter Purview Network Upload (runbook §24, ADR-0006/0007), tenant/mailbox precheck
+read-only e o policy/capacity gate de archive import (runbook §25.2-§25.4) — **sem** coleta/armazenamento de
+SAS, sem AzCopy, sem staging/upload real, sem geração/validação de mapping CSV, sem criação/início de
+Purview import job, sem Graph writes, sem `Enable-Mailbox -Archive`, sem habilitar auto-expanding archive,
+sem alteração de role group/PIM/Conditional Access, sem Exchange Online write operations e sem
+reconciliação/post-import (STOP-THE-LINE de
+[`docs/engineering/requests/AB-I5-001.md`](../engineering/requests/AB-I5-001.md)). Nenhum destes fluxos
+existe no código deste Passo — não há superfície de ameaça nova a analisar para eles aqui.
+
+## Ativos adicionais
+
+- **Capability evidence** (`purview_capability_evidence`): rota de capability, nível de suporte
+  (`GeneralAvailability`/`Preview`/`Contractual`/`Unsupported`/`Unknown`), fonte oficial (citação
+  ADR/documentação — nunca URL de tenant), versão de documentação/capability quando disponível e data
+  observada. Evidência de GOVERNANÇA/decisão arquitetural, não conteúdo de mailbox nem segredo.
+- **Snapshots de precheck de mailbox** (`purview_mailbox_prechecks`): identidade resolvida do archive de
+  destino, `ExchangeGuid`/`ArchiveGuid`, status do Online Archive, tipo de destinatário, sinalizadores de
+  auto-expansion/holds e estatísticas de capacidade em bytes estruturados. Evidência OPERACIONAL read-only —
+  **nunca** assunto/corpo/remetente/destinatário/anexo ou qualquer conteúdo de mailbox.
+
+## Classificação de dados
+
+As DUAS tabelas novas (`purview_capability_evidence`, `purview_mailbox_prechecks`) **não são "zero PII"**:
+a identidade de mailbox (UPN) e os GUIDs de Exchange/archive são metadados operacionais atribuíveis a uma
+mailbox específica, mesma classificação das tabelas de inventário EV (Slice 3/4C). O que elas **não**
+contêm: SAS, AzCopy, credencial, token, transcript PowerShell bruto, ou qualquer campo de conteúdo de
+mailbox — `CapabilityEvidence`/`MailboxPrecheckSnapshot` (Domain) têm construtores fechados (`Record`/
+`Observe`) que só aceitam os campos normalizados documentados aqui, tornando estruturalmente impossível
+persistir um campo de conteúdo por engano (mesma garantia já usada em `InventoryArchiveRecord`/
+`EvExportManifestEntry`).
+
+## Ameaças e mitigações (delta)
+
+| Ameaça | Mitigação |
+| --- | --- |
+| Capability desconhecida/não documentada tratada como suportada | `CapabilityEvidencePolicy.EnsureGeneralAvailability` nunca infere: `Unknown` bloqueia sempre; nenhuma rota fora de `PurviewCapabilityCatalog` (matriz embarcada, espelha ADR-0006/0007) é tratada como GA — "honestidade comercial", mesma regra de `ConnectorSupportMatrix`/ADR-0013. Comprovado por `UnknownRouteIsNeverInferredAsSupported`, `UnknownStatusBlocks`. |
+| Capability Preview/Contractual promovida implicitamente a GA | `CapabilityEvidencePolicy` só devolve `Usable` quando `Status == GeneralAvailability`; Preview/Contractual sempre devolvem `NotGeneralAvailability`, que `PurviewPrecheckGate` trata como bloqueio antes de qualquer outra checagem. Comprovado por `PreviewOrContractualIsNeverTreatedAsGa`, `NonUsableCapabilityBlocksBeforeAnyOtherCheck`. |
+| Capability evidence stale/adulterada aceita como vigente | `CapabilityEvidencePolicy` avalia staleness contra `RecordedAtUtc` (não `ObservedAtUtc`, que nunca "renova" sozinho) e bloqueia (`Stale`) acima da janela de frescor; a persistência é fronteira NÃO CONFIÁVEL — `CapabilityEvidence.Rehydrate` recomputa `EvidenceHash` a partir dos campos REALMENTE carregados e recusa fail-closed qualquer divergência (mesmo princípio de `EvWatermark`/`InventorySnapshot`). Comprovado por `EvidenceOlderThanMaxAgeSinceLastRecordedIsStale`, `RehydrateFailsClosedWhenStatusIsTamperedButHashStaysStale` e, sob SQL Server real, `GetLatestFailsClosedWhenThePersistedEvidenceHashIsTamperedDirectlyInTheRow`. |
+| Downgrade/contradição de capability mascarado por uma evidência antiga "melhor" | A política SEMPRE consulta apenas a evidência de MAIOR `Version` (mais recente) — nunca a de status mais alto historicamente; um downgrade real (nova evidência com status inferior) prevalece imediatamente. Comprovado por `DowngradeToLatestEvidenceAlwaysWinsOverAnOlderHigherStatus`. |
+| Archive inativo/status não determinado liberado para import | `PurviewPrecheckGate.EvaluateArchiveImport` exige `ArchiveStatus == Active`; `Unknown`/`None`/`Disabled` bloqueiam igualmente (`Unknown` nunca é tratado como `Active` — default fail-closed do enum). Comprovado por `InactiveArchiveBlocks`. |
+| Auto-expanding archive usado para elevar o limite principal do adapter (100 GB) | `PurviewPrecheckGate` nunca consulta `AutoExpandingArchiveEnabled` na checagem do limite principal (`MainArchiveImportLimitBytes`, reaproveitado de `CapacityRule.OneHundredGigabytesInBytes` — mesma constante já usada pelo gate de capacidade por onda, Slice 2) — o limite é fixo independentemente do flag. Comprovado por `PlannedBytesOverMainArchiveLimitBlocksRegardlessOfAutoExpansion` (`autoExpandingArchiveEnabled: true` e `false` produzem o MESMO bloqueio). |
+| Root de destino `"/"` aceito no caminho de import | Estruturalmente impossível: `ArchiveBridge.Domain.Waves.TargetRootFolder` (reutilizado sem duplicação) rejeita `"/"` no próprio construtor — uma onda aprovada nunca alcança o precheck gate com pasta raiz inválida. Comprovado (invariante já existente, reafirmado neste Passo) por `RootTargetFolderIsRejectedByTheReusedWavesValueObject`. |
+| CSV acima de 500 linhas ou parte acima do limite duro liberados | `PurviewPolicyLimits` reaproveita, sem duplicar, `MappingSchema.MaxDataRows` (500) e `PartitionPolicy.RunbookHardPartBytes` (20 GB) — mudar qualquer um desses módulos muda o gate automaticamente. Comprovado por `ExactlyFiveHundredCsvRowsIsAllowed`/`FiveHundredAndOneCsvRowsIsBlocked` e `PartExactlyAtHardLimitIsAllowed`/`PartOneByteAboveHardLimitIsBlocked`. |
+| Capacidade observada insuficiente liberada por ausência de margem de segurança | `PurviewPrecheckGate` exige `ObservedAvailableBytes` presente (bloqueia fail-closed com `CapacityNotObserved` quando ausente) e recusa qualquer volume planejado acima de `disponível − SafetyMarginBytes`. Comprovado por `CapacityNotObservedBlocksFailClosed`, `PlannedBytesExceedingCapacityMarginIsBlocked`. |
+| Parsing locale-dependent de string formatada mascarando o volume real | Todo valor de capacidade/tamanho no gate é `long` estruturado em bytes (nunca uma string formatada pelo PowerShell parseada por regex) — mesma convenção de `PartitionPolicy`/`CapacityRule`. Nenhum tipo do Domain deste Passo aceita ou expõe um campo de texto formatado como fonte de bytes. |
+| Precheck executado sobre identidade de mailbox não resolvida (IDOR) | `MailboxPrecheckSnapshot.Observe` recusa fail-closed (`PurviewValidationException`) qualquer `ArchiveRef` cuja identidade não tenha sido resolvida server-side por um manifesto/resolvedor autorizado (`IsIdentityResolved == false`) — mesmo invariante já aplicado ao gate de capacidade por onda (Slice 2, `WaveSelection.HasUnresolvedArchive`). Comprovado por `ObserveRejectsUnresolvedMailboxIdentity`/`SubmitRejectsUnresolvedMailboxIdentity`. |
+| Vazamento cross-tenant/cross-project de capability evidence ou precheck (IDOR) | `ICapabilityEvidenceStore.GetLatestAsync`/`IMailboxPrecheckStore.GetLatestAsync` participam de `rls.tenant_isolation_policy` (FILTER + BLOCK, reforçado nesta migração para as duas tabelas novas) e filtram `project_id` explicitamente; um registro de outro tenant/projeto é indistinguível de inexistente. Comprovado sob SQL Server real por `CapabilityEvidenceFromAnotherProjectIsIndistinguishableFromNotFound`, `PrecheckFromAnotherProjectIsIndistinguishableFromNotFound`. |
+| Corrida de descoberta/precheck concorrente duplicando evidência ou perdendo uma mudança real | Idempotência é por convergência de versão (mesmo padrão de `SqlConnectorInventoryStore`/`ev_connector_inventory_snapshots`, AB-4C-002): o índice único `(tenant_id, project_id, provider, route_key, version)` (evidence) / `(tenant_id, project_id, archive_identity, version)` (precheck) é o backstop SQL; uma colisão só converge (`Created=false`) quando o CONTEÚDO já persistido é igual ao candidate (`IsSameContentAs`, que deliberadamente exclui `RecordedAtUtc`/`Version`/`Id`/`Correlation` — campos que mudam a cada submissão mesmo sem mudança real); conteúdo diferente sinaliza `ConcurrencyException` e a Application releé o latest e tenta a próxima versão livre (nunca perde a mudança). Comprovado por `DiscoverConvergesUnderConcurrentIdenticalContentInsteadOfDuplicating`, `RepeatedDiscoveryWithNoRealChangeDoesNotCreateANewVersion`, `RepeatedSubmissionWithNoRealChangeDoesNotCreateANewVersion`. |
+| Evidência de precheck persistida adulterada (holds/status/GUIDs/capacidade) lida como canônica | Mesma fronteira NÃO CONFIÁVEL de `EvWatermark`/`InventorySnapshot`: `MailboxPrecheckSnapshot.Rehydrate` recomputa `SnapshotHash` a partir de TODOS os campos REALMENTE carregados e recusa fail-closed (`MailboxPrecheckIntegrityViolationException`) qualquer divergência — inclui adulteração isolada de `ArchiveStatus` ou `ObservedAvailableBytes`. Comprovado sob SQL Server real corrompendo a linha por fora da aplicação: `GetLatestFailsClosedWhenTheArchiveStatusColumnIsTamperedDirectlyInTheRow`, `GetLatestFailsClosedWhenObservedAvailableBytesIsTamperedDirectlyInTheRow`. |
+| Mutação de tenant/mailbox executada implicitamente pelo precheck | Nenhum tipo/porta deste Passo expõe uma operação de escrita contra Graph/EXO/PowerShell — `IMailboxPrecheckAdapter.ObserveAsync` é somente leitura por contrato (mesmo desenho de `IEvInventoryAdapter`, Slice 4C Passo 1); este Passo não inclui nenhuma implementação real de `Enable-Mailbox -Archive`/auto-expansion/role/PIM/Conditional Access — apenas o contrato e um adapter de teste/fixture determinístico. |
+| Escalação via identidade de manutenção | Nenhum store deste Passo (`SqlCapabilityEvidenceStore`, `SqlMailboxPrecheckStore`) abre conexão de manutenção — ambos operam exclusivamente sob a identidade do TENANT já resolvida; a allowlist de `EvWorkerBoundaryTests.MaintenanceIdentityIsRestrictedToApprovedCrossTenantInfrastructureOperations` permanece com os MESMOS arquivos já existentes, sem adição. |
+| SQL injection | Todo acesso a dados é parametrizado (`SqlCommand`/`SqlParameter`), sem concatenação de entrada — reaproveita o mesmo padrão dos módulos anteriores. |
+| Dependência vazando de Domain/Application para Graph/EXO/PowerShell/Purview SDK | Nenhum pacote/assembly de vendor é referenciado por `ArchiveBridge.Domain`/`ArchiveBridge.Application`/`ArchiveBridge.Contracts` deste módulo — `PurviewCapabilityCatalog` é uma matriz embarcada pura (mesmo padrão de `ConnectorSupportMatrix`), sem chamada em tempo real ao fornecedor. Verificado pelos testes já existentes de `VendorBoundaryTests`/`DependencyRuleTests` (sem necessidade de nova allowlist — nenhum token de vendor novo aparece no código deste Passo). |
+
+## Fora de escopo deste Passo (herdado do STOP-THE-LINE)
+
+Coleta/armazenamento de SAS, Key Vault para SAS, execução de AzCopy, staging/upload real, geração/validação
+de mapping CSV, criação/validação/início de Purview import job, Graph writes, `Enable-Mailbox -Archive`,
+habilitar auto-expanding archive, criar/alterar role group/PIM/Conditional Access, Exchange Online write
+operations, reconciliação/post-import, avanço para I6. Nenhum destes fluxos existe no código deste Passo —
+não há superfície de ameaça nova a analisar para eles aqui.
