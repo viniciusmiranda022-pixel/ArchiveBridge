@@ -2,6 +2,7 @@ using System.Data;
 using System.Globalization;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
+using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Domain.TargetIngestion.Purview;
 using ArchiveBridge.Domain.Waves;
 using ArchiveBridge.Infrastructure.Persistence;
@@ -140,6 +141,116 @@ public sealed class Slice5PurviewSasIntegrationTests(SqlServerFixture fixture)
             () => HandleStore.SaveTransitionAsync(stored.MarkAvailable(Slice2Support.Now), CancellationToken.None));
     }
 
+    // ---- Claim / Reclaim / FinalizeClaim sob SQL real (AB-I5-006 item 2) -------------------------------
+
+    [Fact]
+    public async Task ClaimTransitionPersistsAcrossReads()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveAsync(scope);
+        var stored = await HandleStore.ReplaceCanonicalAsync(
+            scope, wave.Id, null, NewHandle(scope, wave.Id, 1, Slice2Support.Now), CancellationToken.None);
+        var available = await HandleStore.SaveTransitionAsync(stored.MarkAvailable(Slice2Support.Now), CancellationToken.None);
+
+        var claimed = await HandleStore.SaveTransitionAsync(
+            available.Claim(WorkloadIdentities.UploadWorker, Slice2Support.Now.AddMinutes(5), Slice2Support.Now), CancellationToken.None);
+        var reloaded = await HandleStore.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+
+        Assert.Equal(SasHandleState.Claimed, reloaded!.State);
+        Assert.Equal(WorkloadIdentities.UploadWorker, reloaded.ClaimOwner);
+        Assert.Equal(1, reloaded.ClaimEpoch.Value);
+        Assert.NotNull(reloaded.ClaimExpiresAtUtc);
+        Assert.Equal(claimed.HandleHash.Value, reloaded.HandleHash.Value);
+    }
+
+    [Fact]
+    public async Task ReclaimAfterLeaseExpiryPersistsAndRotatesTheEpochAndOwner()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveAsync(scope);
+        var clock = new MutableClock(Slice2Support.Now);
+        var store = new SqlPurviewSasUploadHandleStore(fixture.Factory, clock);
+
+        var stored = await store.ReplaceCanonicalAsync(
+            scope, wave.Id, null, NewHandle(scope, wave.Id, 1, Slice2Support.Now), CancellationToken.None);
+        var available = await store.SaveTransitionAsync(stored.MarkAvailable(Slice2Support.Now), CancellationToken.None);
+        var claimed = await store.SaveTransitionAsync(
+            available.Claim(new WorkloadIdentity("OldOwner"), Slice2Support.Now.AddMinutes(5), Slice2Support.Now), CancellationToken.None);
+
+        clock.Set(Slice2Support.Now.AddMinutes(6)); // depois do lease expirar
+        var reclaimed = await store.SaveTransitionAsync(
+            claimed.Reclaim(new WorkloadIdentity("NewOwner"), clock.UtcNow.AddMinutes(5), clock.UtcNow), CancellationToken.None);
+
+        var reloaded = await store.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, reloaded!.State);
+        Assert.Equal(new WorkloadIdentity("NewOwner"), reloaded.ClaimOwner);
+        Assert.Equal(2, reloaded.ClaimEpoch.Value);
+        Assert.Equal(reclaimed.HandleHash.Value, reloaded.HandleHash.Value);
+
+        // O owner ANTERIOR nunca mais finaliza com a época antiga (fencing) — domínio puro, mas provado
+        // aqui contra o handle efetivamente reidratado do SQL (nunca a instância em memória do teste).
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => reloaded.FinalizeClaim(new WorkloadIdentity("OldOwner"), new LeaseEpoch(1), clock.UtcNow));
+    }
+
+    [Fact]
+    public async Task FinalizeClaimAfterAcquisitionPersistsAsConsumed()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveAsync(scope);
+        var stored = await HandleStore.ReplaceCanonicalAsync(
+            scope, wave.Id, null, NewHandle(scope, wave.Id, 1, Slice2Support.Now), CancellationToken.None);
+        var available = await HandleStore.SaveTransitionAsync(stored.MarkAvailable(Slice2Support.Now), CancellationToken.None);
+        var claimed = await HandleStore.SaveTransitionAsync(
+            available.Claim(WorkloadIdentities.UploadWorker, Slice2Support.Now.AddMinutes(5), Slice2Support.Now), CancellationToken.None);
+
+        var consumed = await HandleStore.SaveTransitionAsync(
+            claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Slice2Support.Now.AddMinutes(1)), CancellationToken.None);
+        var reloaded = await HandleStore.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+
+        Assert.Equal(SasHandleState.Consumed, reloaded!.State);
+        Assert.NotNull(reloaded.ConsumedAtUtc);
+        Assert.Equal(consumed.HandleHash.Value, reloaded.HandleHash.Value);
+    }
+
+    [Fact]
+    public async Task ClaimWithAStaleRowVersionFailsClosed()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveAsync(scope);
+        var stored = await HandleStore.ReplaceCanonicalAsync(
+            scope, wave.Id, null, NewHandle(scope, wave.Id, 1, Slice2Support.Now), CancellationToken.None);
+        var available = await HandleStore.SaveTransitionAsync(stored.MarkAvailable(Slice2Support.Now), CancellationToken.None);
+
+        // Consome o row_version real com um claim bem-sucedido — a instância 'available' em mãos do teste
+        // fica STALE, simulando um segundo adquirente perdendo a corrida.
+        await HandleStore.SaveTransitionAsync(
+            available.Claim(WorkloadIdentities.UploadWorker, Slice2Support.Now.AddMinutes(5), Slice2Support.Now), CancellationToken.None);
+
+        await Assert.ThrowsAsync<ConcurrencyException>(() => HandleStore.SaveTransitionAsync(
+            available.Claim(new WorkloadIdentity("AnotherWorker"), Slice2Support.Now.AddMinutes(5), Slice2Support.Now), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetCanonicalFailsClosedWhenTheClaimOwnerIsTamperedDirectlyInTheRow()
+    {
+        var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveAsync(scope);
+        var stored = await HandleStore.ReplaceCanonicalAsync(
+            scope, wave.Id, null, NewHandle(scope, wave.Id, 1, Slice2Support.Now), CancellationToken.None);
+        var available = await HandleStore.SaveTransitionAsync(stored.MarkAvailable(Slice2Support.Now), CancellationToken.None);
+        await HandleStore.SaveTransitionAsync(
+            available.Claim(WorkloadIdentities.UploadWorker, Slice2Support.Now.AddMinutes(5), Slice2Support.Now), CancellationToken.None);
+
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.purview_sas_upload_handles SET claim_owner = N'AttackerControlled' WHERE handle_id = @id;",
+            ("@id", stored.Id.Value));
+
+        await Assert.ThrowsAsync<PurviewSasHandleIntegrityViolationException>(
+            () => HandleStore.GetCanonicalAsync(scope, wave.Id, CancellationToken.None));
+    }
+
     // ---- Isolamento cross-tenant/project (RLS) e fronteira NÃO CONFIÁVEL -------------------------------
 
     [Fact]
@@ -198,11 +309,38 @@ public sealed class Slice5PurviewSasIntegrationTests(SqlServerFixture fixture)
             Assert.Equal(2, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
         }
 
-        // Backstop de canonicidade (item 16): índice único FILTRADO sobre os estados "vivos".
+        // Backstop de canonicidade (item 16): índice único FILTRADO sobre os estados "vivos" — inclui
+        // Claimed(5) desde AB-I5-006 item 2.
         await using (var canonicalIndex = new SqlCommand(
             "SELECT COUNT(*) FROM sys.indexes WHERE name = 'UX_psuh_canonical_live' AND has_filter = 1;", connection))
         {
             Assert.Equal(1, Convert.ToInt32(await canonicalIndex.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // Estado permite até Claimed(5); consistência claim_epoch/claim_owner/claim_expires_at_utc reforçada
+        // no BANCO (defesa em profundidade da mesma regra do Domain, AB-I5-006 item 2).
+        await using (var stateCheck = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.check_constraints WHERE name = 'CK_psuh_state' AND definition LIKE '%5%';", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await stateCheck.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var claimConsistencyCheck = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.check_constraints WHERE name = 'CK_psuh_claim_consistency';", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await claimConsistencyCheck.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // As três colunas de claim/lease/fencing existem na tabela de metadado.
+        await using (var claimColumns = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.columns
+            WHERE object_id = OBJECT_ID('dbo.purview_sas_upload_handles')
+              AND name IN ('claim_owner', 'claim_epoch', 'claim_expires_at_utc');
+            """,
+            connection))
+        {
+            Assert.Equal(3, Convert.ToInt32(await claimColumns.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
         }
 
         // Nenhum GRANT de leitura à identidade de MANUTENÇÃO em purview_sas_secret_material — nem sequer o

@@ -285,6 +285,132 @@ public sealed class Slice5PurviewSasUseCaseTests
         Assert.Equal(0, secrets.AcquireCallCount);
     }
 
+    // ---- AcquireSasForUploadUseCase: claim/lease/fencing (AB-I5-006 item 2) --------------------------
+
+    [Fact]
+    public async Task TwoConcurrentClaimAttemptsNeverBothReceiveTheSecret()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(ValidSasUri(scope)), CorrelationId.New()), CancellationToken.None);
+
+        // Simula um segundo adquirente que vence a corrida de reivindicação exatamente entre a leitura do
+        // canônico desta execução e a persistência da transição Available -> Claimed.
+        var raced = false;
+        handles.BeforeSaveTransitionAttempt = () =>
+        {
+            if (!raced)
+            {
+                raced = true;
+                var canonical = handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None).GetAwaiter().GetResult();
+                handles.SeedDirectly(canonical!.Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now));
+            }
+        };
+
+        var useCase = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now));
+        await Assert.ThrowsAsync<PurviewSasAcquisitionDeniedException>(() => useCase.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        // A execução perdedora NUNCA chega a chamar o secret store — o "vencedor" simulado detém o claim.
+        Assert.Equal(0, secrets.AcquireCallCount);
+        var handle = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, handle!.State);
+    }
+
+    [Fact]
+    public async Task AcquireWhileAnotherClaimIsStillWithinItsLeaseIsDeniedWithoutTouchingTheSecretStore()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(ValidSasUri(scope)), CorrelationId.New()), CancellationToken.None);
+
+        var canonical = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        handles.SeedDirectly(canonical!.Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now)); // outro adquirente já detém o claim
+
+        var useCase = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now.AddMinutes(1))); // ainda dentro do lease
+        await Assert.ThrowsAsync<PurviewSasAcquisitionDeniedException>(() => useCase.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        Assert.Equal(0, secrets.AcquireCallCount);
+    }
+
+    [Fact]
+    public async Task AFailedSecretStoreReadAfterClaimingNeverBurnsTheGenerationAndIsRecoverableByReclaimAfterTheLeaseExpires()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        var rawSas = ValidSasUri(scope);
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(rawSas), CorrelationId.New()), CancellationToken.None);
+
+        var leaseDuration = TimeSpan.FromMinutes(5);
+        secrets.FailNextAcquireWith = () => new SecretStoreUnavailableException("Falha simulada do secret store.");
+        var firstAttempt = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now), leaseDuration);
+        await Assert.ThrowsAsync<SecretStoreUnavailableException>(() => firstAttempt.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        // O claim permanece ATIVO (nunca finalizado nem revertido) — a geração nunca é queimada por uma
+        // falha do secret store ANTES da leitura bem-sucedida (item 2).
+        var afterFailure = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, afterFailure!.State);
+
+        // Antes do lease expirar: recusado sem nova tentativa de leitura (claim ainda ativo).
+        var stillLeased = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now.AddMinutes(1)), leaseDuration);
+        await Assert.ThrowsAsync<PurviewSasAcquisitionDeniedException>(() => stillLeased.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        // Depois do lease expirar: reclaim recupera e entrega o segredo com sucesso — recuperável, não
+        // readquirível permanentemente perdido.
+        var afterLeaseExpiry = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now.AddMinutes(6)), leaseDuration);
+        var acquired = await afterLeaseExpiry.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None);
+
+        Assert.Equal(rawSas, acquired.Reveal());
+        var finalHandle = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Consumed, finalHandle!.State);
+    }
+
+    [Fact]
+    public async Task TheClaimLeaseNeverOutlivesTheSasExpiryEvenWithALongLeaseDuration()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(
+                new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(ValidSasUri(scope, Now.AddMinutes(10))), CorrelationId.New()),
+                CancellationToken.None);
+
+        secrets.FailNextAcquireWith = () => new SecretStoreUnavailableException("Falha simulada do secret store.");
+        var useCase = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now), TimeSpan.FromHours(1));
+        await Assert.ThrowsAsync<SecretStoreUnavailableException>(() => useCase.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        var handle = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, handle!.State);
+        Assert.True(handle.ClaimExpiresAtUtc <= handle.ExpiresAtUtc);
+    }
+
+    [Fact]
+    public void ConstructingWithANonPositiveClaimLeaseDurationThrows()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => new AcquireSasForUploadUseCase(new FakeSasHandleStore(), new FakeSecretStore(), new StubClock(Now), TimeSpan.Zero));
+    }
+
     // ---- DestroySasHandleUseCase --------------------------------------------------------------------
 
     [Fact]
@@ -306,8 +432,13 @@ public sealed class Slice5PurviewSasUseCaseTests
     }
 
     [Fact]
-    public async Task DestroyIsIdempotentAndNeverCallsTheSecretStoreTwice()
+    public async Task DestroyIsIdempotentInResultButAlwaysRetriesTheSecretStoreDestroyForCrashSafety()
     {
+        // AB-I5-006 item 3: o resultado (handle Destroyed) é idempotente, mas ISecretStore.DestroyAsync é
+        // SEMPRE reexecutado — mesmo quando o metadado já estava Destroyed — para que uma tentativa
+        // anterior que caiu ENTRE as duas etapas (metadado já Destroyed, material ainda não removido)
+        // eventualmente convirja por retry, em vez de deixar o material para sempre. DestroyAsync já é
+        // idempotente por si só (um segundo DELETE sobre uma referência já removida é um no-op).
         var scope = Scope();
         var waves = new FakeWaveStore();
         var wave = SeedWave(waves, scope);
@@ -321,7 +452,36 @@ public sealed class Slice5PurviewSasUseCaseTests
         var second = await useCase.ExecuteAsync(new DestroySasHandleRequest(scope, wave.Id, CorrelationId.New()), CancellationToken.None);
 
         Assert.Equal(SasHandleState.Destroyed, second.State);
-        Assert.Equal(1, secrets.DestroyCallCount);
+        Assert.Equal(2, secrets.DestroyCallCount);
+        Assert.Equal(0, secrets.MaterialCount);
+    }
+
+    [Fact]
+    public async Task WhenTheSecretStoreDestroyFailsTheMetadataIsAlreadyDestroyedAndARetryConverges()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(ValidSasUri(scope)), CorrelationId.New()), CancellationToken.None);
+
+        secrets.FailNextDestroyWith = () => new SecretStoreUnavailableException("Falha simulada do secret store.");
+        var useCase = new DestroySasHandleUseCase(handles, secrets, new StubClock(Now));
+        await Assert.ThrowsAsync<SecretStoreUnavailableException>(
+            () => useCase.ExecuteAsync(new DestroySasHandleRequest(scope, wave.Id, CorrelationId.New()), CancellationToken.None));
+
+        // Metadado JÁ transicionou para Destroyed — inacessível a AcquireSasForUploadUseCase — mesmo com o
+        // material ainda pendente de remoção (nunca "aparenta disponível apontando para material já apagado").
+        var afterFailure = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Destroyed, afterFailure!.State);
+        Assert.Equal(1, secrets.MaterialCount);
+
+        // Retry converge: reexecuta SOMENTE a destruição do material (o metadado já Destroyed não transiciona de novo).
+        var result = await useCase.ExecuteAsync(new DestroySasHandleRequest(scope, wave.Id, CorrelationId.New()), CancellationToken.None);
+        Assert.Equal(SasHandleState.Destroyed, result.State);
+        Assert.Equal(0, secrets.MaterialCount);
     }
 
     [Fact]
@@ -351,6 +511,15 @@ internal sealed class FakeSecretStore : ISecretStore
 
     public int DestroyCallCount { get; private set; }
 
+    /// <summary>Contagem de referências ainda "vivas" no material — usada para provar ausência de órfãos permanentes.</summary>
+    public int MaterialCount => _material.Count;
+
+    /// <summary>Hook de teste: quando definido, <see cref="AcquireAsync"/> lança este erro em vez de devolver o segredo (simula falha do secret store DEPOIS de um claim bem-sucedido).</summary>
+    public Func<Exception>? FailNextAcquireWith { get; set; }
+
+    /// <summary>Hook de teste: quando definido, <see cref="DestroyAsync"/> lança este erro em vez de remover o material (simula falha do secret store DEPOIS do metadado já ter transicionado para Destroyed).</summary>
+    public Func<Exception>? FailNextDestroyWith { get; set; }
+
     public Task<SecretStoreHandleReference> ProtectAsync(
         TenantScope scope, RedactedSecret secret, CorrelationId correlation, CancellationToken cancellationToken)
     {
@@ -365,6 +534,12 @@ internal sealed class FakeSecretStore : ISecretStore
         CancellationToken cancellationToken)
     {
         AcquireCallCount++;
+        if (FailNextAcquireWith is { } makeException)
+        {
+            FailNextAcquireWith = null;
+            throw makeException();
+        }
+
         if (!string.Equals(requester.Value, WorkloadIdentities.UploadWorker.Value, StringComparison.Ordinal))
         {
             throw new SecretStoreAccessDeniedException("Identidade não autorizada.");
@@ -381,6 +556,12 @@ internal sealed class FakeSecretStore : ISecretStore
     public Task DestroyAsync(TenantScope scope, SecretStoreHandleReference reference, CorrelationId correlation, CancellationToken cancellationToken)
     {
         DestroyCallCount++;
+        if (FailNextDestroyWith is { } makeException)
+        {
+            FailNextDestroyWith = null;
+            throw makeException();
+        }
+
         _material.Remove(reference.Value);
         return Task.CompletedTask;
     }
@@ -398,6 +579,9 @@ internal sealed class FakeSasHandleStore : IPurviewSasUploadHandleStore
 
     /// <summary>Hook de teste: invocado imediatamente antes de CADA tentativa de <see cref="ReplaceCanonicalAsync"/>.</summary>
     public Action? BeforeReplaceAttempt { get; set; }
+
+    /// <summary>Hook de teste: invocado imediatamente antes de CADA tentativa de <see cref="SaveTransitionAsync"/>.</summary>
+    public Action? BeforeSaveTransitionAttempt { get; set; }
 
     public void SeedDirectly(PurviewSasUploadHandle handle) => Store(handle);
 
@@ -426,9 +610,11 @@ internal sealed class FakeSasHandleStore : IPurviewSasUploadHandleStore
     {
         BeforeReplaceAttempt?.Invoke();
 
+        // Estados "vivos" (nunca dois simultâneos por wave) — espelha o índice único filtrado
+        // UX_psuh_canonical_live da migration 0027 (Stored/Available/Claimed/Consumed).
         var live = _handles.Values.SingleOrDefault(h =>
             h.Tenant == scope.Tenant && h.Project == scope.Project && h.Wave == wave
-            && h.State is SasHandleState.Stored or SasHandleState.Available or SasHandleState.Consumed);
+            && h.State is SasHandleState.Stored or SasHandleState.Available or SasHandleState.Claimed or SasHandleState.Consumed);
 
         if (expectedPrevious is null)
         {
@@ -453,6 +639,8 @@ internal sealed class FakeSasHandleStore : IPurviewSasUploadHandleStore
 
     public Task<PurviewSasUploadHandle> SaveTransitionAsync(PurviewSasUploadHandle handle, CancellationToken cancellationToken)
     {
+        BeforeSaveTransitionAttempt?.Invoke();
+
         if (!_rowVersions.TryGetValue(handle.Id.Value, out var current) || current != handle.RowVersion.Value)
         {
             throw new ConcurrencyException($"Handle {handle.Id.Value}: row_version divergente.");
@@ -470,6 +658,7 @@ internal sealed class FakeSasHandleStore : IPurviewSasUploadHandleStore
             handle.Id, handle.Tenant, handle.Project, handle.Wave, handle.Generation, handle.State, handle.Fingerprint,
             handle.SecretStoreReference, handle.AuthorizedHost, handle.AuthorizedContainer, handle.KeyVersion,
             handle.ExpiresAtUtc, handle.StoredAtUtc, handle.AvailableAtUtc, handle.ConsumedAtUtc, handle.ExpiredAtUtc,
-            handle.DestroyedAtUtc, handle.Correlation, handle.RecordedAtUtc, new RowVersion(nextRowVersion), handle.HandleHash);
+            handle.DestroyedAtUtc, handle.ClaimOwner, handle.ClaimEpoch, handle.ClaimExpiresAtUtc, handle.Correlation,
+            handle.RecordedAtUtc, new RowVersion(nextRowVersion), handle.HandleHash);
     }
 }

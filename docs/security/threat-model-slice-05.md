@@ -111,7 +111,7 @@ usado em toda a superfície de intake/custódia (`IntakePurviewSasRequest`, `ISe
 | Expiry ausente, malformado, já vencido, vencendo "logo demais" ou distante demais aceito | `se` é parseado estruturadamente (`DateTimeOffset`, nunca regex sobre string) e exigido presente/válido; a policy própria do produto (não documentada pela Microsoft) exige margem mínima futura E limita a janela máxima de validade — defesa em profundidade contra um SAS de vida útil excessiva. Comprovado por `MalformedExpiryIsRejected`, `AlreadyExpiredIsRejected`, `ExpiryWithinMinimumMarginIsRejected`, `ExpiryBeyondMaximumWindowIsRejected`, `ExpiryExactlyAtMaximumWindowIsAccepted`. |
 | Permissões mais amplas que o necessário para upload (delete/list/immutability/ownership) aceitas | `PurviewSasPermissions.SatisfiesUploadPolicy` exige Create+Write E recusa qualquer permissão de controle administrativo do container; letra de permissão não reconhecida recusa o parsing inteiro (nunca ignorada). Comprovado por `PermissionsOutsideUploadPolicyAreRejected`, `UnrecognizedPermissionLetterIsRejected`. |
 | SAS custodiado lido em texto claro por qualquer caminho além do boundary do upload worker | `ISecretStore.AcquireAsync` é a ÚNICA operação de leitura em texto claro de toda a porta, e é chamada em EXATAMENTE um lugar de toda a Application (`AcquireSasForUploadUseCase`) — verificado estruturalmente. A identidade requerente (`WorkloadIdentity`) é revalidada em DUAS camadas independentes: a Application (antes de chamar o adapter) E o próprio `DpapiSecretStore` (defesa em profundidade — um chamador futuro que invoque `ISecretStore` fora do caso de uso não contorna o boundary). Nenhum arquivo do ControlPlane referencia o caso de uso ou a porta (guarda de regressão hoje vale por vacuidade — nenhuma superfície HTTP existe ainda neste Passo). Comprovado por `SecretAcquireAsyncIsCalledFromExactlyOnePlaceInTheApplication`, `NoControlPlaneSourceFileReferencesTheAcquisitionUseCaseOrTheSecretStorePort`, `AcquireByAnUnauthorizedIdentityIsDeniedAndNeverTouchesTheSecretStore`, `DpapiSecretStoreDeniesAcquisitionByAnUnauthorizedIdentityEvenWhenSupported`. |
-| Reuso do SAS além de uma aquisição, ou aquisição concorrente vazando o segredo para o perdedor de uma corrida | `AcquireSasForUploadUseCase` reivindica a transição `Available -> Consumed` por concorrência otimista (`row_version`) ANTES de chamar `ISecretStore.AcquireAsync` — nenhum chamador que perca a corrida da transição chega a ver o segredo. Comprovado por `ASecondAcquireAttemptAfterConsumptionIsDenied` e, sob SQL real, `SaveTransitionWithAStaleRowVersionFailsClosed`. |
+| Reuso do SAS além de uma aquisição, ou aquisição concorrente vazando o segredo para o perdedor de uma corrida | **Revisado por AB-I5-006 item 2** (ver delta abaixo) — `AcquireSasForUploadUseCase` reivindica `Available -> Claimed` por concorrência otimista (`row_version`) E sob fencing por época (`ClaimEpoch`, mesmo padrão de `Job`/`LeaseEpoch`) ANTES de chamar `ISecretStore.AcquireAsync`; nenhum chamador que perca a corrida da reivindicação chega a ver o segredo. Comprovado por `TwoConcurrentClaimAttemptsNeverBothReceiveTheSecret`, `ASecondAcquireAttemptAfterConsumptionIsDenied` e, sob SQL real, `ClaimWithAStaleRowVersionFailsClosed`. |
 | Handle expirado ou destruído readquirido | `AcquireSasForUploadUseCase` avalia expiry no momento da aquisição (marca `Expired` explicitamente antes de recusar) e só aceita estado `Available`; `PurviewSasUploadHandle.MarkAvailable` só é alcançável a partir de `Stored` — `Expired`/`Destroyed` NUNCA retornam a `Available` sem um novo intake explícito (nova geração). Comprovado por `AcquireAfterExpiryIsDeniedAndMarksTheHandleExpired`, `ExpiredAndDestroyedNeverTransitionBackToAvailable`. |
 | Corrida de intake concorrente para a mesma wave produzindo dois handles "vivos" simultâneos | O índice único FILTRADO `UX_psuh_canonical_live` (estados Stored/Available/Consumed) é o backstop SQL — a perdedora de uma corrida de PRIMEIRO intake recebe `ConcurrencyException` e a Application releé o canônico e converge para a próxima geração; um replace com `expectedPrevious` obsoleto (row_version divergente) também recusa fail-closed. Comprovado sob SQL Server real por `ConcurrentFirstIntakeForTheSameWaveNeverProducesTwoLiveCanonicalHandles`, `ReplacingWithAStaleExpectedPreviousFailsClosed`. |
 | Novo SAS para a mesma wave reaproveitando/mascarando o handle anterior sem trilha auditável | Um novo intake cria uma NOVA geração (nunca sobrescreve a linha existente) e marca a geração anterior `Destroyed` na MESMA transação atômica — histórico completo preservado, nunca perdido. Comprovado por `ANewIntakeForTheSameWaveVersionsAndDestroysThePreviousGeneration` e, sob SQL real, `ReplacingDestroysThePreviousGenerationAndInsertsTheNewOneAtomically`. |
@@ -119,7 +119,7 @@ usado em toda a superfície de intake/custódia (`IntakePurviewSasRequest`, `ISe
 | Handle de custódia persistido adulterado (estado/fingerprint/expiry/referência) lido como canônico | Mesma fronteira NÃO CONFIÁVEL de `CapabilityEvidence`/`MailboxPrecheckSnapshot`: `PurviewSasUploadHandle.Rehydrate` recomputa `HandleHash` a partir de TODOS os campos REALMENTE carregados e recusa fail-closed (`PurviewSasHandleIntegrityViolationException`) qualquer divergência. Comprovado por `RehydrateFailsClosedWhenHandleHashDoesNotMatchLoadedFields` e, sob SQL Server real corrompendo a linha por fora da aplicação, `GetCanonicalFailsClosedWhenTheHandleHashIsTamperedDirectlyInTheRow`. |
 | Mecanismo de segredo indisponível (host não-Windows) mascarado como sucesso ou com fallback inseguro | `DpapiSecretStore` verifica `OperatingSystem.IsWindows()` ANTES de qualquer chamada real à API — indisponibilidade lança `SecretStoreUnavailableException` (fail-closed), nunca um fallback para texto claro ou mecanismo alternativo não certificado (ADR-0008: perfil HA de segredos permanece `BLOCKED_PENDING_EVIDENCE`, nenhuma pseudo-HA). Comprovado sob o runner de CI deste repositório (Ubuntu — não-Windows) por `DpapiSecretStoreRoundTripsWhenSupportedAndFailsSafeOtherwise`, que exercita EXATAMENTE este ramo em cada execução do pipeline. |
 | Destruição local do material apresentada como revogação remota do SAS no Purview/Microsoft Storage | `DestroySasHandleUseCase`/`ISecretStore.DestroyAsync` documentam explicitamente que a operação é LOCAL — nenhum tipo/porta deste Passo chama qualquer API do Purview/Azure Storage para revogar o SAS remotamente (nenhum SDK de fornecedor é referenciado, ver abaixo). A validade/revogação remota permanece sob controle exclusivo da Microsoft (ADR-0006). |
-| Destruição local não idempotente causando erro em reprocessamento/retry operacional | `PurviewSasUploadHandle.Destroy` é idempotente por desenho (reaplicar sobre um handle já `Destroyed` devolve a MESMA instância, sem erro); `ISecretStore.DestroyAsync` trata referência inexistente/já removida como no-op. Comprovado por `DestroyIsIdempotentFromAnyState` (Domain) e `DestroyIsIdempotentAndNeverCallsTheSecretStoreTwice` (Application). |
+| Destruição local não idempotente causando erro em reprocessamento/retry operacional, ou material órfão quando o processo cai ENTRE a transição de metadado e a remoção do material | **Revisado por AB-I5-006 item 3** (ver delta abaixo) — `PurviewSasUploadHandle.Destroy` é idempotente por desenho; `DestroySasHandleUseCase` transiciona o metadado para `Destroyed` PRIMEIRO (fencing/inacessibilidade durável) e SÓ DEPOIS remove o material — uma queda entre as duas etapas nunca deixa o metadado "aparentando disponível" apontando para material já removido, e uma nova chamada RETOMA e reexecuta a remoção do material (idempotente por si só em `ISecretStore.DestroyAsync`) mesmo quando o metadado já estava `Destroyed`. Comprovado por `DestroyIsIdempotentFromAnyState` (Domain) e `DestroyIsIdempotentInResultButAlwaysRetriesTheSecretStoreDestroyForCrashSafety`, `WhenTheSecretStoreDestroyFailsTheMetadataIsAlreadyDestroyedAndARetryConverges` (Application). |
 | Dependência vazando de Domain/Application/Contracts para DPAPI/Windows/Azure Key Vault | Nenhum arquivo-fonte de Domain/Application/Contracts referencia `ProtectedData`/`DataProtectionScope`/o assembly do pacote DPAPI — só `ArchiveBridge.Infrastructure` (`DpapiSecretStore`) o faz, sob `[SupportedOSPlatform("windows")]`. Comprovado por `DomainApplicationAndContractsSourceNeverReferenceDpapiTypes`, `DomainContractsAndApplicationAssembliesDoNotReferenceTheDpapiPackageAssembly` — sem necessidade de nova allowlist em `VendorBoundaryTests`, pois DPAPI não é um vendor de fornecedor externo (é uma API do próprio Windows), mas o mesmo princípio de isolamento se aplica. |
 | Identidade de manutenção usada para ler/persistir o handle ou o material protegido | Nenhum store deste Passo (`SqlPurviewSasUploadHandleStore`, `DpapiSecretStore`) abre conexão de manutenção — ambos operam exclusivamente sob a identidade do TENANT já resolvida; `purview_sas_secret_material` não concede NENHUM `GRANT` à identidade de manutenção (mais restritivo que o padrão append-only já usado nas demais tabelas). Comprovado sob SQL Server real por `Migration0027AppliesCleanlyAndPriorHashesRemainStable` (asserção de zero `GRANT`s). |
 | SQL injection | Todo acesso a dados é parametrizado (`SqlCommand`/`SqlParameter`), sem concatenação de entrada — reaproveita o mesmo padrão dos módulos anteriores. |
@@ -132,3 +132,114 @@ de segredos, geração/validação de mapping CSV, criação/validação/início
 writes/Exchange Online writes, reconciliação/post-import, logar/transmitir/copiar o SAS para ticket/e-mail/
 documento/transcript, avanço para o próximo Passo dentro deste PR. Nenhum destes fluxos existe no código
 deste Passo — não há superfície de ameaça nova a analisar para eles aqui.
+
+# Threat model — I5/EPIC-06, Passo 2 (revisão AB-I5-006: claim/lease/fencing e crash-consistency)
+
+Delta sobre o capítulo imediatamente anterior (mesmo Passo, mesmo PR). `AB-I5-005` identificou três
+blockers na revisão de `AB-I5-004`; `AB-I5-006` resolveu o item 1 por decisão de engenharia (documentada
+abaixo) e determinou a implementação integral dos itens 2 e 3. Nenhum STOP-THE-LINE de `AB-I5-004` foi
+alterado; nenhum AzCopy/processo externo/upload real/reconciliação foi introduzido.
+
+## Decisão de engenharia — validação de host permanece estrutural (item 1)
+
+`AB-I5-005` apontou que `PurviewSasIntakePolicy` aceita qualquer host sob o sufixo `.blob.core.windows.net`
+por validação estrutural, sem confirmar que aquele storage account específico é o destino Purview
+verdadeiramente autorizado para a wave. A investigação (`CLAUDE_BLOCKED` sobre `AB-I5-005`) confirmou que
+isso é estruturalmente impossível de fechar neste Passo: o storage account de destino do Network Upload é
+provisionado DINAMICAMENTE pela própria Microsoft a cada novo import job criado manualmente no portal
+Purview (runbook §25.5: "o operador cria um novo import job, seleciona upload e copia a URL SAS"; ADR-0006:
+"a criação e o início do import job permanecem como tarefa de workflow humana no portal Purview") — não
+existe hoje, em nenhuma fonte de autoridade do repositório, um conceito de "storage account pré-autorizado
+por tenant/projeto/wave" que o ArchiveBridge possa consultar ANTES do instante em que o operador cola a
+URL SAS. Inventar esse conceito agora seria uma decisão de produto fora do escopo autorizado (quem
+registra a autorização, em que granularidade, como sobrevive à rotação por import job) — um mecanismo mal
+desenhado teria efeito de segurança PIOR que nenhum (aceitaria facilmente um host arbitrário do atacante
+"pré-autorizado", ou bloquearia falsamente todo intake legítimo).
+
+**Decisão**: a validação de host permanece a checagem estrutural fail-closed já implementada (sufixo
+`.blob.core.windows.net` + label não vazio + container/path `ingestiondata` exato, case-sensitive) — o
+limite do que é comprovável sem I/O externo neste Passo. Isto NÃO é tratado como prova de que o storage
+account pertence ao import job Purview esperado — é registrado explicitamente aqui como uma limitação
+aceita. Como este Passo não executa AzCopy/upload real (STOP-THE-LINE), não há exfiltração possível neste
+boundary hoje. **Antes de habilitar upload real em um Passo posterior**, o work order daquele Passo deve
+fechar este trust boundary com a evidência disponível naquele estágio (ex.: confirmação humana explícita no
+momento do import job, ou uma fonte de autoridade ainda a definir) — sem inventar o mecanismo agora.
+
+## Claim/lease/fencing de aquisição (item 2)
+
+O desenho anterior (`AB-I5-004`) queimava a geração (`Available -> Consumed`) ANTES de chamar
+`ISecretStore.AcquireAsync` — uma falha do secret store DEPOIS dessa transição deixava o handle
+irreversivelmente `Consumed` sem que o upload worker tivesse recebido o segredo (perda de disponibilidade,
+sem retry seguro).
+
+**Mecanismo**: um novo estado `SasHandleState.Claimed` (adicionado ao FINAL da faixa numérica — 5 — para
+nunca renumerar os estados já persistidos) representa uma reserva de uso único sob lease/fencing por época
+(`PurviewSasUploadHandle.ClaimOwner`/`ClaimEpoch`/`ClaimExpiresAtUtc` — mesmo padrão já usado por
+`Job`/`LeaseEpoch`, ADR-0003, e não duplicado: `LeaseEpoch` é reaproveitado diretamente do módulo Jobs).
+`AcquireSasForUploadUseCase.ExecuteAsync`: (1) reivindica `Available -> Claimed` por concorrência otimista
+(`row_version`) — o perdedor de uma corrida de PRIMEIRA reivindicação NUNCA chama `ISecretStore.AcquireAsync`;
+um claim ativo e ainda dentro do lease de OUTRO adquirente é recusado imediatamente, sem tocar o secret
+store; um claim com lease EXPIRADO é recuperável via `Reclaim` (rotaciona owner/época — o titular anterior
+nunca mais finaliza com a época antiga, mesmo que retorne tarde demais); (2) SOMENTE DEPOIS lê o segredo;
+(3) finaliza `Claimed -> Consumed` (`FinalizeClaim`) SOB A MESMA ÉPOCA do claim, SOMENTE após a leitura ter
+tido sucesso — nunca antes. Uma falha do secret store, cancelamento ou queda de processo ENTRE o claim e a
+leitura NUNCA queima a geração: o lease simplesmente expira e um novo adquirente (ou o mesmo, em retry)
+recupera via `Reclaim`. O lease nunca ultrapassa a validade restante do próprio SAS.
+
+Comprovado por `ClaimIncrementsTheEpochEachTimeItIsReivindicated`, `FinalizeClaimWithTheWrongOwnerIsRejectedByFencing`,
+`FinalizeClaimWithAStaleEpochIsRejectedByFencing`, `ReclaimBeforeTheLeaseExpiresIsRejectedFailClosed`,
+`ReclaimRotatesTheOwnerAndTheOldOwnerCanNeverFinalizeAgain` (Domain); `TwoConcurrentClaimAttemptsNeverBothReceiveTheSecret`,
+`AcquireWhileAnotherClaimIsStillWithinItsLeaseIsDeniedWithoutTouchingTheSecretStore`,
+`AFailedSecretStoreReadAfterClaimingNeverBurnsTheGenerationAndIsRecoverableByReclaimAfterTheLeaseExpires`,
+`TheClaimLeaseNeverOutlivesTheSasExpiryEvenWithALongLeaseDuration` (Application); e, sob SQL Server real,
+`ClaimTransitionPersistsAcrossReads`, `ReclaimAfterLeaseExpiryPersistsAndRotatesTheEpochAndOwner`,
+`FinalizeClaimAfterAcquisitionPersistsAsConsumed`, `ClaimWithAStaleRowVersionFailsClosed`,
+`GetCanonicalFailsClosedWhenTheClaimOwnerIsTamperedDirectlyInTheRow` (Integration).
+
+**Risco residual aceito**: o fencing por época impede que um titular reassumido (`Reclaim`) finalize com a
+época antiga, mas não pode impedir uma corrida EXTREMAMENTE estreita em que o titular original lê o segredo
+com sucesso exatamente no instante em que seu lease expira e é reassumido por outro adquirente — uma
+propriedade inerente a qualquer esquema de lease por TTL sem heartbeat síncrono (o mesmo tradeoff aceito por
+esquemas de lease distribuído em geral). O lease default (5 minutos, configurável pelo composition root) é
+dimensionado para tornar essa janela desprezível na prática; nenhum reaper/worker de recuperação em segundo
+plano foi introduzido neste Passo (STOP-THE-LINE: nenhum processo externo) — a recuperação é OPORTUNISTA,
+disparada pelo próprio próximo adquirente dentro do fluxo síncrono de `AcquireSasForUploadUseCase`.
+
+## Crash-consistency do lifecycle do secret material (item 3)
+
+O desenho anterior tinha três lacunas: (a) `IntakePurviewSasUseCase` podia deixar o material recém-protegido
+permanentemente órfão se a convergência do metadado nunca tivesse sucesso (contenção persistente) ou uma
+exceção/cancelamento interrompesse o fluxo; (b) ao substituir uma geração, o material da geração ANTERIOR
+nunca era destruído (vazamento de ciphertext indefinido); (c) `DestroySasHandleUseCase` apagava o material
+ANTES de persistir `Destroyed` no metadado — uma queda entre as duas etapas deixava o metadado aparentando
+`Available`/`Consumed` mas apontando para material já removido.
+
+**Mecanismo** (nenhuma transação distribuída real entre `IPurviewSasUploadHandleStore` e `ISecretStore` —
+são portas independentes por desenho, substituíveis separadamente; a correção usa compensação best-effort
+e reordenação, não uma transação de duas fases):
+
+- `IntakePurviewSasUseCase`: protege o segredo UMA única vez; se NENHUMA tentativa de convergência tiver
+  sucesso, ou uma exceção/cancelamento interromper o fluxo ANTES de o candidato se tornar o canônico
+  persistido, o material recém-protegido é destruído por compensação (nunca mascara a exceção original).
+  Uma vez que o candidato SE TORNA o canônico persistido, o material da geração ANTERIOR substituída (já
+  `Destroyed` no metadado, na MESMA transação atômica do insert) também é destruído por compensação.
+- `DestroySasHandleUseCase`: o metadado transiciona para `Destroyed` PRIMEIRO (inacessível a
+  `AcquireSasForUploadUseCase`, que só reivindica a partir de `Available`/`Claimed`) — SÓ DEPOIS o material
+  é removido. `ISecretStore.DestroyAsync` é SEMPRE reexecutado (mesmo quando o metadado já estava
+  `Destroyed` de uma tentativa anterior), convergindo por retry.
+
+Comprovado por `AFailedSecretStoreReadAfterClaimingNeverBurnsTheGenerationAndIsRecoverableByReclaimAfterTheLeaseExpires`
+(compensação de claim, acima); `WhenTheSecretStoreDestroyFailsTheMetadataIsAlreadyDestroyedAndARetryConverges`,
+`DestroyIsIdempotentInResultButAlwaysRetriesTheSecretStoreDestroyForCrashSafety` (Application).
+
+**Risco residual aceito**: uma compensação é, por natureza, best-effort — se o PRÓPRIO PROCESSO cair (perda
+de energia, kill -9) exatamente entre a chamada de `ISecretStore.ProtectAsync`/`DestroyAsync` bem-sucedida e
+a compensação/transição subsequente, o material pode permanecer órfão sem que nenhuma compensação chegue a
+rodar (a mesma categoria de risco já aceita e documentada em `AB-I5-004`: "material órfão... permanece
+protegido e inacessível — nunca texto claro — até uma rotina de expurgo futura"). Nenhum reconciliador/
+reaper em segundo plano foi introduzido (STOP-THE-LINE). O que MUDOU: (1) todo o espaço de falhas
+alcançável DENTRO do processo (retry exaurido, exceção, `OperationCanceledException`) agora É coberto por
+compensação síncrona — o residual cobre apenas a queda literal do processo, não mais o caminho comum de
+falha; (2) o material órfão permanece RASTREÁVEL: uma geração `Destroyed` retém seu
+`PurviewSasUploadHandle.SecretStoreReference` original (nunca apagado do metadado), servindo de ledger
+auditável para uma futura rotina de expurgo, mesmo sem uma implementada neste Passo.

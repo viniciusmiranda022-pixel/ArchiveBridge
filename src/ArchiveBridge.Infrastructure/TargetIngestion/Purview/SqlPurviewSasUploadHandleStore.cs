@@ -4,6 +4,7 @@ using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.TargetIngestion.Purview;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.IdentityAndAccess;
+using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Domain.TargetIngestion.Purview;
 using ArchiveBridge.Domain.Waves;
@@ -28,8 +29,8 @@ public sealed class SqlPurviewSasUploadHandleStore(TenantConnectionFactory conne
         """
         handle_id, tenant_id, project_id, wave_id, generation, state, fingerprint, secret_store_reference,
                authorized_host, authorized_container, key_version, expires_at_utc, stored_at_utc,
-               available_at_utc, consumed_at_utc, expired_at_utc, destroyed_at_utc, correlation_id,
-               recorded_at_utc, handle_hash, row_version
+               available_at_utc, consumed_at_utc, expired_at_utc, destroyed_at_utc, claim_owner, claim_epoch,
+               claim_expires_at_utc, correlation_id, recorded_at_utc, handle_hash, row_version
         """;
 
     private const string SelectCanonicalSql =
@@ -52,12 +53,13 @@ public sealed class SqlPurviewSasUploadHandleStore(TenantConnectionFactory conne
         INSERT INTO dbo.purview_sas_upload_handles
             (handle_id, tenant_id, project_id, wave_id, generation, state, fingerprint, secret_store_reference,
              authorized_host, authorized_container, key_version, expires_at_utc, stored_at_utc, available_at_utc,
-             consumed_at_utc, expired_at_utc, destroyed_at_utc, correlation_id, recorded_at_utc, handle_hash)
+             consumed_at_utc, expired_at_utc, destroyed_at_utc, claim_owner, claim_epoch, claim_expires_at_utc,
+             correlation_id, recorded_at_utc, handle_hash)
         OUTPUT INSERTED.row_version
         VALUES
             (@id, @tenant, @project, @wave, @generation, @state, @fingerprint, @secretRef, @host, @container,
              @keyVersion, @expiresAt, @storedAt, @availableAt, @consumedAt, @expiredAt, @destroyedAt,
-             @correlation, @recordedAt, @hash);
+             @claimOwner, @claimEpoch, @claimExpiresAt, @correlation, @recordedAt, @hash);
         """;
 
     private static readonly string DestroyPreviousSql =
@@ -72,7 +74,8 @@ public sealed class SqlPurviewSasUploadHandleStore(TenantConnectionFactory conne
         $"""
         UPDATE dbo.purview_sas_upload_handles
         SET state = @state, available_at_utc = @availableAt, consumed_at_utc = @consumedAt,
-            expired_at_utc = @expiredAt, destroyed_at_utc = @destroyedAt, recorded_at_utc = @recordedAt,
+            expired_at_utc = @expiredAt, destroyed_at_utc = @destroyedAt, claim_owner = @claimOwner,
+            claim_epoch = @claimEpoch, claim_expires_at_utc = @claimExpiresAt, recorded_at_utc = @recordedAt,
             handle_hash = @hash
         OUTPUT INSERTED.row_version
         WHERE handle_id = @id AND project_id = @project AND row_version = @rowVersion;
@@ -185,6 +188,11 @@ public sealed class SqlPurviewSasUploadHandleStore(TenantConnectionFactory conne
         { Value = handle.ExpiredAtUtc is { } e ? SqlJobMapping.ToDbUtc(e) : DBNull.Value });
         command.Parameters.Add(new SqlParameter("@destroyedAt", SqlDbType.DateTime2)
         { Value = handle.DestroyedAtUtc is { } d ? SqlJobMapping.ToDbUtc(d) : DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@claimOwner", SqlDbType.NVarChar, 100)
+        { Value = handle.ClaimOwner is { } o ? o.Value : DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@claimEpoch", SqlDbType.BigInt) { Value = handle.ClaimEpoch.Value });
+        command.Parameters.Add(new SqlParameter("@claimExpiresAt", SqlDbType.DateTime2)
+        { Value = handle.ClaimExpiresAtUtc is { } ce ? SqlJobMapping.ToDbUtc(ce) : DBNull.Value });
         command.Parameters.Add(new SqlParameter("@recordedAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(handle.RecordedAtUtc) });
         command.Parameters.Add(new SqlParameter("@hash", SqlDbType.Char, 64) { Value = handle.HandleHash.Value });
         command.Parameters.Add(new SqlParameter("@id", SqlDbType.UniqueIdentifier) { Value = handle.Id.Value });
@@ -224,6 +232,11 @@ public sealed class SqlPurviewSasUploadHandleStore(TenantConnectionFactory conne
         { Value = candidate.ExpiredAtUtc is { } e ? SqlJobMapping.ToDbUtc(e) : DBNull.Value });
         command.Parameters.Add(new SqlParameter("@destroyedAt", SqlDbType.DateTime2)
         { Value = candidate.DestroyedAtUtc is { } d ? SqlJobMapping.ToDbUtc(d) : DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@claimOwner", SqlDbType.NVarChar, 100)
+        { Value = candidate.ClaimOwner is { } o ? o.Value : DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@claimEpoch", SqlDbType.BigInt) { Value = candidate.ClaimEpoch.Value });
+        command.Parameters.Add(new SqlParameter("@claimExpiresAt", SqlDbType.DateTime2)
+        { Value = candidate.ClaimExpiresAtUtc is { } ce ? SqlJobMapping.ToDbUtc(ce) : DBNull.Value });
         command.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = candidate.Correlation.Value });
         command.Parameters.Add(new SqlParameter("@recordedAt", SqlDbType.DateTime2) { Value = SqlJobMapping.ToDbUtc(candidate.RecordedAtUtc) });
         command.Parameters.Add(new SqlParameter("@hash", SqlDbType.Char, 64) { Value = candidate.HandleHash.Value });
@@ -234,7 +247,8 @@ public sealed class SqlPurviewSasUploadHandleStore(TenantConnectionFactory conne
             handle.Id, handle.Tenant, handle.Project, handle.Wave, handle.Generation, handle.State, handle.Fingerprint,
             handle.SecretStoreReference, handle.AuthorizedHost, handle.AuthorizedContainer, handle.KeyVersion,
             handle.ExpiresAtUtc, handle.StoredAtUtc, handle.AvailableAtUtc, handle.ConsumedAtUtc, handle.ExpiredAtUtc,
-            handle.DestroyedAtUtc, handle.Correlation, handle.RecordedAtUtc, rowVersion, handle.HandleHash);
+            handle.DestroyedAtUtc, handle.ClaimOwner, handle.ClaimEpoch, handle.ClaimExpiresAtUtc, handle.Correlation,
+            handle.RecordedAtUtc, rowVersion, handle.HandleHash);
 
     private static async Task<PurviewSasUploadHandle?> ReadOneAsync(SqlCommand command, CancellationToken cancellationToken)
     {
@@ -245,7 +259,7 @@ public sealed class SqlPurviewSasUploadHandleStore(TenantConnectionFactory conne
         }
 
         var rowVersionBytes = new byte[8];
-        _ = reader.GetBytes(20, 0, rowVersionBytes, 0, 8);
+        _ = reader.GetBytes(23, 0, rowVersionBytes, 0, 8);
 
         return PurviewSasUploadHandle.Rehydrate(
             new SasHandleId(reader.GetGuid(0)),
@@ -265,9 +279,12 @@ public sealed class SqlPurviewSasUploadHandleStore(TenantConnectionFactory conne
             reader.IsDBNull(14) ? null : SqlJobMapping.ReadUtc(reader.GetDateTime(14)),
             reader.IsDBNull(15) ? null : SqlJobMapping.ReadUtc(reader.GetDateTime(15)),
             reader.IsDBNull(16) ? null : SqlJobMapping.ReadUtc(reader.GetDateTime(16)),
-            new CorrelationId(reader.GetGuid(17)),
-            SqlJobMapping.ReadUtc(reader.GetDateTime(18)),
+            reader.IsDBNull(17) ? null : new WorkloadIdentity(reader.GetString(17)),
+            new LeaseEpoch(reader.GetInt64(18)),
+            reader.IsDBNull(19) ? null : SqlJobMapping.ReadUtc(reader.GetDateTime(19)),
+            new CorrelationId(reader.GetGuid(20)),
+            SqlJobMapping.ReadUtc(reader.GetDateTime(21)),
             RowVersion.FromBytes(rowVersionBytes),
-            new Sha256Hash(reader.GetString(19)));
+            new Sha256Hash(reader.GetString(22)));
     }
 }

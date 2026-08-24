@@ -54,8 +54,10 @@ public sealed class PurviewSasHandleIntegrityViolationException : Exception
 }
 
 /// <summary>
-/// Transição de ciclo de vida do SAS fora da ordem determinística permitida (AB-I5-004 item 9) —
-/// <c>Stored -&gt; Available -&gt; Consumed | Expired -&gt; Destroyed</c>. Nunca inclui o valor do segredo.
+/// Transição de ciclo de vida do SAS fora da ordem determinística permitida (AB-I5-004 item 9, revisado
+/// por AB-I5-006 item 2) — <c>Stored -&gt; Available -&gt; Claimed -&gt; Consumed | Expired -&gt; Destroyed</c>.
+/// Também lançada quando uma finalização/reclaim viola o fencing por época (owner reassumido tentando
+/// finalizar com uma época antiga, ou reclaim de um lease ainda ativo). Nunca inclui o valor do segredo.
 /// </summary>
 public sealed class PurviewSasLifecycleException : Exception
 {

@@ -1,13 +1,21 @@
--- I5/EPIC-06 Passo 2 — Secure SAS Intake & Custody (AB-I5-004). Migração ADITIVA e protegida por hash: só
--- cria objetos novos, sem alterar migrations já aplicadas e sem operação destrutiva. Duas tabelas:
+-- I5/EPIC-06 Passo 2 — Secure SAS Intake & Custody (AB-I5-004; ciclo de vida de claim/lease/fencing
+-- revisado por AB-I5-006 item 2/3, ainda dentro deste mesmo Passo/PR). Migração ADITIVA e protegida por
+-- hash: só cria objetos novos, sem alterar migrations já aplicadas e sem operação destrutiva. Duas tabelas:
 --   dbo.purview_sas_upload_handles  — METADADO opaco de custódia (estado, fingerprint não reversível,
---     referência opaca ao secret store, metadados NÃO secretos de host/container/expiry, linkage de
+--     referência opaca ao secret store, metadados NÃO secretos de host/container/expiry/claim, linkage de
 --     auditoria). NUNCA contém o SAS em texto claro nem ciphertext.
 --   dbo.purview_sas_secret_material — o material protegido (DPAPI) do secret store. Diferente das demais
 --     tabelas deste release, NÃO é append-only: permite DELETE explícito para a destruição local do item
 --     12 do work order. Mesmo protegido (DPAPI), nenhum GRANT de leitura é concedido à identidade de
 --     MANUTENÇÃO — apenas a aplicação, sob a identidade dedicada do workload, pode ler/gravar/apagar.
---   state (SasHandleState): Stored=0, Available=1, Consumed=2, Expired=3, Destroyed=4
+--   state (SasHandleState): Stored=0, Available=1, Consumed=2, Expired=3, Destroyed=4, Claimed=5 (valores
+--     fixados explicitamente no enum C# — Claimed foi adicionado no FINAL da faixa para nunca renumerar os
+--     demais estados).
+--   claim_owner/claim_epoch/claim_expires_at_utc — reserva de uso único sob lease/fencing por época
+--     (AB-I5-006 item 2, mesmo padrão de dbo.jobs/lease_epoch, ADR-0003): claim_epoch começa em 0 (nunca
+--     reivindicado) e incrementa a cada Claim/Reclaim; a finalização (Claimed -> Consumed) só é aceita sob
+--     a época titular exata — nunca um NULL "coringa" (claim_owner/claim_expires_at_utc só ficam
+--     preenchidos quando claim_epoch > 0).
 
 -- Metadado de custódia, versionado por (tenant, projeto, wave) via generation — a linha é MUTADA nas
 -- transições de ciclo de vida (mesmo padrão de concorrência otimista de dbo.migration_waves, row_version).
@@ -30,23 +38,33 @@ CREATE TABLE dbo.purview_sas_upload_handles
     consumed_at_utc                     DATETIME2(3) NULL,
     expired_at_utc                       DATETIME2(3) NULL,
     destroyed_at_utc                      DATETIME2(3) NULL,
+    claim_owner                            NVARCHAR(100) NULL,
+    claim_epoch                             BIGINT       NOT NULL DEFAULT 0,
+    claim_expires_at_utc                     DATETIME2(3) NULL,
     correlation_id                    UNIQUEIDENTIFIER NOT NULL,
     recorded_at_utc                     DATETIME2(3) NOT NULL,
     handle_hash                          CHAR(64)     NOT NULL,
     row_version                          ROWVERSION,
     CONSTRAINT PK_purview_sas_upload_handles PRIMARY KEY (handle_id),
     CONSTRAINT UQ_psuh_scope_generation UNIQUE (tenant_id, project_id, wave_id, generation),
-    CONSTRAINT CK_psuh_state CHECK (state BETWEEN 0 AND 4),
-    CONSTRAINT CK_psuh_generation CHECK (generation >= 1)
+    CONSTRAINT CK_psuh_state CHECK (state BETWEEN 0 AND 5),
+    CONSTRAINT CK_psuh_generation CHECK (generation >= 1),
+    CONSTRAINT CK_psuh_claim_epoch CHECK (claim_epoch >= 0),
+    -- claim_owner/claim_expires_at_utc só existem junto de uma época de claim já reivindicada (>0) — nunca
+    -- um NULL "coringa" nem um par incompleto (defesa em profundidade da mesma regra do Domain).
+    CONSTRAINT CK_psuh_claim_consistency CHECK (
+        (claim_epoch = 0 AND claim_owner IS NULL AND claim_expires_at_utc IS NULL)
+        OR (claim_epoch > 0 AND claim_owner IS NOT NULL AND claim_expires_at_utc IS NOT NULL)
+    )
 );
 
--- Backstop de canonicidade (item 16): no máximo UM handle "vivo" (Stored/Available/Consumed) por wave.
--- Expired/Destroyed (estados terminais) nunca disputam este índice — um novo intake sempre encontra a
--- geração anterior já fora dele antes de o candidato ser inserido (SqlPurviewSasUploadHandleStore marca o
+-- Backstop de canonicidade (item 16): no máximo UM handle "vivo" (Stored/Available/Claimed/Consumed) por
+-- wave. Expired/Destroyed (estados terminais) nunca disputam este índice — um novo intake sempre encontra
+-- a geração anterior já fora dele antes de o candidato ser inserido (SqlPurviewSasUploadHandleStore marca o
 -- anterior Destroyed na MESMA transação do insert da nova geração).
 CREATE UNIQUE INDEX UX_psuh_canonical_live
     ON dbo.purview_sas_upload_handles (tenant_id, project_id, wave_id)
-    WHERE state IN (0, 1, 2);
+    WHERE state IN (0, 1, 2, 5);
 
 CREATE INDEX IX_psuh_latest ON dbo.purview_sas_upload_handles (tenant_id, project_id, wave_id, generation DESC);
 GO

@@ -1,6 +1,7 @@
 using System.Globalization;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.IdentityAndAccess;
+using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Domain.Waves;
 
@@ -13,16 +14,21 @@ namespace ArchiveBridge.Domain.TargetIngestion.Purview;
 /// secreto em si NUNCA atravessa este tipo — só <see cref="SecretStoreReference"/> (ver
 /// <see cref="PurviewSasIntakePolicy"/>/<c>ISecretStore</c>).
 /// <para>
-/// Ciclo de vida (item 9): <c>Stored -&gt; Available -&gt; Consumed | Expired -&gt; Destroyed</c>, aplicado
-/// pelos métodos de transição abaixo — cada um recusa fail-closed uma transição fora da ordem permitida
-/// (<see cref="PurviewSasLifecycleException"/>). <see cref="Destroy"/> é idempotente (item 9: transições
-/// determinísticas); as demais não são.
+/// Ciclo de vida (item 9, revisado por AB-I5-006 item 3): <c>Stored -&gt; Available -&gt; Claimed -&gt;
+/// Consumed | Expired -&gt; Destroyed</c>, aplicado pelos métodos de transição abaixo — cada um recusa
+/// fail-closed uma transição fora da ordem permitida (<see cref="PurviewSasLifecycleException"/>).
+/// <see cref="SasHandleState.Claimed"/> é uma reserva DURÁVEL de uso único com lease/fencing por época
+/// (<see cref="ClaimEpoch"/>, mesmo padrão de <c>Job</c>/<see cref="LeaseEpoch"/>, ADR-0003): reivindicar
+/// (<see cref="Claim"/>) incrementa a época; a finalização (<see cref="FinalizeClaim"/>) só é aceita sob a
+/// MESMA época titular — um owner reassumido por <see cref="Reclaim"/> (lease expirado) nunca consegue
+/// finalizar com a época antiga. <see cref="Destroy"/> é idempotente (item 9: transições determinísticas);
+/// as demais não são.
 /// </para>
 /// <para>
 /// <see cref="Generation"/> versiona o handle CANÔNICO de uma wave (item 15): um novo intake para a MESMA
 /// wave cria uma nova geração e invalida (destrói) a anterior de forma explícita e auditável — nunca duas
-/// gerações simultaneamente "vivas" (Stored/Available/Consumed) para a mesma wave (item 16), reforçado por
-/// índice único filtrado na Infrastructure.
+/// gerações simultaneamente "vivas" (Stored/Available/Claimed/Consumed) para a mesma wave (item 16),
+/// reforçado por índice único filtrado na Infrastructure.
 /// </para>
 /// <para>
 /// A persistência é fronteira NÃO CONFIÁVEL (mesmo princípio de <c>CapabilityEvidence</c>/
@@ -50,6 +56,9 @@ public sealed record PurviewSasUploadHandle
         DateTimeOffset? consumedAtUtc,
         DateTimeOffset? expiredAtUtc,
         DateTimeOffset? destroyedAtUtc,
+        WorkloadIdentity? claimOwner,
+        LeaseEpoch claimEpoch,
+        DateTimeOffset? claimExpiresAtUtc,
         CorrelationId correlation,
         DateTimeOffset recordedAtUtc,
         RowVersion rowVersion,
@@ -72,13 +81,16 @@ public sealed record PurviewSasUploadHandle
         ConsumedAtUtc = consumedAtUtc;
         ExpiredAtUtc = expiredAtUtc;
         DestroyedAtUtc = destroyedAtUtc;
+        ClaimOwner = claimOwner;
+        ClaimEpoch = claimEpoch;
+        ClaimExpiresAtUtc = claimExpiresAtUtc;
         Correlation = correlation;
         RecordedAtUtc = recordedAtUtc;
         RowVersion = rowVersion;
         HandleHash = handleHash;
     }
 
-    /// <summary>Registra um novo intake (geração) em estado <see cref="SasHandleState.Stored"/>.</summary>
+    /// <summary>Registra um novo intake (geração) em estado <see cref="SasHandleState.Stored"/>, sem claim ativo.</summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="generation"/> não é positivo.</exception>
     public static PurviewSasUploadHandle Intake(
         SasHandleId id,
@@ -108,12 +120,12 @@ public sealed record PurviewSasUploadHandle
         var hash = ComputeHandleHash(
             id, tenant, project, wave, generation, SasHandleState.Stored, fingerprint, secretStoreReference,
             sanitizedHost, sanitizedContainer, keyVersion, canonicalExpiresAtUtc, canonicalNowUtc, null, null, null,
-            null, correlation, canonicalNowUtc);
+            null, null, LeaseEpoch.Initial, null, correlation, canonicalNowUtc);
 
         return new PurviewSasUploadHandle(
             id, tenant, project, wave, generation, SasHandleState.Stored, fingerprint, secretStoreReference,
             sanitizedHost, sanitizedContainer, keyVersion, canonicalExpiresAtUtc, canonicalNowUtc, null, null, null,
-            null, correlation, canonicalNowUtc, RowVersion.None, hash);
+            null, null, LeaseEpoch.Initial, null, correlation, canonicalNowUtc, RowVersion.None, hash);
     }
 
     /// <summary>
@@ -140,6 +152,9 @@ public sealed record PurviewSasUploadHandle
         DateTimeOffset? consumedAtUtc,
         DateTimeOffset? expiredAtUtc,
         DateTimeOffset? destroyedAtUtc,
+        WorkloadIdentity? claimOwner,
+        LeaseEpoch claimEpoch,
+        DateTimeOffset? claimExpiresAtUtc,
         CorrelationId correlation,
         DateTimeOffset recordedAtUtc,
         RowVersion rowVersion,
@@ -148,7 +163,7 @@ public sealed record PurviewSasUploadHandle
         var recomputed = ComputeHandleHash(
             id, tenant, project, wave, generation, state, fingerprint, secretStoreReference, authorizedHost,
             authorizedContainer, keyVersion, expiresAtUtc, storedAtUtc, availableAtUtc, consumedAtUtc, expiredAtUtc,
-            destroyedAtUtc, correlation, recordedAtUtc);
+            destroyedAtUtc, claimOwner, claimEpoch, claimExpiresAtUtc, correlation, recordedAtUtc);
         if (!string.Equals(recomputed.Value, persistedHandleHash.Value, StringComparison.Ordinal))
         {
             throw new PurviewSasHandleIntegrityViolationException(
@@ -159,7 +174,8 @@ public sealed record PurviewSasUploadHandle
         return new PurviewSasUploadHandle(
             id, tenant, project, wave, generation, state, fingerprint, secretStoreReference, authorizedHost,
             authorizedContainer, keyVersion, expiresAtUtc, storedAtUtc, availableAtUtc, consumedAtUtc, expiredAtUtc,
-            destroyedAtUtc, correlation, recordedAtUtc, rowVersion, persistedHandleHash);
+            destroyedAtUtc, claimOwner, claimEpoch, claimExpiresAtUtc, correlation, recordedAtUtc, rowVersion,
+            persistedHandleHash);
     }
 
     /// <summary>Transição <c>Stored -&gt; Available</c> — confirma que o segredo está pronto para UMA aquisição.</summary>
@@ -175,14 +191,84 @@ public sealed record PurviewSasUploadHandle
         return Rebuild(SasHandleState.Available, nowUtc, availableAtUtc: TruncateToMilliseconds(nowUtc));
     }
 
-    /// <summary>Transição <c>Available -&gt; Consumed</c> — uso único (policy deste Passo, item 11).</summary>
+    /// <summary>
+    /// Transição <c>Available -&gt; Claimed</c> — reivindica exclusividade de uso único sob lease/fencing
+    /// (AB-I5-006 item 2). Incrementa <see cref="ClaimEpoch"/> (mesmo padrão de fencing de <c>Job</c>): um
+    /// owner que perder a corrida do <see cref="ConcurrencyException"/> subjacente (a Application persiste
+    /// via <c>row_version</c>) nunca chega a observar o segredo, pois a finalização (<see cref="FinalizeClaim"/>)
+    /// só é aceita sob a época devolvida por ESTA chamada.
+    /// </summary>
     /// <exception cref="PurviewSasLifecycleException">O handle não está em <see cref="SasHandleState.Available"/>.</exception>
-    public PurviewSasUploadHandle MarkConsumed(DateTimeOffset nowUtc)
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="leaseExpiresAtUtc"/> não é estritamente futuro.</exception>
+    public PurviewSasUploadHandle Claim(WorkloadIdentity owner, DateTimeOffset leaseExpiresAtUtc, DateTimeOffset nowUtc)
     {
         if (State != SasHandleState.Available)
         {
             throw new PurviewSasLifecycleException(
-                $"Transição para Consumed inválida a partir de {State} (handle {Id.Value}).");
+                $"Transição para Claimed inválida a partir de {State} (handle {Id.Value}).");
+        }
+
+        if (leaseExpiresAtUtc <= nowUtc)
+        {
+            throw new ArgumentOutOfRangeException(nameof(leaseExpiresAtUtc), leaseExpiresAtUtc, "O lease de claim deve expirar estritamente no futuro.");
+        }
+
+        return Rebuild(
+            SasHandleState.Claimed, nowUtc,
+            claimOwner: owner, claimEpoch: ClaimEpoch.Next(), claimExpiresAtUtc: TruncateToMilliseconds(leaseExpiresAtUtc));
+    }
+
+    /// <summary>
+    /// Reivindicação de recuperação (<c>Claimed -&gt; Claimed</c>) — SOMENTE quando o lease titular já
+    /// expirou (AB-I5-006 item 2: "reclaim atômico após expiração"). Rotaciona owner/época: o titular
+    /// anterior (época defasada) nunca mais consegue <see cref="FinalizeClaim"/> nem reivindicar de volta
+    /// sem um novo <see cref="Claim"/>/<see cref="Reclaim"/> legítimo. Torna cancelamento/crash do
+    /// adquirente anterior RECUPERÁVEL sem queimar a geração (nunca readquirível permanentemente).
+    /// </summary>
+    /// <exception cref="PurviewSasLifecycleException">
+    /// O handle não está em <see cref="SasHandleState.Claimed"/>, ou o lease titular ainda não expirou.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="leaseExpiresAtUtc"/> não é estritamente futuro.</exception>
+    public PurviewSasUploadHandle Reclaim(WorkloadIdentity newOwner, DateTimeOffset leaseExpiresAtUtc, DateTimeOffset nowUtc)
+    {
+        if (State != SasHandleState.Claimed)
+        {
+            throw new PurviewSasLifecycleException(
+                $"Reclaim inválido a partir de {State} (handle {Id.Value}) — só se aplica a um claim ativo.");
+        }
+
+        if (ClaimExpiresAtUtc is null || ClaimExpiresAtUtc.Value > nowUtc)
+        {
+            throw new PurviewSasLifecycleException(
+                $"Reclaim recusado (fail-closed): o lease titular do handle {Id.Value} ainda não expirou.");
+        }
+
+        if (leaseExpiresAtUtc <= nowUtc)
+        {
+            throw new ArgumentOutOfRangeException(nameof(leaseExpiresAtUtc), leaseExpiresAtUtc, "O lease de claim deve expirar estritamente no futuro.");
+        }
+
+        return Rebuild(
+            SasHandleState.Claimed, nowUtc,
+            claimOwner: newOwner, claimEpoch: ClaimEpoch.Next(), claimExpiresAtUtc: TruncateToMilliseconds(leaseExpiresAtUtc));
+    }
+
+    /// <summary>
+    /// Transição <c>Claimed -&gt; Consumed</c> — finaliza o uso único SOMENTE sob a MESMA identidade e
+    /// época do claim titular (fencing, AB-I5-006 item 2). Deve ser chamada pela Application SOMENTE
+    /// depois de <c>ISecretStore.AcquireAsync</c> já ter devolvido o segredo com sucesso — nunca antes
+    /// (item 2: "finalize/consume somente após leitura bem-sucedida do secret store").
+    /// </summary>
+    /// <exception cref="PurviewSasLifecycleException">
+    /// O handle não está em <see cref="SasHandleState.Claimed"/> sob exatamente este owner/época — inclui o
+    /// caso de um owner reassumido por <see cref="Reclaim"/> tentando finalizar com a época antiga.
+    /// </exception>
+    public PurviewSasUploadHandle FinalizeClaim(WorkloadIdentity owner, LeaseEpoch epoch, DateTimeOffset nowUtc)
+    {
+        if (State != SasHandleState.Claimed || ClaimOwner != owner || ClaimEpoch != epoch)
+        {
+            throw new PurviewSasLifecycleException(
+                $"Finalize recusado por fencing: o handle {Id.Value} não está sob o claim informado (owner + época).");
         }
 
         return Rebuild(SasHandleState.Consumed, nowUtc, consumedAtUtc: TruncateToMilliseconds(nowUtc));
@@ -221,23 +307,31 @@ public sealed record PurviewSasUploadHandle
         DateTimeOffset? availableAtUtc = null,
         DateTimeOffset? consumedAtUtc = null,
         DateTimeOffset? expiredAtUtc = null,
-        DateTimeOffset? destroyedAtUtc = null)
+        DateTimeOffset? destroyedAtUtc = null,
+        WorkloadIdentity? claimOwner = null,
+        LeaseEpoch? claimEpoch = null,
+        DateTimeOffset? claimExpiresAtUtc = null)
     {
         var canonicalNowUtc = TruncateToMilliseconds(nowUtc);
         var newAvailableAtUtc = availableAtUtc ?? AvailableAtUtc;
         var newConsumedAtUtc = consumedAtUtc ?? ConsumedAtUtc;
         var newExpiredAtUtc = expiredAtUtc ?? ExpiredAtUtc;
         var newDestroyedAtUtc = destroyedAtUtc ?? DestroyedAtUtc;
+        var newClaimOwner = claimOwner ?? ClaimOwner;
+        var newClaimEpoch = claimEpoch ?? ClaimEpoch;
+        var newClaimExpiresAtUtc = claimExpiresAtUtc ?? ClaimExpiresAtUtc;
 
         var hash = ComputeHandleHash(
             Id, Tenant, Project, Wave, Generation, newState, Fingerprint, SecretStoreReference, AuthorizedHost,
             AuthorizedContainer, KeyVersion, ExpiresAtUtc, StoredAtUtc, newAvailableAtUtc, newConsumedAtUtc,
-            newExpiredAtUtc, newDestroyedAtUtc, Correlation, canonicalNowUtc);
+            newExpiredAtUtc, newDestroyedAtUtc, newClaimOwner, newClaimEpoch, newClaimExpiresAtUtc, Correlation,
+            canonicalNowUtc);
 
         return new PurviewSasUploadHandle(
             Id, Tenant, Project, Wave, Generation, newState, Fingerprint, SecretStoreReference, AuthorizedHost,
             AuthorizedContainer, KeyVersion, ExpiresAtUtc, StoredAtUtc, newAvailableAtUtc, newConsumedAtUtc,
-            newExpiredAtUtc, newDestroyedAtUtc, Correlation, canonicalNowUtc, RowVersion, hash);
+            newExpiredAtUtc, newDestroyedAtUtc, newClaimOwner, newClaimEpoch, newClaimExpiresAtUtc, Correlation,
+            canonicalNowUtc, RowVersion, hash);
     }
 
     /// <summary>Identidade do handle.</summary>
@@ -291,6 +385,26 @@ public sealed record PurviewSasUploadHandle
     /// <summary>Instante da destruição local; <see langword="null"/> se ainda não ocorreu.</summary>
     public DateTimeOffset? DestroyedAtUtc { get; }
 
+    /// <summary>
+    /// Identidade titular do claim ativo/mais recente; <see langword="null"/> enquanto nenhum claim foi
+    /// reivindicado (mesmo após <see cref="Reclaim"/>, retém o owner MAIS RECENTE — nunca o histórico
+    /// completo, que vive na trilha de auditoria/correlação, não neste agregado).
+    /// </summary>
+    public WorkloadIdentity? ClaimOwner { get; }
+
+    /// <summary>
+    /// Época de fencing do claim (AB-I5-006 item 2, mesmo padrão de <see cref="LeaseEpoch"/> em <c>Job</c>):
+    /// <see cref="LeaseEpoch.Initial"/> (zero) enquanto nunca reivindicado; incrementa a cada
+    /// <see cref="Claim"/>/<see cref="Reclaim"/>. <see cref="FinalizeClaim"/> só aceita a época EXATA.
+    /// </summary>
+    public LeaseEpoch ClaimEpoch { get; }
+
+    /// <summary>
+    /// Instante em que o claim ativo/mais recente deixa (ou deixou) de ser titular — um <see cref="Reclaim"/>
+    /// só é aceito quando este instante já ficou no passado. <see langword="null"/> enquanto nunca reivindicado.
+    /// </summary>
+    public DateTimeOffset? ClaimExpiresAtUtc { get; }
+
     /// <summary>Correlação com a trilha de auditoria (item 8: linkage de auditoria).</summary>
     public CorrelationId Correlation { get; }
 
@@ -308,7 +422,8 @@ public sealed record PurviewSasUploadHandle
         Sha256Hash fingerprint, SecretStoreHandleReference secretStoreReference, string authorizedHost,
         string authorizedContainer, int? keyVersion, DateTimeOffset expiresAtUtc, DateTimeOffset storedAtUtc,
         DateTimeOffset? availableAtUtc, DateTimeOffset? consumedAtUtc, DateTimeOffset? expiredAtUtc,
-        DateTimeOffset? destroyedAtUtc, CorrelationId correlation, DateTimeOffset recordedAtUtc) =>
+        DateTimeOffset? destroyedAtUtc, WorkloadIdentity? claimOwner, LeaseEpoch claimEpoch,
+        DateTimeOffset? claimExpiresAtUtc, CorrelationId correlation, DateTimeOffset recordedAtUtc) =>
         DeterministicHash.Compute(
         [
             id.Value.ToString("N"),
@@ -328,6 +443,9 @@ public sealed record PurviewSasUploadHandle
             consumedAtUtc is { } c ? TruncateToMilliseconds(c).UtcTicks.ToString(CultureInfo.InvariantCulture) : string.Empty,
             expiredAtUtc is { } e ? TruncateToMilliseconds(e).UtcTicks.ToString(CultureInfo.InvariantCulture) : string.Empty,
             destroyedAtUtc is { } d ? TruncateToMilliseconds(d).UtcTicks.ToString(CultureInfo.InvariantCulture) : string.Empty,
+            claimOwner?.Value ?? string.Empty,
+            claimEpoch.Value.ToString(CultureInfo.InvariantCulture),
+            claimExpiresAtUtc is { } ce ? TruncateToMilliseconds(ce).UtcTicks.ToString(CultureInfo.InvariantCulture) : string.Empty,
             correlation.Value.ToString("N"),
             TruncateToMilliseconds(recordedAtUtc).UtcTicks.ToString(CultureInfo.InvariantCulture),
         ]);

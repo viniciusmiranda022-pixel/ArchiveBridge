@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text.Json;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.IdentityAndAccess;
+using ArchiveBridge.Domain.Jobs;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Domain.TargetIngestion.Purview;
 using ArchiveBridge.Domain.Waves;
@@ -363,11 +364,16 @@ public sealed class Slice5PurviewSasDomainTests
         Assert.Equal(SasHandleState.Available, available.State);
         Assert.NotNull(available.AvailableAtUtc);
 
-        var consumed = available.MarkConsumed(Now.AddMinutes(2));
+        var claimed = available.Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(6), Now.AddMinutes(2));
+        Assert.Equal(SasHandleState.Claimed, claimed.State);
+        Assert.Equal(WorkloadIdentities.UploadWorker, claimed.ClaimOwner);
+        Assert.Equal(1, claimed.ClaimEpoch.Value);
+
+        var consumed = claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Now.AddMinutes(3));
         Assert.Equal(SasHandleState.Consumed, consumed.State);
         Assert.NotNull(consumed.ConsumedAtUtc);
 
-        var destroyed = consumed.Destroy(Now.AddMinutes(3));
+        var destroyed = consumed.Destroy(Now.AddMinutes(4));
         Assert.Equal(SasHandleState.Destroyed, destroyed.State);
         Assert.NotNull(destroyed.DestroyedAtUtc);
     }
@@ -379,14 +385,115 @@ public sealed class Slice5PurviewSasDomainTests
         Assert.Throws<PurviewSasLifecycleException>(() => available.MarkAvailable(Now));
     }
 
+    // ---- Claim / Reclaim / FinalizeClaim (AB-I5-006 item 2: lease/fencing por época) ------------------
+
     [Fact]
-    public void MarkConsumedFromNonAvailableStateThrows()
+    public void ClaimFromNonAvailableStateThrows()
     {
         var stored = NewStoredHandle();
-        Assert.Throws<PurviewSasLifecycleException>(() => stored.MarkConsumed(Now));
+        Assert.Throws<PurviewSasLifecycleException>(() => stored.Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now));
 
-        var consumedOnce = stored.MarkAvailable(Now).MarkConsumed(Now);
-        Assert.Throws<PurviewSasLifecycleException>(() => consumedOnce.MarkConsumed(Now));
+        var claimedOnce = stored.MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        Assert.Throws<PurviewSasLifecycleException>(() => claimedOnce.Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now));
+    }
+
+    [Fact]
+    public void ClaimWithANonFutureLeaseExpiryThrows()
+    {
+        var available = NewStoredHandle().MarkAvailable(Now);
+        Assert.Throws<ArgumentOutOfRangeException>(() => available.Claim(WorkloadIdentities.UploadWorker, Now, Now));
+        Assert.Throws<ArgumentOutOfRangeException>(() => available.Claim(WorkloadIdentities.UploadWorker, Now.AddSeconds(-1), Now));
+    }
+
+    [Fact]
+    public void ClaimIncrementsTheEpochEachTimeItIsReivindicated()
+    {
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        Assert.Equal(1, claimed.ClaimEpoch.Value);
+        Assert.Equal(WorkloadIdentities.UploadWorker, claimed.ClaimOwner);
+        Assert.NotNull(claimed.ClaimExpiresAtUtc);
+    }
+
+    [Fact]
+    public void FinalizeClaimUnderTheCorrectOwnerAndEpochTransitionsToConsumed()
+    {
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        var consumed = claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Now.AddMinutes(1));
+
+        Assert.Equal(SasHandleState.Consumed, consumed.State);
+        Assert.NotNull(consumed.ConsumedAtUtc);
+        // O owner/época do claim titular permanecem no registro mesmo após a finalização (trilha de quem consumiu).
+        Assert.Equal(WorkloadIdentities.UploadWorker, consumed.ClaimOwner);
+        Assert.Equal(claimed.ClaimEpoch, consumed.ClaimEpoch);
+    }
+
+    [Fact]
+    public void FinalizeClaimFromNonClaimedStateThrows()
+    {
+        var available = NewStoredHandle().MarkAvailable(Now);
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => available.FinalizeClaim(WorkloadIdentities.UploadWorker, LeaseEpoch.Initial.Next(), Now));
+    }
+
+    [Fact]
+    public void FinalizeClaimWithTheWrongOwnerIsRejectedByFencing()
+    {
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => claimed.FinalizeClaim(new WorkloadIdentity("SomeoneElse"), claimed.ClaimEpoch, Now));
+    }
+
+    [Fact]
+    public void FinalizeClaimWithAStaleEpochIsRejectedByFencing()
+    {
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        var staleEpoch = claimed.ClaimEpoch;
+        var reclaimed = claimed.Reclaim(WorkloadIdentities.UploadWorker, Now.AddMinutes(10), Now.AddMinutes(6));
+
+        // O MESMO owner, mas com a época ANTIGA (do claim já reassumido) — nunca finaliza (item 2: "owner
+        // antigo não pode finalizar/reabrir claim reassumido").
+        Assert.NotEqual(staleEpoch, reclaimed.ClaimEpoch);
+        Assert.Throws<PurviewSasLifecycleException>(() => reclaimed.FinalizeClaim(WorkloadIdentities.UploadWorker, staleEpoch, Now.AddMinutes(6)));
+    }
+
+    [Fact]
+    public void ReclaimBeforeTheLeaseExpiresIsRejectedFailClosed()
+    {
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => claimed.Reclaim(new WorkloadIdentity("AnotherWorker"), Now.AddMinutes(10), Now.AddMinutes(1)));
+    }
+
+    [Fact]
+    public void ReclaimExactlyAtLeaseExpiryIsAccepted()
+    {
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        var reclaimed = claimed.Reclaim(WorkloadIdentities.UploadWorker, Now.AddMinutes(11), Now.AddMinutes(5));
+
+        Assert.Equal(SasHandleState.Claimed, reclaimed.State);
+        Assert.Equal(2, reclaimed.ClaimEpoch.Value);
+    }
+
+    [Fact]
+    public void ReclaimFromNonClaimedStateThrows()
+    {
+        var available = NewStoredHandle().MarkAvailable(Now);
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => available.Reclaim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now));
+    }
+
+    [Fact]
+    public void ReclaimRotatesTheOwnerAndTheOldOwnerCanNeverFinalizeAgain()
+    {
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(new WorkloadIdentity("OldOwner"), Now.AddMinutes(5), Now);
+        var reclaimed = claimed.Reclaim(new WorkloadIdentity("NewOwner"), Now.AddMinutes(11), Now.AddMinutes(5));
+
+        Assert.Equal(new WorkloadIdentity("NewOwner"), reclaimed.ClaimOwner);
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => reclaimed.FinalizeClaim(new WorkloadIdentity("OldOwner"), reclaimed.ClaimEpoch, Now.AddMinutes(6)));
+
+        var consumed = reclaimed.FinalizeClaim(new WorkloadIdentity("NewOwner"), reclaimed.ClaimEpoch, Now.AddMinutes(6));
+        Assert.Equal(SasHandleState.Consumed, consumed.State);
     }
 
     [Fact]
@@ -397,6 +504,18 @@ public sealed class Slice5PurviewSasDomainTests
 
         var destroyed = expired.Destroy(Now);
         Assert.Throws<PurviewSasLifecycleException>(() => destroyed.MarkAvailable(Now));
+    }
+
+    [Fact]
+    public void ClaimedCanTransitionDirectlyToExpiredOrBeDestroyed()
+    {
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+
+        var expired = claimed.MarkExpired(Now.AddMinutes(1));
+        Assert.Equal(SasHandleState.Expired, expired.State);
+
+        var destroyed = claimed.Destroy(Now.AddMinutes(1));
+        Assert.Equal(SasHandleState.Destroyed, destroyed.State);
     }
 
     [Fact]
@@ -430,7 +549,41 @@ public sealed class Slice5PurviewSasDomainTests
             handle.Id, handle.Tenant, handle.Project, handle.Wave, handle.Generation, handle.State, tamperedFingerprint,
             handle.SecretStoreReference, handle.AuthorizedHost, handle.AuthorizedContainer, handle.KeyVersion,
             handle.ExpiresAtUtc, handle.StoredAtUtc, handle.AvailableAtUtc, handle.ConsumedAtUtc, handle.ExpiredAtUtc,
-            handle.DestroyedAtUtc, handle.Correlation, handle.RecordedAtUtc, RowVersion.None, handle.HandleHash));
+            handle.DestroyedAtUtc, handle.ClaimOwner, handle.ClaimEpoch, handle.ClaimExpiresAtUtc, handle.Correlation,
+            handle.RecordedAtUtc, RowVersion.None, handle.HandleHash));
+    }
+
+    [Fact]
+    public void RehydrateFailsClosedWhenTheClaimOwnerIsTamperedIndependentlyOfTheHash()
+    {
+        // Um claim ativo cujo owner é forjado (ex.: linha adulterada diretamente no SQL) diverge do
+        // handle_hash persistido — a fronteira NÃO CONFIÁVEL cobre TAMBÉM os campos de claim/fencing, não
+        // só os campos herdados de antes de AB-I5-006.
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        var tamperedOwner = new WorkloadIdentity("AttackerControlled");
+
+        Assert.Throws<PurviewSasHandleIntegrityViolationException>(() => PurviewSasUploadHandle.Rehydrate(
+            claimed.Id, claimed.Tenant, claimed.Project, claimed.Wave, claimed.Generation, claimed.State, claimed.Fingerprint,
+            claimed.SecretStoreReference, claimed.AuthorizedHost, claimed.AuthorizedContainer, claimed.KeyVersion,
+            claimed.ExpiresAtUtc, claimed.StoredAtUtc, claimed.AvailableAtUtc, claimed.ConsumedAtUtc, claimed.ExpiredAtUtc,
+            claimed.DestroyedAtUtc, tamperedOwner, claimed.ClaimEpoch, claimed.ClaimExpiresAtUtc, claimed.Correlation,
+            claimed.RecordedAtUtc, RowVersion.None, claimed.HandleHash));
+    }
+
+    [Fact]
+    public void RehydrateFailsClosedWhenTheClaimEpochIsTamperedIndependentlyOfTheHash()
+    {
+        // Uma época de fencing forjada para trás (ex.: um invasor tentando "reabrir" um claim antigo) é
+        // pega pela mesma fronteira NÃO CONFIÁVEL — nunca confiada implicitamente porque "veio do SQL".
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        var tamperedEpoch = LeaseEpoch.Initial;
+
+        Assert.Throws<PurviewSasHandleIntegrityViolationException>(() => PurviewSasUploadHandle.Rehydrate(
+            claimed.Id, claimed.Tenant, claimed.Project, claimed.Wave, claimed.Generation, claimed.State, claimed.Fingerprint,
+            claimed.SecretStoreReference, claimed.AuthorizedHost, claimed.AuthorizedContainer, claimed.KeyVersion,
+            claimed.ExpiresAtUtc, claimed.StoredAtUtc, claimed.AvailableAtUtc, claimed.ConsumedAtUtc, claimed.ExpiredAtUtc,
+            claimed.DestroyedAtUtc, claimed.ClaimOwner, tamperedEpoch, claimed.ClaimExpiresAtUtc, claimed.Correlation,
+            claimed.RecordedAtUtc, RowVersion.None, claimed.HandleHash));
     }
 
     [Fact]
@@ -441,10 +594,27 @@ public sealed class Slice5PurviewSasDomainTests
             handle.Id, handle.Tenant, handle.Project, handle.Wave, handle.Generation, handle.State, handle.Fingerprint,
             handle.SecretStoreReference, handle.AuthorizedHost, handle.AuthorizedContainer, handle.KeyVersion,
             handle.ExpiresAtUtc, handle.StoredAtUtc, handle.AvailableAtUtc, handle.ConsumedAtUtc, handle.ExpiredAtUtc,
-            handle.DestroyedAtUtc, handle.Correlation, handle.RecordedAtUtc, RowVersion.None, handle.HandleHash);
+            handle.DestroyedAtUtc, handle.ClaimOwner, handle.ClaimEpoch, handle.ClaimExpiresAtUtc, handle.Correlation,
+            handle.RecordedAtUtc, RowVersion.None, handle.HandleHash);
 
         Assert.Equal(handle.HandleHash.Value, rehydrated.HandleHash.Value);
         Assert.Equal(SasHandleState.Stored, rehydrated.State);
+    }
+
+    [Fact]
+    public void RehydrateSucceedsForAClaimedHandleWhenAllLoadedFieldsMatchThePersistedHash()
+    {
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        var rehydrated = PurviewSasUploadHandle.Rehydrate(
+            claimed.Id, claimed.Tenant, claimed.Project, claimed.Wave, claimed.Generation, claimed.State, claimed.Fingerprint,
+            claimed.SecretStoreReference, claimed.AuthorizedHost, claimed.AuthorizedContainer, claimed.KeyVersion,
+            claimed.ExpiresAtUtc, claimed.StoredAtUtc, claimed.AvailableAtUtc, claimed.ConsumedAtUtc, claimed.ExpiredAtUtc,
+            claimed.DestroyedAtUtc, claimed.ClaimOwner, claimed.ClaimEpoch, claimed.ClaimExpiresAtUtc, claimed.Correlation,
+            claimed.RecordedAtUtc, RowVersion.None, claimed.HandleHash);
+
+        Assert.Equal(claimed.HandleHash.Value, rehydrated.HandleHash.Value);
+        Assert.Equal(SasHandleState.Claimed, rehydrated.State);
+        Assert.Equal(WorkloadIdentities.UploadWorker, rehydrated.ClaimOwner);
     }
 
     // ---- Identidade de workload ----------------------------------------------------------------------
