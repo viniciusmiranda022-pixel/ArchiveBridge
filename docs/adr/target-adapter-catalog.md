@@ -43,15 +43,17 @@ arquitetura** do adapter — não para uma promoção já prevista.
 
 | Adapter | Papel arquitetural | Implementação atual | Gate atual | Estado-alvo | ADR |
 | --- | --- | --- | --- | --- | --- |
-| `PurviewPstImportAdapter` | `PRIMARY_GA_TARGET` | `NOT_IMPLEMENTED` | `PENDING_ADR_0006` | `ENABLED` | [ADR-0006](0006-purview-adapter-ga-inicial.md) |
+| `PurviewPstImportAdapter` | `PRIMARY_GA_TARGET` | `IN_PROGRESS` (capability registry + prechecks read-only, I5/EPIC-06 Passo 1, AB-I5-001 — sem SAS/AzCopy/CSV/import job) | `PENDING_ADR_0006` | `ENABLED` | [ADR-0006](0006-purview-adapter-ga-inicial.md) |
 | `GraphFtsTargetAdapter` | `CONDITIONAL` | `NOT_IMPLEMENTED` | `GraphFtsImportFromPstEv = BLOCKED_PENDING_EVIDENCE` | `ENABLED` após certificação | [ADR-0007](0007-graph-fts-bloqueado.md) |
 
 Notas:
 
 - **Purview = primeiro adapter GA planejado**, não um adapter atualmente
-  habilitado em produção: não há código nem runtime e o ADR-0006 segue
-  `proposto`. Quando implementado, validado em tenant e com o ADR-0006
-  aceito, o estado-alvo é `ENABLED` (mantendo o capacity gate e o bloqueio
+  habilitado em produção: a fundação de capability registry/prechecks
+  read-only existe (I5/EPIC-06 Passo 1), mas SAS/AzCopy/CSV/import job
+  seguem fora de escopo até um Passo futuro. Quando integralmente
+  implementado, validado em tenant e com o Gate A/B do ADR-0006 satisfeitos,
+  o estado-alvo é `ENABLED` (mantendo o capacity gate e o bloqueio
   >100 GB / `MICROSOFT_ASSESSMENT_REQUIRED`). É o primeiro destino, não o
   único.
 - **Graph = segundo adapter, condicional**: disponível na arquitetura,
