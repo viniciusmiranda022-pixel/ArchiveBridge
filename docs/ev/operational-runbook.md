@@ -7,16 +7,46 @@ runbooks operacionais gerais do runbook de engenharia (§42).
 > [!NOTE]
 > **Status de implementação (2026-08).** Este documento descreve o desenho ALVO completo do conector de
 > exportação. O que está REALMENTE implementado hoje: enrollment/identidade/capability handshake/inventário
-> (Slice 4C Passo 1, AB-4C-001) e a fundação de EXECUÇÃO — comando `Export-EVArchive` construído por API
+> (Slice 4C Passo 1, AB-4C-001), a fundação de EXECUÇÃO — comando `Export-EVArchive` construído por API
 > segura (sem command injection), throttling exclusivo por connector/archive, idempotência por identidade
 > canônica do pedido, captura estruturada de resultado, manifesto canônico com hash/tamanho por output,
-> revalidação de replay fail-closed e classificação de itens oversized (Slice 4C Passo 2, AB-4C-005; delta
-> de ameaças em [`threat-model-slice-04c.md`](../security/threat-model-slice-04c.md)). O que permanece
-> FORA de escopo (STOP-THE-LINE, nenhum código no repositório): execução contra um Enterprise Vault real de
-> cliente, automação Outlook/COM, NATIVE/EML real, delta/freeze operacional real, descomissionamento EV,
-> AzCopy/Azure staging/SAS, Purview/Graph/Exchange Online/import job e reconciliação M365 — as seções
-> abaixo (modo assistido, `ExportRequestId` operacional completo, `GetProgress`, retry automático de onda)
-> descrevem esse alvo e ainda não correspondem a código executável.
+> revalidação de replay fail-closed e classificação de itens oversized (Slice 4C Passo 2, AB-4C-005) — e a
+> fundação de DELTA STRATEGY & FREEZE PLANNING: seleção determinística de strategy por versão (fail-closed
+> para versão/schema desconhecido, nunca `ReceivedDate` isolado), watermark opaco versionado com lineage,
+> fases Baseline/Delta/FinalDelta correlacionadas ao export foundation do Passo 2, e planejamento/
+> autorização FORMAL de freeze/cutover como estado — nunca execução real (Slice 4C Passo 3, AB-4C-008;
+> delta de ameaças em [`threat-model-slice-04c.md`](../security/threat-model-slice-04c.md)). O que
+> permanece FORA de escopo (STOP-THE-LINE, nenhum código no repositório): execução contra um Enterprise
+> Vault real de cliente, automação Outlook/COM, NATIVE/EML real, freeze/cutover REAL (mudança de acesso,
+> retention/policy), descomissionamento EV, AzCopy/Azure staging/SAS, Purview/Graph/Exchange Online/import
+> job e reconciliação M365 — as seções abaixo (modo assistido, `ExportRequestId` operacional completo,
+> `GetProgress`, retry automático de onda) descrevem esse alvo e ainda não correspondem a código executável.
+
+## Delta incremental e freeze/cutover (Slice 4C Passo 3)
+
+Fundação apenas — nenhuma chamada real ao Enterprise Vault para pull de delta e nenhum comando de freeze
+real existem no código deste Passo (STOP-THE-LINE).
+
+1. **Baseline**: primeira carga completa de um archive; estabelece o primeiro watermark canônico
+   (`EvDeltaPhase.Baseline`). Exige a mesma capability EV certificada do Passo 2.
+2. **Delta**: incremental subsequente, sempre a partir do último watermark canônico aceito
+   (`EvDeltaPhase.Delta`); um watermark de outro tenant/projeto/connector/archive, de outra strategy, com
+   downgrade de versão ou stale é recusado fail-closed — nunca `ReceivedDate` isolado como único critério
+   (§16.5).
+3. **Freeze**: solicitado (`FreezeRequired`) e autorizado FORMALMENTE por operador/role competente
+   (`FreezeAuthorized`, com justificativa e correlação persistidas) antes de qualquer delta final — apenas
+   ESTADO, nunca uma ação real de congelamento de ingestão/shortcut no EV.
+4. **FinalDelta**: só elegível com `FreezeAuthorized` já persistido; ao concluir, marca o plano
+   `FinalDeltaReady`.
+5. **Cutover/rollback retention**: confirmação de cutover avança o plano para
+   `RollbackRetentionRequired` — apenas registro de estado, nunca a troca de acesso real do usuário.
+6. **Descomissionamento**: permanece SEMPRE `DecommissionBlocked` neste Passo — não há caminho de código
+   que libere descomissionamento sem sign-off/retenção/reconciliação de um Passo POSTERIOR.
+
+A delta strategy concreta (`EV-COMPOSITE-WATERMARK@v1`, [`compatibility-matrix.md`](compatibility-matrix.md))
+é `Compatible` para as mesmas famílias candidatas do adapter de export — nenhuma certificada ainda; a
+emissão real do watermark contra um host EV (via o mesmo mecanismo `Export-EVArchive` do Passo 2, com o
+filtro incremental aprovado) é trabalho de um Passo posterior de certificação.
 
 ## Instalação
 

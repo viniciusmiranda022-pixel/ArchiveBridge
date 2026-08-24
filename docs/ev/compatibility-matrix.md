@@ -51,3 +51,26 @@ build.
 3. A matriz é referenciada pela fábrica de adapters em runtime (dados de
    certificação embarcados e versionados); divergência entre matriz e
    binário publicado é defeito de release.
+
+## Matriz de delta strategy (Slice 4C Passo 3, AB-4C-008)
+
+Mesma regra de honestidade comercial acima, aplicada à SELEÇÃO DE DELTA STRATEGY
+(`EvDeltaStrategySelectionPolicy`, embarcada em `EvDeltaStrategyCatalog`): nenhuma
+família começa **certificada**; uma versão não reconhecida por nenhuma família
+aparece como **`Unknown`** (fail-closed, nunca inferida); uma família reconhecida
+mas explicitamente vetada aparece como **`Unsupported`**. A strategy candidata
+`EV-COMPOSITE-WATERMARK@v1` (Infrastructure: `EvCompositeWatermarkDeltaStrategyAdapter`)
+emite um watermark opaco composto — **nunca** `ReceivedDate` isolado como único
+critério (§16.5) — mas nenhuma chamada real a um host EV foi ainda validada em
+laboratório.
+
+| Versão EV | Delta strategy | Nível | Fases suportadas (candidatura) | Status |
+| --- | --- | --- | --- | --- |
+| 15.x / 14.x / 13.x / 12.1–12.x (≥12.1) / 12.0 / 11.x / 10.x | `EV-COMPOSITE-WATERMARK@v1` (candidato) | compatível | Baseline, Delta, FinalDelta — sujeitas a capability discovery + certificação | **planejado** |
+| < 10.0 ou versão não reconhecida | — | — | nenhuma (bloqueio fail-closed, `Unknown`) | **não avaliável** |
+| Família reconhecida e explicitamente vetada | — | — | nenhuma (bloqueio fail-closed, `Unsupported`) | **não suportado** |
+
+A emissão real do watermark contra um host EV (reaproveitando o mesmo mecanismo
+`Export-EVArchive`/PowerShell do adapter de export, com o filtro incremental
+aprovado) e a promoção a `testado`/`certificado` são trabalho de um Passo
+POSTERIOR de certificação — nenhuma versão é certificada por este documento.
