@@ -126,3 +126,75 @@ autorizado, automação Outlook/COM, NATIVE/EML conversion real, delta/freeze op
 descomissionamento EV, AzCopy/Azure staging/SAS, Purview/Graph/Exchange Online/import job, reconciliação
 M365. Nenhum destes fluxos existe no código deste Passo — não há superfície de ameaça nova a analisar
 para eles aqui.
+
+# Delta — Slice 4C, Passo 3 (EV Delta Strategy & Freeze Planning Foundation)
+
+Delta sobre o modelo de ameaças acima. Escopo: estratégia incremental/delta por versão do EV (watermarks
+opacos com lineage), correlação baseline/delta/final-delta com o export foundation do Passo 2 e
+planejamento/autorização de freeze/cutover — **sem** executar freeze real, sem alterar retention/policy/
+acesso no EV e sem descomissionamento (AB-4C-008). Nenhum comando destrutivo ou mudança operacional real
+no Enterprise Vault existe no código deste Passo.
+
+**Correção AB-4C-009 (mesmo Passo, antes de qualquer aprovação de merge):** a revisão de engenharia
+encontrou dois desvios fail-closed no HEAD original do Passo 3, corrigidos abaixo e refletidos nas duas
+linhas atualizadas da tabela de ameaças/mitigações: (1) o gate de certificação de delta strategy aceitava
+`Compatible` como suficiente para execução canônica — deveria exigir `Certified`, nível que nenhuma família
+embarcada possui neste Passo; (2) o hash de evidência do watermark (`lineage_hash`) cobria apenas os campos
+de escopo (tenant/projeto/connector/archive/fase/strategy), não `opaque_token`/`producing_execution_id`/
+`issued_at_utc` — uma linha SQL com qualquer um destes três campos adulterado ainda passava na releitura.
+
+## Ativos adicionais
+
+- **Watermarks** (`ev_watermarks`): identidade opaca, lineage (tenant/projeto/connector/archive/fase/
+  strategy/execução que o produziu) e um `opaque_token` interpretável EXCLUSIVAMENTE pelo adapter EV da
+  strategy selecionada — nunca decodificado pelo Domain/Application/Control Plane. Metadados operacionais,
+  não conteúdo de mailbox.
+- **Tentativas de execução de fase** (`ev_delta_attempts`): fase (Baseline/Delta/FinalDelta), strategy
+  resolvida (quando elegível), watermark anterior/emitido, desfecho estruturado e motivo de bloqueio —
+  append-only, mesma classificação das tentativas de exportação do Passo 2.
+- **Planos de freeze** (`ev_freeze_plans`): estado (`FreezeRequired`/`FreezeAuthorized`/`FreezeRejected`/
+  `FinalDeltaReady`/`RollbackRetentionRequired`/`DecommissionBlocked`) e, quando autorizado, o operador, o
+  role, a justificativa e a correlação — evidência de AUTORIZAÇÃO formal, nunca de execução. Única tabela
+  nova deste Passo que é MUTÁVEL (concorrência otimista por `version`), pelo mesmo motivo que os slots de
+  throttling do Passo 2 são mutáveis: representa "estado atual", não histórico append-only.
+- **Eventos de custódia/auditoria** (`ev_delta_events`): código do evento (strategy-selected/baseline-
+  started/completed/delta-requested/completed/failed/watermark-issued/accepted/rejected/freeze-requested/
+  authorized/rejected/final-delta-ready/decommission-blocked), sem conteúdo sensível.
+
+## Classificação de dados
+
+As QUATRO tabelas novas (`ev_watermarks`, `ev_delta_attempts`, `ev_freeze_plans`, `ev_delta_events`) **não
+são "zero PII"**: a identidade externa de archive e o `opaque_token` do watermark são metadados
+operacionais atribuíveis a um archive/execução específicos, mesma classificação das tabelas dos Passos
+1-2. O que elas **não** contêm: conteúdo de mailbox, credencial EV, token de acesso, private key ou
+transcript PowerShell bruto — é responsabilidade do adapter que EMITE o `opaque_token` garantir isso antes
+de entregá-lo ao Domain; `EvWatermark.Issue` (Domain) sanitiza o token (tamanho/controle) mas nunca
+inspeciona seu conteúdo interno (é opaco por design, item 3/4 do work order).
+
+## Ameaças e mitigações (delta)
+
+| Ameaça | Mitigação |
+| --- | --- |
+| Delta strategy implícita para versão/schema desconhecida, OU strategy apenas `Compatible`/`Tested` tratada como autorizada para execução canônica (AB-4C-009 item 1) | `EvDeltaStrategySelectionPolicy` nunca infere: versão não reconhecida por nenhuma família da matriz embarcada ⇒ `Unknown`; família reconhecida mas sem strategy `Certified` elegível para a fase ⇒ `Unsupported` (inclui tanto família vetada quanto família apenas `Compatible`/`Tested` — honestidade comercial, mesma regra de `ConnectorCapabilityHandshake`/`ExportCapable`); empate de precedência entre `Certified` elegíveis ⇒ `Ambiguous` — em NENHUM destes três casos o adapter EV é chamado. Como nenhuma família embarcada está `Certified` neste Passo, todo baseline/delta/final-delta real permanece bloqueado até um Passo de certificação futuro. Comprovado por `UnknownOrUnrecognizedVersionSelectsNothing`, `AKnownButNotCertifiedFamilyVersionIsUnsupportedForCanonicalExecutionInEveryPhase`, `ACertifiedDescriptorInjectedIntoThePolicyIsSelectedDeterministically`, `TwoEligibleDescriptorsTiedAtTheHighestPrecedenceAreAmbiguousFailClosed`, `BaselineWithUnknownEvVersionBlocksFailClosedAndRecordsTheAttempt`, `BaselineWithACompatibleOnlyFamilyIsBlockedFailClosedAndIsIdempotentOnRetry`, `BaselineDeltaAndFinalDeltaAreAllBlockedFailClosedOverRealSqlBecauseNoEmbeddedFamilyIsCertifiedYet`. |
+| `ReceivedDate` isolado como critério genérico de delta | Nenhum tipo do Domain/Contracts expõe ou aceita `ReceivedDate`; o `opaque_token` do watermark é responsabilidade EXCLUSIVA do adapter da strategy selecionada, nunca um campo estruturado do Domain — estruturalmente impossível ao Domain/Application decidir delta por uma única data. |
+| Watermark de outro tenant/projeto/connector/archive aceito como anterior | `EvWatermark.EnsureCanPrecede` compara tenant/projeto/connector/archive do watermark candidato contra o pedido ANTES de qualquer chamada ao adapter; qualquer divergência lança `EvWatermarkRejectedException(CrossScope)` fail-closed. Comprovado por `ACrossScopeWatermarkNeverPrecedesADeltaForAnotherArchive`, `AWatermarkFromAnotherTenantIsRejectedCrossScope`. |
+| Watermark de outra strategy ou downgrade de versão aceito silenciosamente | `EnsureCanPrecede` também recusa strategy de nome diferente (`StrategyMismatch`) e versão inferior à do watermark canônico (`StrategyDowngrade`) — nunca combina lineage de strategies distintas nem regride versão. Comprovado por `AWatermarkFromAnotherStrategyIsRejectedAsStrategyMismatch`, `AStrategyVersionDowngradeIsRejected`. |
+| Watermark stale/replay aceito como avanço de checkpoint | `EvWatermark.EnsureSucceededBy` exige que o candidato seja ESTRITAMENTE mais recente (`IssuedAtUtc`) que o canônico atual — um candidato igual ou anterior lança `EvWatermarkRejectedException(Stale)` fail-closed, mesmo que o adapter já tenha sido chamado. Comprovado por `AStaleCandidateWatermarkIsRejected`. |
+| Evidência de watermark persistida adulterada sendo lida como canônica — incluindo adulteração ISOLADA de `opaque_token`/`producing_execution_id`/`issued_at_utc` (AB-4C-009 item 2), que antes da correção não era coberta pelo hash | A persistência é fronteira NÃO CONFIÁVEL (mesmo princípio de `InventorySnapshot`/`EvExportManifest`): `EvWatermark.Rehydrate` recomputa o hash de evidência a partir de TODOS os campos REALMENTE carregados — tenant/projeto/connector/archive/fase/strategy + `producing_execution_id` + `opaque_token` + `issued_at_utc` (canonicalizado em milissegundos, mesma precisão de `DATETIME2(3)`) — e recusa fail-closed (`EvWatermarkRejectedException(Tampered)`) qualquer divergência do hash persistido; em particular, adulterar `issued_at_utc` de um watermark antigo NUNCA o promove silenciosamente a `LatestCanonical` (`ORDER BY issued_at_utc DESC` só entrega uma linha que ainda passa na revalidação do hash). Comprovado por `RehydrateFailsClosedWhenTheLineageHashDoesNotMatchTheLoadedFields`, `RehydrateFailsClosedWhenOnlyTheOpaqueTokenIsAlteredButTheRestOfTheRowStaysIntact`, `RehydrateFailsClosedWhenOnlyTheProducingExecutionIdIsAlteredButTheRestOfTheRowStaysIntact`, `RehydrateFailsClosedWhenOnlyIssuedAtUtcIsAlteredButTheRestOfTheRowStaysIntact`, e, sob SQL Server real, `GetByIdFailsClosedWhenOnlyTheOpaqueTokenColumnIsTamperedDirectlyInTheRow`, `GetByIdFailsClosedWhenOnlyTheProducingExecutionIdColumnIsTamperedDirectlyInTheRow`, `GetByIdFailsClosedWhenOnlyIssuedAtUtcColumnIsTamperedDirectlyInTheRow`, `TamperingIssuedAtUtcOfAnOlderWatermarkNeverSilentlyPromotesItToLatestCanonical`. |
+| Checkpoint avançado/duplicado sob crash entre a emissão do token e o commit (req 6/14) | `IEvDeltaRunStore.AppendAttemptAsync` persiste a tentativa `Completed` e o watermark que ela emite NA MESMA transação SQL (`SqlEvDeltaRunStore`) — o watermark nunca se torna canônico sem a tentativa também estar commitada, e vice-versa; um crash entre a chamada ao adapter e este commit nunca deixa o par inconsistente. Comprovado sob SQL Server real por `ACompletedAttemptPersistsItsWatermarkInTheSameTransactionAndItBecomesTheCanonicalOne`. |
+| Concorrência/duplicidade de efeito lógico entre execuções de fase | Idempotência é por identidade CANÔNICA (`EvDeltaRunIdentity`, hash determinístico de tenant/projeto/connector/archive/fase/watermark-anterior — deliberadamente SEM a strategy, decisão derivada) — nunca um token do cliente; o backstop SQL `UX_ev_delta_attempts_number UNIQUE (tenant_id, project_id, canonical_idempotency_key, attempt_number)`, combinado com a resolução de `run_id`/`attempt_number` sob `UPDLOCK, HOLDLOCK` na MESMA leitura, garante que tentativas concorrentes sob a MESMA chave convergem para o MESMO `run_id`, sem duplicar linha. Comprovado sob SQL Server real (8 gravações concorrentes) por `ConcurrentAppendsUnderTheSameFreshIdempotencyKeyConvergeToOneWinningAttempt`. |
+| Autorização de freeze sem role competente ou implícita | `EvFreezePlan.AuthorizeFreeze` recusa fail-closed (`EvFreezeAuthorizationRequiredException`) qualquer autorização com role `Unspecified` — nunca inferido do request; a transição em si só é permitida a partir de `FreezeRequired` (`EvFreezeTransitions`, allow-list explícita). Comprovado por `AuthorizingWithUnspecifiedRoleIsAlwaysRejected`, `AuthorizingWithUnspecifiedRoleIsRejectedByTheUseCase`. |
+| Freeze/final-delta/descomissionamento fora de ordem ou sem precondição | `EvFreezeTransitions.EnsureCanTransition` é uma allow-list fail-closed: tudo que não estiver explicitamente listado é recusado (ex.: `FinalDeltaReady` sem `FreezeAuthorized` persistido lança `InvalidEvFreezeTransitionException`/`EvFreezeAuthorizationRequiredException`; `DecommissionBlocked` não tem NENHUMA transição de saída). `RequestEvDeltaUseCase` exige `FreezeAuthorized` persistido ANTES de qualquer chamada ao adapter para `FinalDelta` — nunca aciona uma ação real. Comprovado por `FinalDeltaReadyRequiresAPersistedAuthorization`, `FinalDeltaWithoutAnAuthorizedFreezeIsRejected`, `DecommissionBlockedHasNoOutgoingTransitionsWhatsoever`. |
+| Descomissionamento liberado por engano neste Passo | `AttemptDecommissionUseCase` só tem UMA saída possível: `DecommissionBlocked` — nunca uma execução real; chamado repetidamente permanece idempotentemente bloqueado. Comprovado por `DecommissionRemainsBlockedThroughTheFullHappyPath`, `FullFreezeLifecycleEndsPermanentlyBlockedAtDecommission`. |
+| Alteração concorrente do plano de freeze mascarada como sucesso | `IEvFreezePlanStore.SaveAsync` exige a versão ANTERIOR à transição aplicada em memória; um `UPDATE` que afeta zero linhas (versão divergente) lança `ConcurrencyException` — nunca sobrescreve silenciosamente uma autorização/decisão concorrente. Comprovado sob SQL Server real por `SavingAFreezePlanWithAStaleExpectedVersionFailsClosed`. |
+| Escalação via identidade de manutenção | Nenhum store deste Passo (`SqlEvWatermarkStore`, `SqlEvDeltaRunStore`, `SqlEvFreezePlanStore`, `SqlEvDeltaAuditTrail`) abre conexão de manutenção — todos operam exclusivamente sob a identidade do TENANT já resolvido; a allowlist de `EvWorkerBoundaryTests.MaintenanceIdentityIsRestrictedToApprovedCrossTenantInfrastructureOperations` permanece com os MESMOS três arquivos dos Passos 1-2, sem adição. |
+| SQL injection | Todo acesso a dados é parametrizado (`SqlCommand`/`SqlParameter`), sem concatenação de entrada — reaproveita o mesmo padrão dos Passos 1-2. |
+
+## Fora de escopo deste Passo (herdado do STOP-THE-LINE)
+
+Freeze real de ingestão/shortcut no Enterprise Vault, alteração de policy/retention ou acesso de usuário no
+EV, descomissionamento/deleção de EV/Vault Store/archive, execução contra ambiente EV real de cliente sem
+support-matrix certificada e host explicitamente autorizado, estratégia genérica baseada somente em
+`ReceivedDate`, Outlook/COM automation, AzCopy/Azure staging/SAS, Purview/Graph/Exchange Online/import job,
+reconciliação M365, avanço para I5. Nenhum destes fluxos existe no código deste Passo — não há superfície
+de ameaça nova a analisar para eles aqui.
