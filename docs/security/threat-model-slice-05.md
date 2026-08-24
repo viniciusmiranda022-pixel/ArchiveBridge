@@ -220,6 +220,39 @@ Comprovado por `AFinalizeClaimLostToAConcurrentReclaimNeverReturnsTheSecretToThe
 `CancellationOrFailureBeforeFinalizeRemainsRecoverableByReclaimWithoutDoubleDelivery` (Application), e sob
 SQL Server real, `FinalizeClaimLostToAConcurrentReclaimFailsClosedUnderRealConcurrency` (Integration).
 
+**AB-I5-008 — expiração temporal do lease/SAS no instante da entrega é fail-closed mesmo sem reclaim
+concorrente (corrigido)**: `AB-I5-007` fechou a corrida de fencing por época, mas a correção reaproveitava o
+`now` capturado ANTES do claim para validar `FinalizeClaim` DEPOIS da leitura do secret store — e
+`PurviewSasUploadHandle.FinalizeClaim` validava apenas owner/época, nunca a validade temporal do lease
+(`ClaimExpiresAtUtc`) nem do próprio SAS (`ExpiresAtUtc`). Consequência: se a leitura do secret store
+demorasse além do lease, mas NENHUM concorrente tivesse feito `Reclaim` ainda (row_version continuava
+"fresco"), o claimant original conseguia persistir `Claimed -> Consumed` com sucesso e receber o SAS DEPOIS
+do lease (ou do próprio SAS) já terem expirado — contradizendo o fail-closed exigido desde `AB-I5-006`.
+
+**Correção**: `AcquireSasForUploadUseCase.ExecuteAsync` relê `_clock.UtcNow` IMEDIATAMENTE após a leitura
+bem-sucedida do secret store — nunca reaproveita o instante capturado antes do claim. `PurviewSasUploadHandle
+.FinalizeClaim` agora exige, além do fencing por owner/época já existente, que `ClaimExpiresAtUtc` e
+`ExpiresAtUtc` (SAS) sejam ESTRITAMENTE maiores que o instante de finalização informado — `nowUtc ==
+ClaimExpiresAtUtc`/`ExpiresAtUtc` já falha fechado (boundary exclusivo). A rejeição temporal ocorre no
+Domain, ANTES de qualquer tentativa de persistência: nenhuma transição é escrita no SQL, o handle permanece
+`Claimed` sob o owner/época atuais (sem nenhuma compensação insegura que o reverta para `Available`) e
+continua recuperável por `Reclaim` assim que um adquirente observar o lease expirado — exatamente o mesmo
+caminho de recuperação já usado para falha do secret store/cancelamento ANTES da leitura.
+
+Comprovado por `FinalizeClaimWithinTheLeaseAndSasValidityStillSucceeds`,
+`FinalizeClaimExactlyAtTheClaimLeaseExpiryBoundaryFailsClosed`,
+`FinalizeClaimAfterTheClaimLeaseExpiresWithoutAnyConcurrentReclaimFailsClosed`,
+`FinalizeClaimExactlyAtTheSasExpiryBoundaryFailsClosedEvenWithinTheClaimLease`,
+`FinalizeClaimAfterTheSasExpiresFailsClosedEvenWithinTheClaimLease`,
+`FinalizeClaimBeforeTheSasExpiresAndWithinTheClaimLeaseSucceeds`,
+`AHandleWithAnExpiredLeaseLeftUnfinalizedRemainsClaimedAndRecoverableByReclaim` (Domain);
+`ALeaseThatExpiresDuringTheSecretStoreReadWithoutAnyConcurrentReclaimDeniesDeliveryAndNeverPersistsConsumed`,
+`FinalizingExactlyAtTheClaimLeaseExpiryBoundaryFailsClosed`,
+`FinalizingWithinTheClaimLeaseUsingTheReReadClockStillSucceeds`,
+`ASasThatExpiresDuringTheSecretStoreReadDeniesDeliveryAndNeverPersistsConsumed`,
+`ALeaseThatExpiresDuringTheReadRemainsRecoverableByReclaimAfterwards` (Application); e sob SQL Server real,
+`ATemporallyExpiredFinalizeNeverPersistsConsumedEvenWithAFreshRowVersion` (Integration).
+
 ## Crash-consistency do lifecycle do secret material (item 3)
 
 O desenho anterior tinha três lacunas: (a) `IntakePurviewSasUseCase` podia deixar o material recém-protegido

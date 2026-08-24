@@ -549,6 +549,141 @@ public sealed class Slice5PurviewSasUseCaseTests
             () => new AcquireSasForUploadUseCase(new FakeSasHandleStore(), new FakeSecretStore(), new StubClock(Now), TimeSpan.Zero));
     }
 
+    // ---- AcquireSasForUploadUseCase: expiração temporal no instante da entrega (AB-I5-008) -----------
+
+    [Fact]
+    public async Task ALeaseThatExpiresDuringTheSecretStoreReadWithoutAnyConcurrentReclaimDeniesDeliveryAndNeverPersistsConsumed()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(ValidSasUri(scope)), CorrelationId.New()), CancellationToken.None);
+
+        // Nenhum reclaim concorrente ocorre — só o relógio avança o suficiente ENTRE o claim (1ª leitura do
+        // relógio) e a finalização (2ª leitura, relida depois da leitura do secret store) para ultrapassar
+        // o lease de 5 minutos. O 'now' capturado antes do claim NUNCA é reaproveitado na finalização.
+        var leaseDuration = TimeSpan.FromMinutes(5);
+        var clock = new SteppedClock(Now, Now.AddMinutes(6));
+        var useCase = new AcquireSasForUploadUseCase(handles, secrets, clock, leaseDuration);
+
+        await Assert.ThrowsAsync<PurviewSasAcquisitionDeniedException>(() => useCase.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        // O secret store FOI lido com sucesso (a leitura já havia se concretizado) — mas o segredo nunca sai
+        // do use case, e a transição Claimed -> Consumed NUNCA é persistida.
+        Assert.Equal(1, secrets.AcquireCallCount);
+        var handle = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, handle!.State);
+    }
+
+    [Fact]
+    public async Task FinalizingExactlyAtTheClaimLeaseExpiryBoundaryFailsClosed()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(ValidSasUri(scope)), CorrelationId.New()), CancellationToken.None);
+
+        var leaseDuration = TimeSpan.FromMinutes(5);
+        // now == ClaimExpiresAtUtc no instante exato da finalização — boundary estritamente exclusivo.
+        var clock = new SteppedClock(Now, Now.AddMinutes(5));
+        var useCase = new AcquireSasForUploadUseCase(handles, secrets, clock, leaseDuration);
+
+        await Assert.ThrowsAsync<PurviewSasAcquisitionDeniedException>(() => useCase.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        var handle = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, handle!.State);
+    }
+
+    [Fact]
+    public async Task FinalizingWithinTheClaimLeaseUsingTheReReadClockStillSucceeds()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        var rawSas = ValidSasUri(scope);
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(rawSas), CorrelationId.New()), CancellationToken.None);
+
+        var leaseDuration = TimeSpan.FromMinutes(5);
+        // A 2ª leitura do relógio (finalização) avança em relação à 1ª (claim), mas continua ESTRITAMENTE
+        // dentro do lease de 5 minutos.
+        var clock = new SteppedClock(Now, Now.AddMinutes(2));
+        var useCase = new AcquireSasForUploadUseCase(handles, secrets, clock, leaseDuration);
+
+        var acquired = await useCase.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None);
+
+        Assert.Equal(rawSas, acquired.Reveal());
+        var handle = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Consumed, handle!.State);
+    }
+
+    [Fact]
+    public async Task ASasThatExpiresDuringTheSecretStoreReadDeniesDeliveryAndNeverPersistsConsumed()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        // SAS com validade curta (mínimo aceito pela policy de intake, item 6: 5 minutos) — o cap "lease
+        // nunca ultrapassa o SAS" (TheClaimLeaseNeverOutlivesTheSasExpiry...) faz com que o lease efetivo
+        // (10 min pedidos) termine no instante do SAS (6 min); a leitura lenta simulada abaixo ultrapassa
+        // ambos ao mesmo tempo, provando que a finalização recusa mesmo sem nenhum reclaim.
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(
+                new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(ValidSasUri(scope, Now.AddMinutes(6))), CorrelationId.New()),
+                CancellationToken.None);
+
+        var clock = new SteppedClock(Now, Now.AddMinutes(7));
+        var useCase = new AcquireSasForUploadUseCase(handles, secrets, clock, TimeSpan.FromMinutes(10));
+
+        await Assert.ThrowsAsync<PurviewSasAcquisitionDeniedException>(() => useCase.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        Assert.Equal(1, secrets.AcquireCallCount);
+        var handle = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, handle!.State);
+    }
+
+    [Fact]
+    public async Task ALeaseThatExpiresDuringTheReadRemainsRecoverableByReclaimAfterwards()
+    {
+        var scope = Scope();
+        var waves = new FakeWaveStore();
+        var wave = SeedWave(waves, scope);
+        var handles = new FakeSasHandleStore();
+        var secrets = new FakeSecretStore();
+        var rawSas = ValidSasUri(scope);
+        await new IntakePurviewSasUseCase(waves, handles, secrets, new StubClock(Now))
+            .ExecuteAsync(new IntakePurviewSasRequest(scope, wave.Id, RedactedSecret.Wrap(rawSas), CorrelationId.New()), CancellationToken.None);
+
+        var leaseDuration = TimeSpan.FromMinutes(5);
+        var firstAttempt = new AcquireSasForUploadUseCase(handles, secrets, new SteppedClock(Now, Now.AddMinutes(6)), leaseDuration);
+        await Assert.ThrowsAsync<PurviewSasAcquisitionDeniedException>(() => firstAttempt.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None));
+
+        // Nenhuma compensação insegura (nunca volta para Available) — um adquirente posterior reclama e
+        // finaliza com sucesso normalmente, exatamente como qualquer outro lease expirado sem dono.
+        var recovered = new AcquireSasForUploadUseCase(handles, secrets, new StubClock(Now.AddMinutes(7)), leaseDuration);
+        var acquired = await recovered.ExecuteAsync(
+            new AcquireSasForUploadRequest(scope, wave.Id, WorkloadIdentities.UploadWorker, CorrelationId.New()), CancellationToken.None);
+
+        Assert.Equal(rawSas, acquired.Reveal());
+        var handle = await handles.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Consumed, handle!.State);
+    }
+
     // ---- DestroySasHandleUseCase --------------------------------------------------------------------
 
     [Fact]
@@ -798,5 +933,41 @@ internal sealed class FakeSasHandleStore : IPurviewSasUploadHandleStore
             handle.ExpiresAtUtc, handle.StoredAtUtc, handle.AvailableAtUtc, handle.ConsumedAtUtc, handle.ExpiredAtUtc,
             handle.DestroyedAtUtc, handle.ClaimOwner, handle.ClaimEpoch, handle.ClaimExpiresAtUtc, handle.Correlation,
             handle.RecordedAtUtc, new RowVersion(nextRowVersion), handle.HandleHash);
+    }
+}
+
+/// <summary>
+/// Relógio que devolve uma sequência PRÉ-DEFINIDA de instantes, um por leitura, retendo o último valor
+/// depois de esgotada a sequência (AB-I5-008): necessário para provar que
+/// <see cref="AcquireSasForUploadUseCase"/> relê o relógio entre o claim e a finalização, em vez de
+/// reaproveitar o instante capturado antes da leitura do secret store.
+/// </summary>
+internal sealed class SteppedClock : IClock
+{
+    private readonly Queue<DateTimeOffset> _remaining;
+    private DateTimeOffset _current;
+
+    public SteppedClock(params DateTimeOffset[] values)
+    {
+        if (values.Length == 0)
+        {
+            throw new ArgumentException("Ao menos um instante deve ser fornecido.", nameof(values));
+        }
+
+        _remaining = new Queue<DateTimeOffset>(values);
+        _current = _remaining.Peek();
+    }
+
+    public DateTimeOffset UtcNow
+    {
+        get
+        {
+            if (_remaining.Count > 0)
+            {
+                _current = _remaining.Dequeue();
+            }
+
+            return _current;
+        }
     }
 }

@@ -33,7 +33,11 @@ public sealed record AcquireSasForUploadRequest(TenantScope Scope, WaveId Wave, 
 /// (3) a transição final para <see cref="SasHandleState.Consumed"/> só ocorre DEPOIS da leitura bem-sucedida
 /// (nunca antes — ao contrário do desenho anterior a AB-I5-005/006): uma falha do secret store, cancelamento
 /// ou queda de processo ENTRE o claim e a leitura nunca queima a geração — o lease simplesmente expira e um
-/// novo adquirente (ou o mesmo, em retry) recupera via <see cref="PurviewSasUploadHandle.Reclaim"/>.
+/// novo adquirente (ou o mesmo, em retry) recupera via <see cref="PurviewSasUploadHandle.Reclaim"/>. (4) a
+/// finalização é validada com um <c>nowUtc</c> RELIDO do relógio imediatamente após a leitura do segredo
+/// (nunca o instante capturado antes do claim, AB-I5-008): tanto a perda de fencing (row_version divergente,
+/// AB-I5-007) quanto a expiração temporal do lease/SAS no instante exato da entrega — mesmo sem nenhum
+/// reclaim concorrente — negam a entrega fail-closed, sem persistir <see cref="SasHandleState.Consumed"/>.
 /// </para>
 /// </summary>
 public sealed class AcquireSasForUploadUseCase
@@ -160,18 +164,41 @@ public sealed class AcquireSasForUploadUseCase
             throw new PurviewSasAcquisitionDeniedException(DenialMessage);
         }
 
+        // Relê o relógio IMEDIATAMENTE após a leitura bem-sucedida do secret store (AB-I5-008 item 1) — o
+        // 'now' capturado ANTES do claim nunca é reaproveitado aqui: uma leitura lenta o suficiente para
+        // ultrapassar o lease (ou o próprio SAS) deve ser tratada como expirada, mesmo sem nenhum reclaim
+        // concorrente ter ocorrido.
+        var finalizeAtUtc = _clock.UtcNow;
+
         // Finaliza SOMENTE depois da leitura bem-sucedida do secret store (item 2), sob a MESMA época do
-        // claim que fizemos acima (fencing): se outro adquirente já reivindicou este handle por reclaim
-        // entre a aquisição do segredo e este ponto (janela mínima, sem I/O de rede entre as duas chamadas),
-        // a finalização falha por row_version divergente. AB-I5-007: isso NUNCA é best-effort — o segredo já
-        // lido por ESTE requester NUNCA é devolvido ao caller a menos que a transição Claimed -&gt; Consumed
-        // sob a MESMA época seja persistida com sucesso (prova, no momento da entrega, de que este requester
-        // ainda é o titular do claim). Um requester que perdeu o fencing falha fechado — a leitura já
-        // concretizada do secret store nunca chega ao caller.
+        // claim que fizemos acima (fencing) E sob validade temporal estrita do lease/SAS no instante da
+        // finalização (AB-I5-008 item 2): se outro adquirente já reivindicou este handle por reclaim entre a
+        // aquisição do segredo e este ponto, a finalização falha por row_version divergente (capturado
+        // abaixo); se o lease de claim ou o próprio SAS já expiraram no instante de <see cref="finalizeAtUtc"/>
+        // — mesmo sem nenhum reclaim concorrente — <see cref="PurviewSasUploadHandle.FinalizeClaim"/> recusa
+        // fail-closed ANTES de qualquer tentativa de persistência. Em ambos os casos isso NUNCA é
+        // best-effort: o segredo já lido por ESTE requester NUNCA é devolvido ao caller a menos que a
+        // transição Claimed -&gt; Consumed seja persistida com sucesso, sob a MESMA época e dentro da janela
+        // de validade do lease e do SAS (prova, no momento da entrega, de que este requester ainda é o
+        // titular do claim E que essa titularidade ainda era temporalmente válida quando a entrega se
+        // concretizou).
+        PurviewSasUploadHandle finalized;
         try
         {
-            await _handles.SaveTransitionAsync(claimed.FinalizeClaim(request.Requester, claimed.ClaimEpoch, now), cancellationToken)
-                .ConfigureAwait(false);
+            finalized = claimed.FinalizeClaim(request.Requester, claimed.ClaimEpoch, finalizeAtUtc);
+        }
+        catch (PurviewSasLifecycleException)
+        {
+            // Lease de claim ou SAS já expirado no instante da finalização — nenhuma transição foi tentada
+            // contra o store: o handle permanece Claimed sob o owner/época atuais, recuperável por
+            // Reclaim assim que um novo adquirente observar o lease expirado. O segredo já lido nunca é
+            // retornado ao caller.
+            throw new PurviewSasAcquisitionDeniedException(DenialMessage);
+        }
+
+        try
+        {
+            await _handles.SaveTransitionAsync(finalized, cancellationToken).ConfigureAwait(false);
         }
         catch (ConcurrencyException)
         {

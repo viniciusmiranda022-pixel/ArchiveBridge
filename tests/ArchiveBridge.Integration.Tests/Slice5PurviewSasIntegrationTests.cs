@@ -252,13 +252,53 @@ public sealed class Slice5PurviewSasIntegrationTests(SqlServerFixture fixture)
         await store.SaveTransitionAsync(
             claimed.Reclaim(new WorkloadIdentity("OtherWorker"), clock.UtcNow.AddMinutes(5), clock.UtcNow), CancellationToken.None);
 
-        // 'claimed' está STALE — a finalização do titular original nunca pode ser tratada como sucesso.
+        // 'claimed' está STALE. Usamos um 'nowUtc' de finalização AINDA dentro do lease ORIGINAL (item 2 do
+        // titular original, AB-I5-008) para isolar esta corrida da checagem temporal adicionada em
+        // AB-I5-008 (coberta separadamente por FinalizeClaimTemporallyExpiredNeverPersistsConsumedEvenWithAFreshRowVersion
+        // abaixo): mesmo com uma visão local ainda temporalmente válida, o row_version obsoleto no SQL real
+        // (por causa do Reclaim concorrente) é o que faz esta finalização falhar fechado.
         await Assert.ThrowsAsync<ConcurrencyException>(() => store.SaveTransitionAsync(
-            claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, clock.UtcNow), CancellationToken.None));
+            claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Slice2Support.Now.AddMinutes(1)),
+            CancellationToken.None));
 
         var reloaded = await store.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
         Assert.Equal(SasHandleState.Claimed, reloaded!.State);
         Assert.Equal(new WorkloadIdentity("OtherWorker"), reloaded.ClaimOwner);
+    }
+
+    [Fact]
+    public async Task ATemporallyExpiredFinalizeNeverPersistsConsumedEvenWithAFreshRowVersion()
+    {
+        // AB-I5-008: nenhum reclaim concorrente ocorre aqui — o row_version permanece o mesmo que 'claimed'
+        // já carrega. Ainda assim, a finalização deve recusar fail-closed quando o lease de claim já expirou
+        // no instante informado, e a rejeição deve ocorrer ANTES de qualquer tentativa de persistência (a
+        // exceção nasce em PurviewSasUploadHandle.FinalizeClaim, no Domain — nunca chega ao SQL).
+        var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveAsync(scope);
+        var stored = await HandleStore.ReplaceCanonicalAsync(
+            scope, wave.Id, null, NewHandle(scope, wave.Id, 1, Slice2Support.Now), CancellationToken.None);
+        var available = await HandleStore.SaveTransitionAsync(stored.MarkAvailable(Slice2Support.Now), CancellationToken.None);
+        var claimed = await HandleStore.SaveTransitionAsync(
+            available.Claim(WorkloadIdentities.UploadWorker, Slice2Support.Now.AddMinutes(5), Slice2Support.Now), CancellationToken.None);
+
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Slice2Support.Now.AddMinutes(6)));
+
+        // O row_version de 'claimed' nunca é consumido pela tentativa recusada — o handle persistido
+        // continua exatamente como estava (Claimed, mesmo owner/época), pronto para um Reclaim futuro.
+        var reloaded = await HandleStore.GetCanonicalAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, reloaded!.State);
+        Assert.Equal(WorkloadIdentities.UploadWorker, reloaded.ClaimOwner);
+        Assert.Equal(claimed.ClaimEpoch, reloaded.ClaimEpoch);
+        Assert.Equal(claimed.RowVersion.Value, reloaded.RowVersion.Value);
+
+        // Um Reclaim subsequente (nova geração de owner) continua funcionando normalmente sobre o MESMO
+        // row_version — a rejeição temporal não deixou nenhum resíduo no SQL.
+        var reclaimed = await HandleStore.SaveTransitionAsync(
+            reloaded.Reclaim(new WorkloadIdentity("NewOwner"), Slice2Support.Now.AddMinutes(11), Slice2Support.Now.AddMinutes(6)),
+            CancellationToken.None);
+        Assert.Equal(SasHandleState.Claimed, reclaimed.State);
+        Assert.Equal(new WorkloadIdentity("NewOwner"), reclaimed.ClaimOwner);
     }
 
     [Fact]

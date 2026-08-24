@@ -456,6 +456,97 @@ public sealed class Slice5PurviewSasDomainTests
         Assert.Throws<PurviewSasLifecycleException>(() => reclaimed.FinalizeClaim(WorkloadIdentities.UploadWorker, staleEpoch, Now.AddMinutes(6)));
     }
 
+    // ---- FinalizeClaim: validade temporal estrita no instante da entrega (AB-I5-008) -----------------
+
+    [Fact]
+    public void FinalizeClaimWithinTheLeaseAndSasValidityStillSucceeds()
+    {
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        var consumed = claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Now.AddMinutes(4));
+
+        Assert.Equal(SasHandleState.Consumed, consumed.State);
+    }
+
+    [Fact]
+    public void FinalizeClaimExactlyAtTheClaimLeaseExpiryBoundaryFailsClosed()
+    {
+        // now == ClaimExpiresAtUtc nunca é tratado como ainda válido (boundary estritamente exclusivo).
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Now.AddMinutes(5)));
+    }
+
+    [Fact]
+    public void FinalizeClaimAfterTheClaimLeaseExpiresWithoutAnyConcurrentReclaimFailsClosed()
+    {
+        // Nenhum reclaim concorrente ocorreu — só o relógio avançou o suficiente entre o claim e a
+        // finalização (ex.: leitura lenta do secret store). Ainda assim, fail-closed (AB-I5-008 item 2).
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Now.AddMinutes(6)));
+    }
+
+    [Fact]
+    public void FinalizeClaimExactlyAtTheSasExpiryBoundaryFailsClosedEvenWithinTheClaimLease()
+    {
+        // O lease de claim (Domain puro, sem o cap da Application) se estende além do próprio SAS — a
+        // finalização ainda deve recusar fail-closed quando o SAS já expirou, mesmo com o lease ainda ativo.
+        var handle = PurviewSasUploadHandle.Intake(
+            SasHandleId.New(), new TenantId(Guid.NewGuid()), new ProjectId(Guid.NewGuid()), new WaveId(Guid.NewGuid()),
+            generation: 1, new Sha256Hash(new string('a', 64)), new SecretStoreHandleReference("ref-1"),
+            "mystorageaccount123.blob.core.windows.net", "ingestiondata", keyVersion: null,
+            expiresAtUtc: Now.AddMinutes(3), CorrelationId.New(), Now);
+        var claimed = handle.MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(10), Now);
+
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Now.AddMinutes(3)));
+    }
+
+    [Fact]
+    public void FinalizeClaimAfterTheSasExpiresFailsClosedEvenWithinTheClaimLease()
+    {
+        var handle = PurviewSasUploadHandle.Intake(
+            SasHandleId.New(), new TenantId(Guid.NewGuid()), new ProjectId(Guid.NewGuid()), new WaveId(Guid.NewGuid()),
+            generation: 1, new Sha256Hash(new string('a', 64)), new SecretStoreHandleReference("ref-1"),
+            "mystorageaccount123.blob.core.windows.net", "ingestiondata", keyVersion: null,
+            expiresAtUtc: Now.AddMinutes(3), CorrelationId.New(), Now);
+        var claimed = handle.MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(10), Now);
+
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Now.AddMinutes(4)));
+    }
+
+    [Fact]
+    public void FinalizeClaimBeforeTheSasExpiresAndWithinTheClaimLeaseSucceeds()
+    {
+        var handle = PurviewSasUploadHandle.Intake(
+            SasHandleId.New(), new TenantId(Guid.NewGuid()), new ProjectId(Guid.NewGuid()), new WaveId(Guid.NewGuid()),
+            generation: 1, new Sha256Hash(new string('a', 64)), new SecretStoreHandleReference("ref-1"),
+            "mystorageaccount123.blob.core.windows.net", "ingestiondata", keyVersion: null,
+            expiresAtUtc: Now.AddMinutes(3), CorrelationId.New(), Now);
+        var claimed = handle.MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(10), Now);
+
+        var consumed = claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Now.AddMinutes(2));
+        Assert.Equal(SasHandleState.Consumed, consumed.State);
+    }
+
+    [Fact]
+    public void AHandleWithAnExpiredLeaseLeftUnfinalizedRemainsClaimedAndRecoverableByReclaim()
+    {
+        // A rejeição fail-closed da finalização temporalmente expirada não faz nenhuma compensação insegura
+        // (nunca reverte para Available) — o handle simplesmente permanece Claimed, recuperável por Reclaim.
+        var claimed = NewStoredHandle().MarkAvailable(Now).Claim(WorkloadIdentities.UploadWorker, Now.AddMinutes(5), Now);
+        Assert.Throws<PurviewSasLifecycleException>(
+            () => claimed.FinalizeClaim(WorkloadIdentities.UploadWorker, claimed.ClaimEpoch, Now.AddMinutes(6)));
+
+        // 'claimed' (a instância em mãos, nunca persistida com a rejeição) continua Claimed e reclamável.
+        var reclaimed = claimed.Reclaim(new WorkloadIdentity("NewOwner"), Now.AddMinutes(20), Now.AddMinutes(6));
+        Assert.Equal(SasHandleState.Claimed, reclaimed.State);
+        Assert.Equal(2, reclaimed.ClaimEpoch.Value);
+    }
+
     [Fact]
     public void ReclaimBeforeTheLeaseExpiresIsRejectedFailClosed()
     {

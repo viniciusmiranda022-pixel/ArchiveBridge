@@ -255,13 +255,20 @@ public sealed record PurviewSasUploadHandle
 
     /// <summary>
     /// Transição <c>Claimed -&gt; Consumed</c> — finaliza o uso único SOMENTE sob a MESMA identidade e
-    /// época do claim titular (fencing, AB-I5-006 item 2). Deve ser chamada pela Application SOMENTE
-    /// depois de <c>ISecretStore.AcquireAsync</c> já ter devolvido o segredo com sucesso — nunca antes
-    /// (item 2: "finalize/consume somente após leitura bem-sucedida do secret store").
+    /// época do claim titular (fencing, AB-I5-006 item 2) E somente quando o lease de claim e o próprio SAS
+    /// ainda estão estritamente dentro da validade NO INSTANTE da finalização (<paramref name="nowUtc"/>,
+    /// AB-I5-008 item 2) — nunca aceita <c>nowUtc == ClaimExpiresAtUtc</c>/<c>ExpiresAtUtc</c> como válido
+    /// (boundary fail-closed). Deve ser chamada pela Application SOMENTE depois de
+    /// <c>ISecretStore.AcquireAsync</c> já ter devolvido o segredo com sucesso — nunca antes (item 2:
+    /// "finalize/consume somente após leitura bem-sucedida do secret store") — e com um <paramref name="nowUtc"/>
+    /// relido do relógio IMEDIATAMENTE antes desta chamada, nunca um instante capturado antes da leitura do
+    /// secret store (AB-I5-008 item 1/3): uma leitura lenta o suficiente para ultrapassar o lease/SAS deve
+    /// falhar fechado aqui mesmo sem nenhum reclaim concorrente ter ocorrido.
     /// </summary>
     /// <exception cref="PurviewSasLifecycleException">
-    /// O handle não está em <see cref="SasHandleState.Claimed"/> sob exatamente este owner/época — inclui o
-    /// caso de um owner reassumido por <see cref="Reclaim"/> tentando finalizar com a época antiga.
+    /// O handle não está em <see cref="SasHandleState.Claimed"/> sob exatamente este owner/época (inclui o
+    /// caso de um owner reassumido por <see cref="Reclaim"/> tentando finalizar com a época antiga), ou o
+    /// lease de claim/o próprio SAS já expiraram no instante <paramref name="nowUtc"/> informado.
     /// </exception>
     public PurviewSasUploadHandle FinalizeClaim(WorkloadIdentity owner, LeaseEpoch epoch, DateTimeOffset nowUtc)
     {
@@ -271,7 +278,21 @@ public sealed record PurviewSasUploadHandle
                 $"Finalize recusado por fencing: o handle {Id.Value} não está sob o claim informado (owner + época).");
         }
 
-        return Rebuild(SasHandleState.Consumed, nowUtc, consumedAtUtc: TruncateToMilliseconds(nowUtc));
+        var canonicalNowUtc = TruncateToMilliseconds(nowUtc);
+
+        if (ClaimExpiresAtUtc is not { } claimExpiresAtUtc || claimExpiresAtUtc <= canonicalNowUtc)
+        {
+            throw new PurviewSasLifecycleException(
+                $"Finalize recusado (fail-closed): o lease de claim do handle {Id.Value} já expirou no instante da finalização.");
+        }
+
+        if (ExpiresAtUtc <= canonicalNowUtc)
+        {
+            throw new PurviewSasLifecycleException(
+                $"Finalize recusado (fail-closed): o SAS do handle {Id.Value} já expirou no instante da finalização.");
+        }
+
+        return Rebuild(SasHandleState.Consumed, nowUtc, consumedAtUtc: canonicalNowUtc);
     }
 
     /// <summary>Transição para <see cref="SasHandleState.Expired"/> — nunca a partir de um estado já terminal.</summary>
