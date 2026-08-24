@@ -70,7 +70,7 @@ public sealed class SqlPurviewUploadRequestStore(TenantConnectionFactory connect
             (@jobId, @tenant, @projectId, NULL, 0, 0, 0, NULL, @correlation, @now);
 
         INSERT INTO dbo.purview_upload_requests (request_id, tenant_id, project_id, wave_id, job_id, correlation_id, created_at_utc, request_hash)
-        VALUES (@requestId, @tenant, @projectId, @wave, @jobId, @correlation, @now, @requestHash);
+        VALUES (@requestId, @tenant, @projectId, @wave, @jobId, @correlation, @requestCreatedAt, @requestHash);
         """;
 
     private readonly TenantConnectionFactory _connectionFactory = connectionFactory;
@@ -175,6 +175,15 @@ public sealed class SqlPurviewUploadRequestStore(TenantConnectionFactory connect
         command.Parameters.Add(new SqlParameter("@correlation", SqlDbType.UniqueIdentifier) { Value = candidate.Correlation.Value });
         command.Parameters.Add(new SqlParameter("@requestHash", SqlDbType.Char, 64) { Value = candidate.RequestHash.Value });
         command.Parameters.Add(new SqlParameter("@now", SqlDbType.DateTime2) { Value = now });
+        // O request_hash foi calculado sobre candidate.CreatedAtUtc (já truncado ao milissegundo pelo
+        // Domain — mesmo padrão de SqlPurviewSasUploadHandleStore.candidate.StoredAtUtc). A coluna
+        // created_at_utc é DATETIME2(3) e ARREDONDA (não trunca) o valor persistido: gravar o "now" bruto
+        // aqui divergiria do valor truncado usado no hash sempre que o resto sub-milissegundo de "now" for
+        // >= 0.5ms, fazendo Rehydrate recusar fail-closed um pedido que nunca foi adulterado.
+        command.Parameters.Add(new SqlParameter("@requestCreatedAt", SqlDbType.DateTime2)
+        {
+            Value = SqlJobMapping.ToDbUtc(candidate.CreatedAtUtc),
+        });
     }
 
     private static PurviewUploadRequest ReadRequest(SqlDataReader reader) => PurviewUploadRequest.Rehydrate(
