@@ -82,44 +82,119 @@ public sealed class Slice5PurviewUseCaseTests
     }
 
     // ---- SubmitMailboxPrecheckUseCase -------------------------------------------------------------------
+    //
+    // O request carrega SOMENTE identificadores opacos (WaveId + TargetArchiveId) — nunca uma ArchiveRef
+    // fornecida diretamente pelo chamador (anti-IDOR, AB-I5-003). O caso de uso resolve a ArchiveRef
+    // canônica a partir da seleção da onda JÁ persistida sob o TenantScope via IWaveStore.
 
     [Fact]
-    public async Task SubmitRejectsUnresolvedMailboxIdentity()
+    public async Task SubmitFailsClosedWhenTheWaveDoesNotExistInScope()
     {
         var scope = Scope();
         var store = new FakeMailboxPrecheckStore();
         var adapter = new FakeMailboxPrecheckAdapter(ValidObservation());
-        var useCase = new SubmitMailboxPrecheckUseCase(store, adapter, new StubClock(DateTimeOffset.UtcNow));
+        var useCase = new SubmitMailboxPrecheckUseCase(new FakeWaveStore(), store, adapter, new StubClock(DateTimeOffset.UtcNow));
 
-        var unresolved = new ArchiveRef("user01@contoso.com");
-        await Assert.ThrowsAsync<PurviewValidationException>(() => useCase.ExecuteAsync(
-            new SubmitMailboxPrecheckRequest(scope, unresolved, CorrelationId.New()), CancellationToken.None));
+        await Assert.ThrowsAsync<PurviewArchiveNotFoundException>(() => useCase.ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(scope, WaveId.New(), new TargetArchiveId("user01@contoso.com"), CorrelationId.New()),
+            CancellationToken.None));
+        Assert.Equal(0, adapter.ObserveCallCount);
     }
 
     [Fact]
-    public async Task SubmitPersistsTheObservedSnapshot()
+    public async Task SubmitFailsClosedWhenTheArchiveIsNotPartOfTheWaveSelection()
     {
+        // Um caller não consegue precheck de mailbox arbitrária apenas informando um TargetArchiveId que
+        // não pertence à seleção da onda autorizada — mesmo com a onda existindo e no escopo correto.
         var scope = Scope();
+        var wave = BuildWave(scope, ("user01@contoso.com", 1_000_000_000));
+        var waves = new FakeWaveStore();
+        waves.Seed(wave);
         var store = new FakeMailboxPrecheckStore();
         var adapter = new FakeMailboxPrecheckAdapter(ValidObservation());
-        var useCase = new SubmitMailboxPrecheckUseCase(store, adapter, new StubClock(DateTimeOffset.UtcNow));
-        var mailbox = ResolvedMailbox();
+        var useCase = new SubmitMailboxPrecheckUseCase(waves, store, adapter, new StubClock(DateTimeOffset.UtcNow));
+
+        await Assert.ThrowsAsync<PurviewArchiveNotFoundException>(() => useCase.ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(scope, wave.Id, new TargetArchiveId("attacker-arbitrary@contoso.com"), CorrelationId.New()),
+            CancellationToken.None));
+        Assert.Equal(0, adapter.ObserveCallCount);
+    }
+
+    [Fact]
+    public async Task SubmitFailsClosedWhenTheArchiveInTheWaveIsStillUnresolved()
+    {
+        var scope = Scope();
+        var unresolvedEntry = new WaveEntry(
+            "prj01-w001", "p_000.pst", new ArchiveRef("user01@contoso.com"), sizeBytes: 1_000_000_000, itemCount: 10);
+        var wave = MigrationWave.Create(
+            WaveId.New(), scope.Tenant, scope.Project, new WaveName("Wave 1"), TargetRootFolder.ForWave("PRJ01", "W001"),
+            DeterministicHash.Compute(["config"]), new WaveSelection([unresolvedEntry]), DateTimeOffset.UtcNow);
+        var waves = new FakeWaveStore();
+        waves.Seed(wave);
+        var store = new FakeMailboxPrecheckStore();
+        var adapter = new FakeMailboxPrecheckAdapter(ValidObservation());
+        var useCase = new SubmitMailboxPrecheckUseCase(waves, store, adapter, new StubClock(DateTimeOffset.UtcNow));
+
+        await Assert.ThrowsAsync<PurviewArchiveNotFoundException>(() => useCase.ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(scope, wave.Id, unresolvedEntry.Archive.Identity, CorrelationId.New()),
+            CancellationToken.None));
+        Assert.Equal(0, adapter.ObserveCallCount);
+    }
+
+    [Fact]
+    public async Task SubmitFailsClosedWhenTheWaveBelongsToAnotherTenantOrProject()
+    {
+        // Cross-tenant/project é negado sem vazamento de existência: o mesmo erro genérico do caso "onda
+        // inexistente" — IWaveStore.GetAsync já devolve null para uma onda de outro escopo.
+        var owner = Scope();
+        var attacker = Scope();
+        var wave = BuildWave(owner, ("user01@contoso.com", 1_000_000_000));
+        var waves = new FakeWaveStore();
+        waves.Seed(wave);
+        var store = new FakeMailboxPrecheckStore();
+        var adapter = new FakeMailboxPrecheckAdapter(ValidObservation());
+        var useCase = new SubmitMailboxPrecheckUseCase(waves, store, adapter, new StubClock(DateTimeOffset.UtcNow));
+
+        await Assert.ThrowsAsync<PurviewArchiveNotFoundException>(() => useCase.ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(attacker, wave.Id, new TargetArchiveId("user01@contoso.com"), CorrelationId.New()),
+            CancellationToken.None));
+        Assert.Equal(0, adapter.ObserveCallCount);
+    }
+
+    [Fact]
+    public async Task SubmitPersistsTheObservedSnapshotUsingTheCanonicalMailboxFromTheWave()
+    {
+        var scope = Scope();
+        var wave = BuildWave(scope, ("user01@contoso.com", 1_000_000_000));
+        var waves = new FakeWaveStore();
+        waves.Seed(wave);
+        var store = new FakeMailboxPrecheckStore();
+        var adapter = new FakeMailboxPrecheckAdapter(ValidObservation());
+        var useCase = new SubmitMailboxPrecheckUseCase(waves, store, adapter, new StubClock(DateTimeOffset.UtcNow));
 
         var result = await useCase.ExecuteAsync(
-            new SubmitMailboxPrecheckRequest(scope, mailbox, CorrelationId.New()), CancellationToken.None);
+            new SubmitMailboxPrecheckRequest(scope, wave.Id, ResolvedMailbox().Identity, CorrelationId.New()), CancellationToken.None);
 
         Assert.True(result.Created);
         Assert.Equal(MailboxArchiveStatus.Active, result.Snapshot.ArchiveStatus);
+        // A mailbox de exibição sondada/persistida é a CANÔNICA resolvida server-side pela onda — o
+        // request não carrega nenhum campo de exibição que um caller pudesse usar para substituí-la.
+        Assert.Equal("user01@contoso.com", adapter.LastObservedMailbox!.Value.Mailbox);
+        Assert.Equal("user01@contoso.com", result.Snapshot.Mailbox.Mailbox);
+        Assert.Equal(1, adapter.ObserveCallCount);
     }
 
     [Fact]
     public async Task SubmitIsIdempotentWhenObservationDoesNotChange()
     {
         var scope = Scope();
+        var wave = BuildWave(scope, ("user01@contoso.com", 1_000_000_000));
+        var waves = new FakeWaveStore();
+        waves.Seed(wave);
         var store = new FakeMailboxPrecheckStore();
         var adapter = new FakeMailboxPrecheckAdapter(ValidObservation());
-        var useCase = new SubmitMailboxPrecheckUseCase(store, adapter, new StubClock(DateTimeOffset.UtcNow));
-        var request = new SubmitMailboxPrecheckRequest(scope, ResolvedMailbox(), CorrelationId.New());
+        var useCase = new SubmitMailboxPrecheckUseCase(waves, store, adapter, new StubClock(DateTimeOffset.UtcNow));
+        var request = new SubmitMailboxPrecheckRequest(scope, wave.Id, ResolvedMailbox().Identity, CorrelationId.New());
 
         var first = await useCase.ExecuteAsync(request, CancellationToken.None);
         var second = await useCase.ExecuteAsync(request, CancellationToken.None);
@@ -197,8 +272,8 @@ public sealed class Slice5PurviewUseCaseTests
 
         var prechecks = new FakeMailboxPrecheckStore();
         var adapter = new FakeMailboxPrecheckAdapter(ValidObservation());
-        await new SubmitMailboxPrecheckUseCase(prechecks, adapter, clock).ExecuteAsync(
-            new SubmitMailboxPrecheckRequest(scope, ResolvedMailbox(), CorrelationId.New()), CancellationToken.None);
+        await new SubmitMailboxPrecheckUseCase(waves, prechecks, adapter, clock).ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(scope, wave.Id, ResolvedMailbox().Identity, CorrelationId.New()), CancellationToken.None);
 
         var useCase = new EvaluatePurviewPrecheckUseCase(waves, capability, prechecks, clock);
         var report = await useCase.ExecuteAsync(
@@ -341,9 +416,19 @@ internal sealed class FakeMailboxPrecheckStore : IMailboxPrecheckStore
 /// <summary>Duplo de teste da porta <see cref="IMailboxPrecheckAdapter"/> — determinístico, sem EXO/Graph.</summary>
 internal sealed class FakeMailboxPrecheckAdapter(MailboxPrecheckObservation observation) : IMailboxPrecheckAdapter
 {
+    /// <summary>Quantas vezes o adapter foi sondado — usado para provar que falhas fail-closed nunca sondam.</summary>
+    public int ObserveCallCount { get; private set; }
+
+    /// <summary>A mailbox efetivamente recebida na última sondagem, para provar que é a CANÔNICA resolvida server-side.</summary>
+    public ArchiveRef? LastObservedMailbox { get; private set; }
+
     public Task<MailboxPrecheckObservation> ObserveAsync(
-        TenantScope scope, ArchiveRef mailbox, CorrelationId correlation, CancellationToken cancellationToken) =>
-        Task.FromResult(observation);
+        TenantScope scope, ArchiveRef mailbox, CorrelationId correlation, CancellationToken cancellationToken)
+    {
+        ObserveCallCount++;
+        LastObservedMailbox = mailbox;
+        return Task.FromResult(observation);
+    }
 }
 
 /// <summary>Duplo de teste MÍNIMO da porta <see cref="IWaveStore"/> — só <see cref="GetAsync"/> é exercitado por este Passo (read-only).</summary>

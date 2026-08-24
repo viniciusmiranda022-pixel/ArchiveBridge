@@ -7,6 +7,7 @@ using ArchiveBridge.Domain.TargetIngestion;
 using ArchiveBridge.Domain.TargetIngestion.Purview;
 using ArchiveBridge.Domain.Waves;
 using ArchiveBridge.Infrastructure.TargetIngestion.Purview;
+using ArchiveBridge.Infrastructure.Waves;
 using ArchiveBridge.Integration.Tests.Support;
 using Microsoft.Data.SqlClient;
 using Xunit;
@@ -14,9 +15,10 @@ using Xunit;
 namespace ArchiveBridge.Integration.Tests;
 
 /// <summary>
-/// I5/EPIC-06 Passo 1 — capability registry &amp; mailbox/tenant prechecks sobre SQL real (AB-I5-001):
-/// persistência append-only versionada, idempotência sob corrida, isolamento por tenant/projeto (RLS) e
-/// falha fechada diante de evidência persistida adulterada/inconsistente.
+/// I5/EPIC-06 Passo 1 — capability registry &amp; mailbox/tenant prechecks sobre SQL real (AB-I5-001,
+/// AB-I5-003): persistência append-only versionada, idempotência sob corrida, isolamento por
+/// tenant/projeto (RLS), resolução server-side da mailbox canônica a partir de uma onda autorizada
+/// (anti-IDOR) e falha fechada diante de evidência persistida adulterada/inconsistente.
 /// </summary>
 [Collection(SqlServerCollectionDefinition.Name)]
 public sealed class Slice5PurviewIntegrationTests(SqlServerFixture fixture)
@@ -25,6 +27,8 @@ public sealed class Slice5PurviewIntegrationTests(SqlServerFixture fixture)
 
     private SqlMailboxPrecheckStore PrecheckStore => new(fixture.Factory);
 
+    private SqlWaveStore WaveStore => Slice2Support.WaveStore(fixture);
+
     private static ArchiveRef ResolvedMailbox(string mailbox) => new(mailbox, new TargetArchiveId(mailbox));
 
     private static MailboxPrecheckObservation ValidObservation(
@@ -32,6 +36,20 @@ public sealed class Slice5PurviewIntegrationTests(SqlServerFixture fixture)
         Guid.NewGuid(), Guid.NewGuid(), status, "UserMailbox", AutoExpandingArchiveEnabled: false,
         LitigationHoldEnabled: false, RetentionHoldEnabled: false, ArchiveItemCount: 1000,
         ArchiveTotalSizeBytes: 10_000_000_000, observedAvailableBytes, DateTimeOffset.UtcNow);
+
+    /// <summary>
+    /// Persiste um projeto e uma onda com UMA entrada de archive RESOLVIDA (mailbox) sob <paramref name="scope"/> —
+    /// fonte server-side autorizada que <see cref="SubmitMailboxPrecheckUseCase"/> deve resolver, nunca uma
+    /// <see cref="ArchiveRef"/> fabricada pelo chamador.
+    /// </summary>
+    private async Task<MigrationWave> SeedWaveWithResolvedArchiveAsync(TenantScope scope, string mailbox)
+    {
+        await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
+        var selection = new WaveSelection([Slice2Support.Entry($"{mailbox}.pst", mailbox, 1_000_000_000)]);
+        var wave = Slice2Support.NewWave(scope, selection);
+        await WaveStore.AddAsync(wave, CorrelationId.New(), CancellationToken.None);
+        return wave;
+    }
 
     // ---- Capability evidence: persistência, idempotência, isolamento --------------------------------
 
@@ -105,27 +123,32 @@ public sealed class Slice5PurviewIntegrationTests(SqlServerFixture fixture)
     public async Task SubmitPersistsTheObservedPrecheckSnapshot()
     {
         var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveWithResolvedArchiveAsync(scope, "user01@contoso.com");
         var mailbox = ResolvedMailbox("user01@contoso.com");
         var adapter = new StubMailboxPrecheckAdapter(ValidObservation());
-        var useCase = new SubmitMailboxPrecheckUseCase(PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
+        var useCase = new SubmitMailboxPrecheckUseCase(WaveStore, PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
 
-        var result = await useCase.ExecuteAsync(new SubmitMailboxPrecheckRequest(scope, mailbox, CorrelationId.New()), CancellationToken.None);
+        var result = await useCase.ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(scope, wave.Id, mailbox.Identity, CorrelationId.New()), CancellationToken.None);
         Assert.True(result.Created);
 
         var latest = await PrecheckStore.GetLatestAsync(scope, mailbox.Identity, CancellationToken.None);
         Assert.NotNull(latest);
         Assert.Equal(MailboxArchiveStatus.Active, latest!.ArchiveStatus);
         Assert.Equal(result.Snapshot.SnapshotHash, latest.SnapshotHash);
+        // A mailbox de exibição persistida é a CANÔNICA resolvida server-side pela onda.
+        Assert.Equal("user01@contoso.com", latest.Mailbox.Mailbox);
     }
 
     [Fact]
     public async Task RepeatedSubmissionWithNoRealChangeDoesNotCreateANewVersion()
     {
         var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveWithResolvedArchiveAsync(scope, "user02@contoso.com");
         var mailbox = ResolvedMailbox("user02@contoso.com");
         var adapter = new StubMailboxPrecheckAdapter(ValidObservation());
-        var useCase = new SubmitMailboxPrecheckUseCase(PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
-        var request = new SubmitMailboxPrecheckRequest(scope, mailbox, CorrelationId.New());
+        var useCase = new SubmitMailboxPrecheckUseCase(WaveStore, PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
+        var request = new SubmitMailboxPrecheckRequest(scope, wave.Id, mailbox.Identity, CorrelationId.New());
 
         var first = await useCase.ExecuteAsync(request, CancellationToken.None);
         var second = await useCase.ExecuteAsync(request, CancellationToken.None);
@@ -140,23 +163,61 @@ public sealed class Slice5PurviewIntegrationTests(SqlServerFixture fixture)
     {
         var scopeA = SqlServerFixture.NewScope();
         var scopeB = SqlServerFixture.NewScope();
+        var wave = await SeedWaveWithResolvedArchiveAsync(scopeA, "user03@contoso.com");
         var mailbox = ResolvedMailbox("user03@contoso.com");
         var adapter = new StubMailboxPrecheckAdapter(ValidObservation());
-        var useCase = new SubmitMailboxPrecheckUseCase(PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
-        await useCase.ExecuteAsync(new SubmitMailboxPrecheckRequest(scopeA, mailbox, CorrelationId.New()), CancellationToken.None);
+        var useCase = new SubmitMailboxPrecheckUseCase(WaveStore, PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
+        await useCase.ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(scopeA, wave.Id, mailbox.Identity, CorrelationId.New()), CancellationToken.None);
 
         var fromOtherScope = await PrecheckStore.GetLatestAsync(scopeB, mailbox.Identity, CancellationToken.None);
         Assert.Null(fromOtherScope);
     }
 
     [Fact]
+    public async Task SubmitFailsClosedWhenTheWaveBelongsToAnotherTenantOrProject()
+    {
+        // Anti-IDOR (AB-I5-003) sob SQL/RLS real: a onda existe, mas para OUTRO tenant/projeto — o
+        // chamador não consegue sondar/persistir precheck de um archive fora do seu próprio escopo, e o
+        // adapter nunca é sondado.
+        var owner = SqlServerFixture.NewScope();
+        var attacker = SqlServerFixture.NewScope();
+        var wave = await SeedWaveWithResolvedArchiveAsync(owner, "user06@contoso.com");
+        var adapter = new StubMailboxPrecheckAdapter(ValidObservation());
+        var useCase = new SubmitMailboxPrecheckUseCase(WaveStore, PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
+
+        await Assert.ThrowsAsync<PurviewArchiveNotFoundException>(() => useCase.ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(attacker, wave.Id, new TargetArchiveId("user06@contoso.com"), CorrelationId.New()),
+            CancellationToken.None));
+        Assert.Equal(0, adapter.ObserveCallCount);
+    }
+
+    [Fact]
+    public async Task SubmitFailsClosedWhenTheArchiveIsNotPartOfTheWaveSelection()
+    {
+        // Um TargetArchiveId arbitrário que não pertence à seleção da onda autorizada falha fechado — sem
+        // sondar o adapter — mesmo com a onda existindo no escopo correto.
+        var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveWithResolvedArchiveAsync(scope, "user07@contoso.com");
+        var adapter = new StubMailboxPrecheckAdapter(ValidObservation());
+        var useCase = new SubmitMailboxPrecheckUseCase(WaveStore, PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
+
+        await Assert.ThrowsAsync<PurviewArchiveNotFoundException>(() => useCase.ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(scope, wave.Id, new TargetArchiveId("attacker-arbitrary@contoso.com"), CorrelationId.New()),
+            CancellationToken.None));
+        Assert.Equal(0, adapter.ObserveCallCount);
+    }
+
+    [Fact]
     public async Task GetLatestFailsClosedWhenTheArchiveStatusColumnIsTamperedDirectlyInTheRow()
     {
         var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveWithResolvedArchiveAsync(scope, "user04@contoso.com");
         var mailbox = ResolvedMailbox("user04@contoso.com");
         var adapter = new StubMailboxPrecheckAdapter(ValidObservation(status: MailboxArchiveStatus.Disabled));
-        var useCase = new SubmitMailboxPrecheckUseCase(PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
-        var result = await useCase.ExecuteAsync(new SubmitMailboxPrecheckRequest(scope, mailbox, CorrelationId.New()), CancellationToken.None);
+        var useCase = new SubmitMailboxPrecheckUseCase(WaveStore, PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
+        var result = await useCase.ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(scope, wave.Id, mailbox.Identity, CorrelationId.New()), CancellationToken.None);
 
         await ExecuteAdminSqlAsync(
             scope,
@@ -171,10 +232,12 @@ public sealed class Slice5PurviewIntegrationTests(SqlServerFixture fixture)
     public async Task GetLatestFailsClosedWhenObservedAvailableBytesIsTamperedDirectlyInTheRow()
     {
         var scope = SqlServerFixture.NewScope();
+        var wave = await SeedWaveWithResolvedArchiveAsync(scope, "user05@contoso.com");
         var mailbox = ResolvedMailbox("user05@contoso.com");
         var adapter = new StubMailboxPrecheckAdapter(ValidObservation());
-        var useCase = new SubmitMailboxPrecheckUseCase(PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
-        var result = await useCase.ExecuteAsync(new SubmitMailboxPrecheckRequest(scope, mailbox, CorrelationId.New()), CancellationToken.None);
+        var useCase = new SubmitMailboxPrecheckUseCase(WaveStore, PrecheckStore, adapter, new MutableClock(DateTimeOffset.UtcNow));
+        var result = await useCase.ExecuteAsync(
+            new SubmitMailboxPrecheckRequest(scope, wave.Id, mailbox.Identity, CorrelationId.New()), CancellationToken.None);
 
         await ExecuteAdminSqlAsync(
             scope,
@@ -211,7 +274,13 @@ public sealed class Slice5PurviewIntegrationTests(SqlServerFixture fixture)
 /// <summary>Duplo de teste da porta <see cref="IMailboxPrecheckAdapter"/> — determinístico, sem EXO/Graph.</summary>
 internal sealed class StubMailboxPrecheckAdapter(MailboxPrecheckObservation observation) : IMailboxPrecheckAdapter
 {
+    /// <summary>Quantas vezes o adapter foi sondado — usado para provar que falhas fail-closed nunca sondam.</summary>
+    public int ObserveCallCount { get; private set; }
+
     public Task<MailboxPrecheckObservation> ObserveAsync(
-        TenantScope scope, ArchiveRef mailbox, CorrelationId correlation, CancellationToken cancellationToken) =>
-        Task.FromResult(observation);
+        TenantScope scope, ArchiveRef mailbox, CorrelationId correlation, CancellationToken cancellationToken)
+    {
+        ObserveCallCount++;
+        return Task.FromResult(observation);
+    }
 }
