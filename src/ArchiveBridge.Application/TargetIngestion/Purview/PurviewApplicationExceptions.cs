@@ -12,3 +12,24 @@ public sealed class PurviewWaveNotFoundException(string message) : Exception(mes
 /// vazar existência, UPN, GUID ou qualquer detalhe cross-tenant/project.
 /// </summary>
 public sealed class PurviewArchiveNotFoundException(string message) : Exception(message);
+
+/// <summary>
+/// A URL SAS submetida foi recusada fail-closed por <c>PurviewSasIntakePolicy</c> (AB-I5-004 item 4). A
+/// mensagem carrega SOMENTE o <see cref="Domain.TargetIngestion.Purview.PurviewSasRejectionReason"/>
+/// estruturado — nunca qualquer fragmento da URL/segredo submetido.
+/// </summary>
+public sealed class PurviewSasIntakeRejectedException(
+    Domain.TargetIngestion.Purview.PurviewSasRejectionReason reason)
+    : Exception($"SAS recusado fail-closed: {reason}.")
+{
+    /// <summary>Motivo estruturado da rejeição.</summary>
+    public Domain.TargetIngestion.Purview.PurviewSasRejectionReason Reason { get; } = reason;
+}
+
+/// <summary>
+/// Aquisição do SAS custodiado recusada fail-closed (AB-I5-004 item 10/11) — onda/handle inexistente no
+/// escopo, requester fora do boundary autorizado, ou handle fora de <see cref="Domain.TargetIngestion.Purview.SasHandleState.Available"/>
+/// (Stored/Consumed/Expired/Destroyed). Todas as causas produzem o MESMO tipo/mensagem genérica —
+/// indistinguível de inexistente, sem vazar qual causa específica se aplica.
+/// </summary>
+public sealed class PurviewSasAcquisitionDeniedException(string message) : Exception(message);
