@@ -291,3 +291,102 @@ compensação síncrona — o residual cobre apenas a queda literal do processo,
 falha; (2) o material órfão permanece RASTREÁVEL: uma geração `Destroyed` retém seu
 `PurviewSasUploadHandle.SecretStoreReference` original (nunca apagado do metadado), servindo de ledger
 auditável para uma futura rotina de expurgo, mesmo sem uma implementada neste Passo.
+
+# Threat model — I5/EPIC-06, Passo 3 (AB-I5-010: vínculo Wave↔Partition Output; AB-I5-009: fundação do
+# upload Purview via AzCopy)
+
+Delta sobre o capítulo imediatamente anterior (mesmo formato). Escopo: (a) AB-I5-010 — o vínculo IMUTÁVEL
+entre uma onda aprovada e um output de particionamento canônico (Slice 4B), a fonte de autoridade de
+custódia física que faltava para o upload; (b) AB-I5-009 — preparação da estrutura remota determinística,
+homologação do binário AzCopy, adapter de processo isolado, persistência durável/append-only do pedido e
+das tentativas de upload, job lease/fencing/heartbeat e evidência sanitizada do transporte (runbook
+§25.5-§25.7). **Sem** criação/início de import job Purview, mapping CSV oficial, Graph/EXO writes,
+Enable-Mailbox/auto-expansion, reconciliação pós-import ou conclusão de wave por upload isolado
+(STOP-THE-LINE de [`docs/engineering/requests/AB-I5-009.md`](../engineering/requests/AB-I5-009.md)).
+Nenhum destes fluxos existe no código deste Passo.
+
+## Ativos adicionais
+
+- **Vínculo wave→output** (`wave_partition_output_bindings`): metadado de INTEGRAÇÃO entre os bounded
+  contexts Waves e PstProcessing — IDs opacos (execução, plano, parte, artefato), `part_key`/hash/tamanho
+  reidratados da execução canônica, correlação. Evidência de GOVERNANÇA/integração, nunca conteúdo de
+  mailbox nem segredo — `WavePartitionOutputBinding` tem construtor fechado (`Create`) que só aceita esses
+  campos reidratados de um `PartitionExecutionRecord` já canônico, nunca de IDs soltos do caller.
+- **Pedido lógico de upload** (`purview_upload_requests`): vínculo 1:1 durável entre uma wave e o Job
+  (workload `Upload`) que a transporta — para sempre, nunca duplicado. Não carrega bindings, SAS,
+  binário ou evidência.
+- **Tentativas de upload** (`purview_upload_attempts`): história append-only por tentativa — desfecho,
+  identidade lógica calculada (item 14), e, SOMENTE quando `Uploaded`, evidência SANITIZADA (versão/hash do
+  binário AzCopy, contagem/tamanho total esperados, prefixo remoto). NUNCA SAS, NUNCA stdout/stderr bruto do
+  AzCopy, NUNCA caminho físico absoluto — `PurviewUploadEvidence` só é construída no caminho de sucesso e o
+  CHECK `CK_purview_upload_attempts_evidence_only_when_uploaded` reforça, no banco, que nenhum outro
+  desfecho carrega esses campos.
+
+## Classificação de dados
+
+Nenhuma tabela nova deste Passo contém PII de mailbox/conteúdo. O SAS continua sendo o único segredo do
+domínio Purview (Passo 2) — este Passo NUNCA o persiste: o adapter de upload (`AzCopyUploadProcessExecutor`)
+é o ÚNICO ponto de todo o worker que chama `RedactedSecret.Reveal()`, e apenas para compor a URL de destino
+imediatamente antes de iniciar o processo AzCopy — o valor nunca é atribuído a um campo, log, exceção ou
+evidência persistida. O prefixo remoto (`ingestiondata/<hex opaco>`) e o nome de PST remoto
+(`p_<artifactId hex>_part<NNN>.pst`) são metadados NÃO secretos, estruturalmente hexadecimais/dígitos —
+nunca UPN, mailbox ou caminho de origem.
+
+## Ameaças e mitigações (delta)
+
+| Ameaça | Mitigação |
+| --- | --- |
+| Caller escolhe SAS, host, container, path remoto ou PST arbitrário para o transporte (acceptance criteria 1) | O upload nunca aceita esses valores como entrada: `PurviewUploadCommandProcessor` resolve a wave via `IWaveStore`, o conjunto de PSTs via `IWavePartitionOutputBindingStore.ListForWaveAsync` (AB-I5-010, nunca `WaveSelection`/`WaveEntry.FilePath`), o SAS via `AcquireSasForUploadUseCase` (Passo 2) e o prefixo/nomes remotos via `PurviewRemoteUploadPrefix.ForWave`/`PurviewRemotePstName.ForPart` — funções puras dos IDs opacos já resolvidos, nunca de string do caller. `RequestPurviewUploadUseCase`/o pedido de upload em si carregam apenas `WaveId`. |
+| Vínculo AB-I5-010 criado a partir de IDs soltos do caller, promovendo `WaveSelection` (planejamento) a prova de custódia física | `CreateWavePartitionOutputBindingUseCase` resolve a wave via `IWaveStore.GetAsync` e a execução via `IPartitionExecutionStore.FindCanonicalAsync` (os únicos stores server-side autorizados) e `WavePartitionOutputBinding.Create` reidrata plano/parte/execução/artefato/part_key/hash/tamanho EXCLUSIVAMENTE do `PartitionExecutionRecord` retornado — nunca aceita esses campos como argumento independente. `WaveEntry.FilePath`/`PstName` continuam sendo planejamento, nunca consultados pelo upload. Comprovado por `CreateReidratesPlanPartExecutionArtifactPartKeyAndOutputFromTheExecutionRecordNeverFromLooseArguments`. |
+| Vínculo/execução de um tenant/projeto usado para autorizar transporte de outro (IDOR cross-scope) | `WavePartitionOutputBinding.Create` recusa estruturalmente (fail-closed, `ArgumentException`) uma execução cujo tenant/projeto diverge do escopo do vínculo — defesa em profundidade independente da Application. `IWavePartitionOutputBindingStore`/`IPurviewUploadRequestStore`/`IPurviewUploadAttemptStore` participam de `rls.tenant_isolation_policy` e filtram `project_id` explicitamente; um registro de outro tenant/projeto é indistinguível de inexistente. Comprovado por `CreateRejectsAnExecutionFromADifferentTenantThanTheBindingScope`/`...Project...` e, sob SQL Server real, `ABindingFromAnotherProjectIsIndistinguishableFromNotFound`/`ARequestFromAnotherProjectIsIndistinguishableFromNotFound`. |
+| Onda ainda mutável (Draft/Validating/Blocked/ReadyForApproval) tem upload iniciado sobre uma seleção que ainda pode mudar | `RequestPurviewUploadUseCase` e, de novo, `PurviewUploadCommandProcessor.DispatchAsync` (revalidação LIVE — o estado no enfileiramento nunca é suficiente) exigem `WaveStatus.Approved`/`Frozen`; qualquer outro estado recusa fail-closed com `PurviewUploadWaveNotEligibleException`/`SourceIntegrityFailed`. Comprovado por `RequestFailsClosedWhenTheWaveIsStillMutable`. |
+| Fonte PST stale/adulterada/ausente usada no transporte (item 12, acceptance criteria 5) | Antes de qualquer efeito externo, `DispatchAsync` re-resolve CADA binding via `IPartitionExecutionStore.FindCanonicalAsync` (rejeitando qualquer divergência de identidade/hash/tamanho contra o binding) e reexecuta `IPartitionPartVerifier.VerifyAsync` — a MESMA validação física de bundle/manifesto/hash já usada no réplay do Slice 4B, nunca uma verificação mais fraca. Qualquer falha (ausência, adulteração, manifesto divergente) produz `SourceIntegrityFailed` e o Job falha terminal — nenhum arquivo é sequer aberto para transporte. Comprovado por `ANonCanonicalBindingSetFailsClosedAsSourceIntegrityAndFailsTheJobWithoutTouchingAzCopy`, `APhysicallyTamperedSourceFailsClosedBeforeAnyAzCopyInvocation`. |
+| Binário AzCopy substituído/desatualizado/desconhecido executa o transporte (item 5, acceptance criteria 2) | `AzCopyUploadProcessExecutor.ProbeBinaryAsync` recomputa o SHA-256 REAL do executável configurado a partir dos bytes em disco (nunca confia em configuração para o hash) e `AzCopyHomologationCatalog.IsHomologated` exige correspondência EXATA de versão E hash contra o catálogo homologado — nunca versão sozinha. A checagem ocorre ANTES de sequer adquirir o SAS (nenhum efeito externo até então). Comprovado por `IsHomologatedRequiresBothVersionAndHashToMatchExactly`, `ANonHomologatedBinaryFailsClosedBeforeAcquiringTheSas`. |
+| SAS ad hoc aceito pelo request de upload, ou reaquisição fora do fluxo de claim/fencing do Passo 2 (item 3) | O upload NUNCA aceita um SAS no request — `PurviewUploadCommandProcessor` chama exclusivamente `AcquireSasForUploadUseCase.ExecuteAsync` (Passo 2, claim/lease/fencing por época já revisado por AB-I5-006/007/008), sob `WorkloadIdentities.UploadWorker`. Qualquer causa de negação (handle ausente, expirado, lease de outro adquirente, cross-scope) produz o MESMO `SasDenied` uniforme — nunca revela qual causa. Comprovado por `ASasThatCannotBeAcquiredIsRetriedRatherThanFailed`. |
+| SAS exposto em log, evidence, exception, telemetria ou command line além do worker dedicado (item 7) | `RedactedSecret.Reveal()` é chamado em EXATAMENTE um ponto de todo o worker de upload (`AzCopyUploadProcessExecutor.ComposeDestinationUrl`), imediatamente antes de montar o `ProcessStartInfo.ArgumentList` — a URL composta nunca é atribuída a um campo, log ou retorno além do uso local imediato. `AzCopyProcessArgumentBuilder` usa `ArgumentList` exclusivamente (nunca shell/string concatenada). O fato de o SAS aparecer inevitavelmente no command line do processo AzCopy (documentado explicitamente aqui como limitação aceita do runbook §25.6) fica confinado a este adapter de Infrastructure, nunca a Domain/Application (reforçado estruturalmente por `VendorBoundaryTests`, que bane `ProcessStartInfo`/`System.Diagnostics.Process` de Domain/Application). |
+| stdout/stderr do AzCopy (que podem refletir o SAS/path) persistidos como evidência ou propagados ao chamador (item 10) | `IAzCopyUploadExecutor.UploadFileAsync`/`AzCopyUploadFileResult` NUNCA carregam stdout/stderr — apenas `ExitCode`/`TimedOut`/`OutputLimitExceeded`, estruturalmente. `AzCopyUploadProcessExecutor` descarta o texto capturado por `ByteLimitedProcessRunner` antes de retornar. `PurviewUploadEvidence` só registra contadores/identidades já conhecidos SERVER-SIDE (do conjunto de bindings), nunca um valor reportado pelo próprio processo. |
+| Estrutura remota reutilizada entre projetos/waves, ou construída a partir de nome humano/mailbox permitindo traversal (item 4, acceptance criteria 11) | `PurviewRemoteUploadPrefix.ForWave`/`PurviewRemotePstName.ForPart` são funções PURAS dos IDs opacos (tenant/projeto/wave em hex `"N"`; artefato+sequência) — estruturalmente hexadecimal/dígitos/hífen/sublinhado, sem `..`/barra/separador UNC possível. Prefixo exclusivo por (tenant, projeto, wave) — dois escopos distintos nunca colidem. Comprovado por `RemoteUploadPrefixIsExclusiveAndDifferentAcrossTenantProjectOrWave`, `RemoteUploadPrefixIsStructurallyOpaqueHexWithoutTraversalOrSeparators`, `RemotePstNameIsDerivedFromArtifactAndSequenceNeverFromMailboxOrPath`. |
+| Retry/restart do worker duplica silenciosamente um upload lógico, ou perde a lineage de tentativas (item 8) | `IPurviewUploadRequestStore.EnqueueIdempotentAsync` garante, sob `UPDLOCK, HOLDLOCK` + índice único `UQ_purview_upload_requests_wave`, um único pedido/Job por (tenant, projeto, wave) PARA SEMPRE — o backstop SQL converge qualquer corrida concorrente sem duplicar. `IPurviewUploadAttemptStore` é append-only (`UQ_purview_upload_attempts_number`): cada tentativa é uma linha imutável nova, a história completa nunca é reescrita. Comprovado por `ARepeatedEnqueueForTheSameWaveConvergesWithoutCreatingASecondJob`, `TwoConcurrentEnqueuesForTheSameWaveNeverProduceTwoRequests` (concorrência real sob SQL Server). |
+| Perda de job lease/fencing durante o transporte persiste `Uploaded` mesmo assim (item 9, acceptance criteria 8) | `PurviewUploadCommandProcessor` reutiliza integralmente `PlanningHeartbeat`/`IJobLeaseManager` (mesmo mecanismo de `EvExportCommandProcessor`, ADR-0003): heartbeat periódico real durante toda a execução — perda do cercamento cancela a operação ANTES de qualquer persistência nova. `IPurviewUploadAttemptStore.AppendAsync` grava sob o MESMO `JobFence` da reivindicação, revalidado (`SqlJobFence.RevalidateAsync`) imediatamente antes do commit — um lease que expirou durante a operação recusa fail-closed (`FencedOutException`), nenhuma linha é gravada. Comprovado sob SQL Server real por `AttemptAppendUnderALostFenceIsRejectedFailClosed`. |
+| Exit code != 0, timeout, cancelamento ou saída de output truncada tratados como sucesso (item 11, acceptance criteria 9) | Qualquer arquivo cujo `AzCopyUploadFileResult` tenha `ExitCode != 0`, `TimedOut` ou `OutputLimitExceeded` interrompe TODO o conjunto do transporte com `ProcessFailed` — nunca um sucesso parcial "meio enviado" nem uma inferência de sucesso a partir de saída incompleta. `Uploaded` só é alcançável depois que TODOS os arquivos do conjunto canônico completaram com exit code exatamente 0. Comprovado por `AProcessFailureIsRetriedAndNeverProducesUploaded`. |
+| Upload bem-sucedido confundido com importação/reconciliação Purview concluída (item 13, STOP-THE-LINE) | `PurviewUploadAttemptOutcome.Uploaded` é um estado ESTRUTURALMENTE distinto — nenhum tipo/porta deste Passo cria, inicia ou consulta um import job Purview, gera mapping CSV ou executa Graph/EXO writes; nenhuma tabela/campo deste Passo marca wave/projeto como "concluído". A wave permanece no MESMO `WaveStatus` (`Approved`/`Frozen`) após o upload — nenhuma transição de estado da wave é disparada por este Passo. |
+| Réplay idempotente (item 14) reexecuta o transporte desnecessariamente, ou identidade lógica calculada incorretamente permite um falso réplay | `PurviewUploadRequestIdentity.Compute` incorpora o conjunto CANÔNICO de bindings (ordenado deterministicamente por `Execution.Value` — nunca a ordem de leitura do store, e nunca só por `PartKey`, que poderia colidir entre execuções distintas), a geração do handle SAS e o binário homologado observado; qualquer mudança real produz uma identidade diferente. `DispatchAsync` converge SEM reexecutar AzCopy quando a tentativa `Uploaded` mais recente já existe para o mesmo pedido. Comprovado por `ComputeIsDeterministicRegardlessOfBindingReadOrder`, `ComputeProducesADifferentIdentityWhenTheSasGenerationChanges`/`...BindingSetChanges`, `ASuccessfulTransportPersistsSanitizedEvidenceAndCompletesTheJob`, `AnIdempotentReplayWithTheSameIdentityNeverReRunsAzCopy`. |
+| SQL injection | Todo acesso a dados é parametrizado (`SqlCommand`/`SqlParameter`), sem concatenação de entrada — reaproveita o mesmo padrão dos módulos anteriores. |
+| Identidade de manutenção usada para ler/persistir bindings, pedidos ou tentativas de upload, ou executar o transporte | Nenhum store deste Passo (`SqlWavePartitionOutputBindingStore`, `SqlPurviewUploadRequestStore`, `SqlPurviewUploadAttemptStore`) abre conexão de manutenção para escrita; apenas `SqlPurviewUploadPendingScopeReader` usa a identidade de manutenção, e é ESTRITAMENTE read-only (mesmo padrão de `SqlEvExportPendingScopeReader`) — nenhum claim/UPDATE/INSERT/efeito de negócio. `dbo.purview_upload_attempts` não concede NENHUM grant à identidade de manutenção. |
+| Dependência vazando de Domain/Application/Contracts para AzCopy/`System.Diagnostics.Process`/DPAPI | Nenhum arquivo-fonte de Domain/Application/Contracts referencia `ProcessStartInfo`/`System.Diagnostics.Process` — `AzCopyProcessArgumentBuilder`/`AzCopyUploadProcessExecutor` vivem exclusivamente em `ArchiveBridge.Infrastructure`. `AzCopyHomologationCatalog`/`AzCopyBinaryIdentity` (Domain) são tipos de VALOR puros (versão + hash), sem qualquer chamada real ao AzCopy. Verificado pelos testes já existentes de `VendorBoundaryTests`/`DependencyRuleTests` (103/103 verdes com este Passo). |
+
+## Risco residual aceito — SAS de uso único versus retry de transporte multi-arquivo (limitação documentada)
+
+O handle SAS do Passo 2 é DELIBERADAMENTE de uso único: `Consumed` é terminal e nunca retorna a
+`Available` sem um NOVO intake (nova geração, ação humana no portal Purview). Este Passo transporta N
+arquivos PST de uma wave SEQUENCIALMENTE dentro de UMA ÚNICA tentativa (`DispatchAsync`), reaproveitando o
+MESMO `RedactedSecret` adquirido uma vez para todos os arquivos daquela tentativa — nunca reaquire o SAS
+por arquivo. Se o processo AzCopy falhar em um arquivo NO MEIO do conjunto (ex.: falha transitória de rede
+no arquivo 2 de 3), a tentativa inteira falha fail-closed (`ProcessFailed`, item 11) e o Job é agendado
+para retry — mas como o SAS já foi `Consumed` pela tentativa anterior, a PRÓXIMA tentativa (mesmo Job,
+`AttemptNumber` seguinte) NUNCA consegue readquiri-lo: `AcquireSasForUploadUseCase` recusa fail-closed
+(`SasDenied`) qualquer segunda aquisição do mesmo handle. O Job então esgota `RetryPolicy.Default` (5
+tentativas) e transitina para `Failed` terminal — nunca para um falso `Uploaded`, mas também sem
+recuperação automática.
+
+**Isto é aceito, não mascarado**: (1) nenhum efeito inseguro decorre disso — o pior caso é uma falha
+terminal honesta, nunca um sucesso parcial reportado como completo; (2) o mesmo comportamento já é
+implícito na decisão de produto do Passo 2/runbook §25.5 (o SAS É a senha do Network Upload, de uso único
+por desenho da própria Microsoft — o runbook não descreve um cenário de "SAS reutilizável para retry
+parcial"); (3) inventar uma exceção a essa regra (ex.: permitir múltiplas aquisições da MESMA geração)
+enfraqueceria a garantia de uso único que o Passo 2 foi desenhado e revisado (AB-I5-006/007/008) para
+proteger, uma decisão de segurança que este Passo não está autorizado a reabrir unilateralmente. A
+recuperação depois desse ponto exige um NOVO intake de SAS (nova geração, ação humana no portal Purview) —
+o mesmo caminho operacional já documentado no runbook para qualquer SAS expirado/inválido. Registrado aqui
+explicitamente para que o Engineering Reviewer decida, em Passo futuro, se um mecanismo de "reintake
+automático após falha parcial" deve ser desenhado — não implementado unilateralmente aqui.
+
+## Fora de escopo deste Passo (herdado do STOP-THE-LINE)
+
+Criação/início de import job Purview por API/automação, mapping CSV oficial, edição manual/Excel do CSV,
+Graph writes/Exchange Online writes, `Enable-Mailbox -Archive`/auto-expansion/mudanças de retention,
+reconciliação pós-import, marcação de wave/projeto como concluído por upload isolado, armazenamento do SAS
+em plaintext/log, Azure Key Vault/Managed Identity como dependência obrigatória, reuso de pasta remota
+entre projetos/waves, qualquer execução contra destino não proveniente do handle SAS canônico da wave.
+Nenhum destes fluxos existe no código deste Passo — não há superfície de ameaça nova a analisar para eles
+aqui.
