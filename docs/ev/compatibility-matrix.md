@@ -74,3 +74,15 @@ A emissão real do watermark contra um host EV (reaproveitando o mesmo mecanismo
 `Export-EVArchive`/PowerShell do adapter de export, com o filtro incremental
 aprovado) e a promoção a `testado`/`certificado` são trabalho de um Passo
 POSTERIOR de certificação — nenhuma versão é certificada por este documento.
+
+**Correção fail-closed (AB-4C-009):** `EvDeltaStrategySelectionPolicy` só resolve
+`Supported` (habilitando `RequestEvBaselineUseCase`/`RequestEvDeltaUseCase` a
+chamar o adapter e criar um watermark canônico) para uma entrada **certificada**
+— nível **compatível** (linha acima) significa exclusivamente "a arquitetura
+comporta a strategy", nunca autorização de execução, mesma regra de honestidade
+comercial da tabela de critérios de suporte no topo deste documento. Como
+NENHUMA família está certificada neste Passo, o desfecho de
+`EvDeltaStrategySelectionPolicy.Select` para toda versão da tabela acima é hoje
+`Unsupported` — o mesmo desfecho de uma família explicitamente vetada — até que
+um Passo de certificação promova `EV-COMPOSITE-WATERMARK@v1` (ou um novo
+adapter) para `certificado` numa família específica.

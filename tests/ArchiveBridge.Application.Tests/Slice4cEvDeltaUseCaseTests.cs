@@ -79,56 +79,38 @@ public sealed class Slice4cEvDeltaUseCaseTests
         Assert.Contains(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.StrategySelected);
     }
 
-    [Fact]
-    public async Task BaselineHappyPathIssuesAWatermarkAndIsIdempotentOnRetry()
-    {
-        var scope = Scope();
-        var now = DateTimeOffset.UtcNow;
-        var (connectors, capabilities, adapters, runs, watermarks, _, audit) = Wiring();
-        var identity = ActiveConnector(scope, now);
-        connectors.Seed(identity);
-        capabilities.Seed(ExportCapableHandshake(identity, now));
-        var adapter = new FakeEvDeltaStrategyAdapter(CompositeV1);
-        adapters.Register(adapter);
-
-        var useCase = new RequestEvBaselineUseCase(connectors, capabilities, adapters, runs, audit, new AdvancingStubClock(now));
-        var request = new RequestEvBaseline(scope, identity.Id, "arch-1", CorrelationId.New());
-
-        var first = await useCase.ExecuteAsync(request, CancellationToken.None);
-        var second = await useCase.ExecuteAsync(request, CancellationToken.None);
-
-        Assert.Equal(EvDeltaRunOutcome.Completed, first.Outcome);
-        Assert.False(first.Replayed);
-        Assert.True(second.Replayed);
-        Assert.Equal(first.Run, second.Run);
-        Assert.Equal(1, adapter.BaselineCallCount); // replay nunca rechama o adapter
-        Assert.NotNull(first.IssuedWatermark);
-        var stored = await watermarks.GetByIdAsync(scope, first.IssuedWatermark!.Value, CancellationToken.None);
-        Assert.NotNull(stored);
-        Assert.Contains(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.BaselineCompleted);
-        Assert.Contains(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.WatermarkAccepted);
-    }
+    // AB-4C-009 item 1 (fail-closed): a família "15.0.0" é reconhecida pela matriz embarcada, mas apenas no
+    // nível Compatible — NENHUMA família de produção está Certified neste Passo — então baseline/delta/
+    // final-delta permanecem bloqueados mesmo com connector ativo, capability exportável e (para FinalDelta)
+    // freeze autorizado. O caminho "adapter chamado ⇒ Completed" só é alcançável quando a policy resolve
+    // Supported (provado isoladamente com um descriptor Certified injetado em Slice4cEvDeltaDomainTests).
 
     [Fact]
-    public async Task BaselineAdapterFailureRecordsAFailedAttemptAndRethrows()
+    public async Task BaselineWithACompatibleOnlyFamilyIsBlockedFailClosedAndIsIdempotentOnRetry()
     {
         var scope = Scope();
         var now = DateTimeOffset.UtcNow;
         var (connectors, capabilities, adapters, runs, _, _, audit) = Wiring();
         var identity = ActiveConnector(scope, now);
         connectors.Seed(identity);
-        capabilities.Seed(ExportCapableHandshake(identity, now));
-        var adapter = new FakeEvDeltaStrategyAdapter(CompositeV1) { ThrowOnBaseline = true };
+        capabilities.Seed(ExportCapableHandshake(identity, now)); // evVersion "15.0.0" — família Compatible, nunca Certified.
+        var adapter = new FakeEvDeltaStrategyAdapter(CompositeV1);
         adapters.Register(adapter);
 
         var useCase = new RequestEvBaselineUseCase(connectors, capabilities, adapters, runs, audit, new AdvancingStubClock(now));
+        var request = new RequestEvBaseline(scope, identity.Id, "arch-1", CorrelationId.New());
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => useCase.ExecuteAsync(
-            new RequestEvBaseline(scope, identity.Id, "arch-1", CorrelationId.New()), CancellationToken.None));
+        await Assert.ThrowsAsync<EvDeltaStrategyUnsupportedException>(() => useCase.ExecuteAsync(request, CancellationToken.None));
+        var second = await useCase.ExecuteAsync(request, CancellationToken.None); // retry converge, não relança silenciosamente uma 2ª tentativa nova
+        Assert.True(second.Replayed);
 
         var recorded = Assert.Single(await runs.ListAllAsync());
-        Assert.Equal(EvDeltaRunOutcome.Failed, recorded.Outcome);
-        Assert.Contains(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.DeltaFailed);
+        Assert.Equal(EvDeltaRunOutcome.StrategyUnsupported, recorded.Outcome);
+        Assert.Null(recorded.IssuedWatermark);
+        Assert.Equal(0, adapter.BaselineCallCount); // NUNCA chamado — Compatible não é elegível para execução canônica
+        Assert.Contains(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.StrategySelected);
+        Assert.DoesNotContain(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.BaselineCompleted);
+        Assert.DoesNotContain(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.WatermarkAccepted);
     }
 
     // ---- RequestEvDeltaUseCase -----------------------------------------------------------------------
@@ -162,8 +144,13 @@ public sealed class Slice4cEvDeltaUseCaseTests
     }
 
     [Fact]
-    public async Task DeltaHappyPathChainsFromThePreviousWatermarkAndIsIdempotent()
+    public async Task DeltaWithACompatibleOnlyFamilyIsBlockedFailClosedEvenWithAValidPreviousWatermark()
     {
+        // Diferente do bloqueio "sem baseline anterior" (DeltaWithoutAPriorBaselineFailsClosed), aqui o
+        // watermark anterior existe e é da MESMA strategy/escopo — ainda assim a seleção (Compatible, não
+        // Certified) bloqueia ANTES de qualquer inspeção de lineage do watermark anterior (EnsureCanPrecede
+        // nunca chega a ser chamado; a validação de lineage cross-scope/strategy/downgrade é coberta em
+        // Slice4cEvDeltaDomainTests diretamente sobre EvWatermark).
         var scope = Scope();
         var now = DateTimeOffset.UtcNow;
         var (connectors, capabilities, adapters, runs, watermarks, freezePlans, audit) = Wiring();
@@ -172,37 +159,27 @@ public sealed class Slice4cEvDeltaUseCaseTests
         capabilities.Seed(ExportCapableHandshake(identity, now));
         var adapter = new FakeEvDeltaStrategyAdapter(CompositeV1);
         adapters.Register(adapter);
-        var clock = new AdvancingStubClock(now);
+        watermarks.Seed(EvWatermark.Issue(identity.Tenant, identity.Project, identity.Id, "arch-1", EvDeltaPhase.Baseline, CompositeV1, Guid.NewGuid(), "t", now));
 
-        var baselineUseCase = new RequestEvBaselineUseCase(connectors, capabilities, adapters, runs, audit, clock);
-        var baseline = await baselineUseCase.ExecuteAsync(new RequestEvBaseline(scope, identity.Id, "arch-1", CorrelationId.New()), CancellationToken.None);
-
-        var deltaUseCase = new RequestEvDeltaUseCase(connectors, capabilities, watermarks, freezePlans, adapters, runs, audit, clock);
+        var useCase = new RequestEvDeltaUseCase(connectors, capabilities, watermarks, freezePlans, adapters, runs, audit, new AdvancingStubClock(now.AddSeconds(1)));
         var request = new RequestEvDelta(scope, identity.Id, "arch-1", EvDeltaPhase.Delta, CorrelationId.New());
-        var first = await deltaUseCase.ExecuteAsync(request, CancellationToken.None);
 
-        Assert.Equal(EvDeltaRunOutcome.Completed, first.Outcome);
-        Assert.False(first.Replayed);
-        Assert.NotEqual(baseline.IssuedWatermark, first.IssuedWatermark);
+        await Assert.ThrowsAsync<EvDeltaStrategyUnsupportedException>(() => useCase.ExecuteAsync(request, CancellationToken.None));
+        var second = await useCase.ExecuteAsync(request, CancellationToken.None); // retry converge (terminal já persistido)
+        Assert.True(second.Replayed);
 
-        // Uma segunda solicitação SEQUENCIAL (após a primeira já ter avançado o watermark canônico) é uma
-        // NOVA operação lógica — o próximo delta a partir do watermark que acabou de se tornar canônico —
-        // nunca um replay da primeira (req 12: a identidade é por phase+watermark-ANTERIOR+archive; o
-        // watermark anterior mudou entre as duas chamadas). Retry/concorrência sob o MESMO watermark
-        // anterior é coberto por DeltaRetryUnderTheSameIdempotencyKeyConvergesWithoutCallingTheAdapterAgain.
-        var second = await deltaUseCase.ExecuteAsync(request, CancellationToken.None);
-        Assert.False(second.Replayed);
-        Assert.Equal(2, adapter.IncrementalCallCount);
-        Assert.NotEqual(first.IssuedWatermark, second.IssuedWatermark);
+        var recorded = Assert.Single(await runs.ListAllAsync());
+        Assert.Equal(EvDeltaRunOutcome.StrategyUnsupported, recorded.Outcome);
+        Assert.Equal(0, adapter.IncrementalCallCount); // NUNCA chamado
     }
 
     [Fact]
-    public async Task DeltaRejectsAWatermarkFromAnotherStrategyAsStrategyMismatchAndRetryConvergesWithoutCallingTheAdapter()
+    public async Task DeltaBlocksAtStrategySelectionBeforeEverInspectingThePreviousWatermarkLineage()
     {
-        // A rejeição acontece ANTES de qualquer chamada ao adapter (EnsureCanPrecede), então "previous" no
-        // watermark store nunca muda entre chamadas — um retry recomputa a MESMA identidade canônica e
-        // encontra a MESMA tentativa bloqueada já persistida (terminal), provando o backstop de
-        // idempotência (req 12/14) sem depender de concorrência real (coberta em Integration.Tests).
+        // Mesmo quando o watermark anterior JÁ seria recusado por outro motivo (EnsureCanPrecede:
+        // StrategyMismatch, provado isoladamente em Slice4cEvDeltaDomainTests), a seleção de strategy
+        // (Compatible, não Certified) é o primeiro gate fail-closed e bloqueia ANTES — o desfecho persistido
+        // é StrategyUnsupported, nunca WatermarkRejected, e o retry converge sem duplicar linha.
         var scope = Scope();
         var now = DateTimeOffset.UtcNow;
         var (connectors, capabilities, adapters, runs, watermarks, freezePlans, audit) = Wiring();
@@ -220,21 +197,20 @@ public sealed class Slice4cEvDeltaUseCaseTests
         var useCase = new RequestEvDeltaUseCase(connectors, capabilities, watermarks, freezePlans, adapters, runs, audit, new AdvancingStubClock(now.AddSeconds(1)));
         var request = new RequestEvDelta(scope, identity.Id, "arch-1", EvDeltaPhase.Delta, CorrelationId.New());
 
-        var first = await Assert.ThrowsAsync<EvWatermarkRejectedException>(() => useCase.ExecuteAsync(request, CancellationToken.None));
-        Assert.Equal(EvWatermarkRejectionReason.StrategyMismatch, first.Reason);
+        await Assert.ThrowsAsync<EvDeltaStrategyUnsupportedException>(() => useCase.ExecuteAsync(request, CancellationToken.None));
 
         // O retry recomputa a MESMA identidade canônica (nenhum watermark novo foi persistido pela
         // tentativa bloqueada) e encontra a tentativa TERMINAL já registrada — devolvida como replay, sem
-        // relançar nem reexecutar a validação/o adapter.
+        // relançar nem reexecutar a seleção/validação/o adapter.
         var second = await useCase.ExecuteAsync(request, CancellationToken.None);
         Assert.True(second.Replayed);
-        Assert.Equal(EvDeltaRunOutcome.WatermarkRejected, second.Outcome);
+        Assert.Equal(EvDeltaRunOutcome.StrategyUnsupported, second.Outcome);
 
         var recorded = await runs.ListAllAsync();
         var blocked = Assert.Single(recorded); // uma ÚNICA linha — o retry converge, nunca duplica
-        Assert.Equal(EvDeltaRunOutcome.WatermarkRejected, blocked.Outcome);
+        Assert.Equal(EvDeltaRunOutcome.StrategyUnsupported, blocked.Outcome);
         Assert.Equal(0, adapter.IncrementalCallCount); // NUNCA chamado em nenhuma das duas tentativas
-        Assert.Contains(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.WatermarkRejected);
+        Assert.Contains(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.StrategySelected);
     }
 
     [Fact]
@@ -256,15 +232,20 @@ public sealed class Slice4cEvDeltaUseCaseTests
     }
 
     [Fact]
-    public async Task FinalDeltaAfterAuthorizedFreezeCompletesAndMarksThePlanFinalDeltaReady()
+    public async Task FinalDeltaIsBlockedFailClosedByStrategySelectionEvenWithAnAuthorizedFreeze()
     {
+        // STOP-THE-LINE (freeze) e certificação (AB-4C-009 item 1) são gates INDEPENDENTES: um freeze
+        // autorizado remove o bloqueio de EvFreezeNotAuthorizedException, mas NÃO substitui a exigência de
+        // strategy Certified — o plano permanece em FreezeAuthorized (nunca promovido a FinalDeltaReady)
+        // porque o delta final nunca chega a Completed.
         var scope = Scope();
         var now = DateTimeOffset.UtcNow;
         var (connectors, capabilities, adapters, runs, watermarks, freezePlans, audit) = Wiring();
         var identity = ActiveConnector(scope, now);
         connectors.Seed(identity);
         capabilities.Seed(ExportCapableHandshake(identity, now));
-        adapters.Register(new FakeEvDeltaStrategyAdapter(CompositeV1));
+        var adapter = new FakeEvDeltaStrategyAdapter(CompositeV1);
+        adapters.Register(adapter);
         watermarks.Seed(EvWatermark.Issue(identity.Tenant, identity.Project, identity.Id, "arch-1", EvDeltaPhase.Baseline, CompositeV1, Guid.NewGuid(), "t", now));
 
         var plan = EvFreezePlan.RequestFreeze(identity.Tenant, identity.Project, identity.Id, "arch-1");
@@ -272,13 +253,14 @@ public sealed class Slice4cEvDeltaUseCaseTests
         await freezePlans.SaveAsync(scope, plan, expectedPreviousVersion: 0, CancellationToken.None);
 
         var useCase = new RequestEvDeltaUseCase(connectors, capabilities, watermarks, freezePlans, adapters, runs, audit, new AdvancingStubClock(now.AddSeconds(1)));
-        var result = await useCase.ExecuteAsync(
-            new RequestEvDelta(scope, identity.Id, "arch-1", EvDeltaPhase.FinalDelta, CorrelationId.New()), CancellationToken.None);
 
-        Assert.Equal(EvDeltaRunOutcome.Completed, result.Outcome);
+        await Assert.ThrowsAsync<EvDeltaStrategyUnsupportedException>(() => useCase.ExecuteAsync(
+            new RequestEvDelta(scope, identity.Id, "arch-1", EvDeltaPhase.FinalDelta, CorrelationId.New()), CancellationToken.None));
+
         var savedPlan = await freezePlans.GetAsync(scope, identity.Id, "arch-1", CancellationToken.None);
-        Assert.Equal(EvFreezeStatus.FinalDeltaReady, savedPlan!.Status);
-        Assert.Contains(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.FinalDeltaReady);
+        Assert.Equal(EvFreezeStatus.FreezeAuthorized, savedPlan!.Status); // NUNCA promovido a FinalDeltaReady sem um delta final Completed
+        Assert.Equal(0, adapter.IncrementalCallCount);
+        Assert.DoesNotContain(audit.Events, e => e.EventCode == EvDeltaAuditEventCode.FinalDeltaReady);
     }
 
     // ---- Freeze lifecycle use cases -------------------------------------------------------------------

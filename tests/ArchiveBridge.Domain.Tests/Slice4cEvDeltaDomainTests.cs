@@ -36,28 +36,88 @@ public sealed class Slice4cEvDeltaDomainTests
         Assert.Null(selection.Selected);
     }
 
+    // ---- AB-4C-009 item 1: Compatible/Tested NUNCA são elegíveis para execução canônica (fail-closed) ----
+
     [Theory]
     [InlineData("15.0.1")]
     [InlineData("14.2")]
     [InlineData("12.1.0")]
     [InlineData("10.0")]
-    public void ACertifiedFamilyVersionSelectsTheDocumentedStrategyForEveryPhase(string version)
+    public void AKnownButNotCertifiedFamilyVersionIsUnsupportedForCanonicalExecutionInEveryPhase(string version)
     {
+        // A matriz embarcada reconhece estas famílias (EV-COMPOSITE-WATERMARK@v1, nível Compatible), mas
+        // Compatible significa apenas "a arquitetura comporta um adapter" — NUNCA autorização para avançar
+        // baseline/delta/final-delta e criar um watermark canônico (AB-4C-009 item 1). O desfecho é
+        // Unsupported, o MESMO usado para família explicitamente vetada — nunca Supported.
         foreach (var phase in new[] { EvDeltaPhase.Baseline, EvDeltaPhase.Delta, EvDeltaPhase.FinalDelta })
         {
             var selection = EvDeltaStrategySelectionPolicy.Select(version, phase);
 
-            Assert.Equal(EvDeltaStrategySelectionOutcome.Supported, selection.Outcome);
-            Assert.Equal("EV-COMPOSITE-WATERMARK", selection.Selected!.StrategyId.Name);
-            Assert.NotEqual(EvDeltaStrategyCertification.Certified, selection.Selected.Certification); // ADR-0013: nenhuma família começa Certified.
+            Assert.Equal(EvDeltaStrategySelectionOutcome.Unsupported, selection.Outcome);
+            Assert.Null(selection.Selected);
         }
     }
 
     [Fact]
     public void NoFamilyInTheEmbeddedMatrixStartsCertified()
     {
-        var selection = EvDeltaStrategySelectionPolicy.Select("15.0", EvDeltaPhase.Baseline);
-        Assert.True(selection.Selected!.Certification < EvDeltaStrategyCertification.Certified);
+        // ADR-0013: nenhuma família começa Certified — consultado diretamente no catálogo, porque a
+        // seleção em si já nem devolve um Selected para uma família apenas Compatible (ver teste acima).
+        var candidates = EvDeltaStrategyCatalog.Evaluate("15.0");
+        Assert.NotEmpty(candidates);
+        Assert.All(candidates, descriptor => Assert.True(descriptor.Certification < EvDeltaStrategyCertification.Certified));
+    }
+
+    [Fact]
+    public void ACompatibleOrTestedDescriptorIsNeverEligibleEvenAsTheOnlyCandidate()
+    {
+        // Prova o gate no nível do descriptor (IsEligibleFor), independente da matriz embarcada real:
+        // nem Compatible nem Tested habilitam execução canônica — só Certified.
+        foreach (var level in new[] { EvDeltaStrategyCertification.Compatible, EvDeltaStrategyCertification.Tested })
+        {
+            var candidates = new[]
+            {
+                new EvDeltaStrategyDescriptor(StrategyV1, "15.", level, [EvDeltaPhase.Baseline], Precedence: 10),
+            };
+
+            var selection = EvDeltaStrategySelectionPolicy.SelectFrom(candidates, EvDeltaPhase.Baseline);
+
+            Assert.Equal(EvDeltaStrategySelectionOutcome.Unsupported, selection.Outcome);
+            Assert.Null(selection.Selected);
+        }
+    }
+
+    [Fact]
+    public void ACertifiedDescriptorInjectedIntoThePolicyIsSelectedDeterministically()
+    {
+        // AB-4C-009 item 3(d): uma versão Certified (injetada via SelectFrom, nunca a matriz embarcada real
+        // — nenhuma família de produção está Certified neste Passo) continua selecionada corretamente.
+        var candidates = new[]
+        {
+            new EvDeltaStrategyDescriptor(StrategyV1, "15.", EvDeltaStrategyCertification.Certified, [EvDeltaPhase.Baseline], Precedence: 10),
+        };
+
+        var selection = EvDeltaStrategySelectionPolicy.SelectFrom(candidates, EvDeltaPhase.Baseline);
+
+        Assert.Equal(EvDeltaStrategySelectionOutcome.Supported, selection.Outcome);
+        Assert.Equal(StrategyV1, selection.Selected!.StrategyId);
+    }
+
+    [Fact]
+    public void ACertifiedDescriptorOutranksACompatibleOneAtTheSamePrecedence()
+    {
+        // Mesmo empatados em precedência, só o Certified é elegível — nunca "escolhe o melhor esforço"
+        // entre os dois quando um deles ainda não está autorizado.
+        var candidates = new[]
+        {
+            new EvDeltaStrategyDescriptor(StrategyV1, "15.", EvDeltaStrategyCertification.Compatible, [EvDeltaPhase.Baseline], Precedence: 10),
+            new EvDeltaStrategyDescriptor(StrategyV2, "15.", EvDeltaStrategyCertification.Certified, [EvDeltaPhase.Baseline], Precedence: 10),
+        };
+
+        var selection = EvDeltaStrategySelectionPolicy.SelectFrom(candidates, EvDeltaPhase.Baseline);
+
+        Assert.Equal(EvDeltaStrategySelectionOutcome.Supported, selection.Outcome);
+        Assert.Equal(StrategyV2, selection.Selected!.StrategyId);
     }
 
     [Fact]
@@ -65,8 +125,8 @@ public sealed class Slice4cEvDeltaDomainTests
     {
         var tied = new[]
         {
-            new EvDeltaStrategyDescriptor(StrategyV1, "15.", EvDeltaStrategyCertification.Compatible, [EvDeltaPhase.Baseline], Precedence: 10),
-            new EvDeltaStrategyDescriptor(StrategyV2, "15.", EvDeltaStrategyCertification.Compatible, [EvDeltaPhase.Baseline], Precedence: 10),
+            new EvDeltaStrategyDescriptor(StrategyV1, "15.", EvDeltaStrategyCertification.Certified, [EvDeltaPhase.Baseline], Precedence: 10),
+            new EvDeltaStrategyDescriptor(StrategyV2, "15.", EvDeltaStrategyCertification.Certified, [EvDeltaPhase.Baseline], Precedence: 10),
         };
 
         var selection = EvDeltaStrategySelectionPolicy.SelectFrom(tied, EvDeltaPhase.Baseline);
@@ -80,8 +140,8 @@ public sealed class Slice4cEvDeltaDomainTests
     {
         var candidates = new[]
         {
-            new EvDeltaStrategyDescriptor(StrategyV1, "15.", EvDeltaStrategyCertification.Compatible, [EvDeltaPhase.Baseline], Precedence: 10),
-            new EvDeltaStrategyDescriptor(StrategyV2, "15.", EvDeltaStrategyCertification.Compatible, [EvDeltaPhase.Baseline], Precedence: 20),
+            new EvDeltaStrategyDescriptor(StrategyV1, "15.", EvDeltaStrategyCertification.Certified, [EvDeltaPhase.Baseline], Precedence: 10),
+            new EvDeltaStrategyDescriptor(StrategyV2, "15.", EvDeltaStrategyCertification.Certified, [EvDeltaPhase.Baseline], Precedence: 20),
         };
 
         var selection = EvDeltaStrategySelectionPolicy.SelectFrom(candidates, EvDeltaPhase.Baseline);
@@ -108,7 +168,7 @@ public sealed class Slice4cEvDeltaDomainTests
     {
         var baselineOnly = new[]
         {
-            new EvDeltaStrategyDescriptor(StrategyV1, "15.", EvDeltaStrategyCertification.Compatible, [EvDeltaPhase.Baseline], Precedence: 10),
+            new EvDeltaStrategyDescriptor(StrategyV1, "15.", EvDeltaStrategyCertification.Certified, [EvDeltaPhase.Baseline], Precedence: 10),
         };
 
         var selection = EvDeltaStrategySelectionPolicy.SelectFrom(baselineOnly, EvDeltaPhase.FinalDelta);
@@ -231,6 +291,59 @@ public sealed class Slice4cEvDeltaDomainTests
         var ex = Assert.Throws<EvWatermarkRejectedException>(() => EvWatermark.Rehydrate(
             WatermarkId.New(), tenant, project, connector, "arch-1", EvDeltaPhase.Baseline, StrategyV1,
             Guid.NewGuid(), "token", now, forgedHash));
+        Assert.Equal(EvWatermarkRejectionReason.Tampered, ex.Reason);
+    }
+
+    // ---- AB-4C-009 item 2/3(b): a evidência do hash cobre opaque_token/producing_execution_id/issued_at_utc,
+    // não só a lineage de escopo — adulteração ISOLADA de qualquer um destes campos é detectada -------------
+
+    [Fact]
+    public void RehydrateFailsClosedWhenOnlyTheOpaqueTokenIsAlteredButTheRestOfTheRowStaysIntact()
+    {
+        var tenant = Tenant;
+        var project = Project;
+        var connector = ConnectorId.New();
+        var now = DateTimeOffset.UtcNow;
+        var issued = IssueWatermark(tenant, project, connector, "arch-1", EvDeltaPhase.Baseline, StrategyV1, now);
+
+        // O hash persistido é o de "opaque-token-1"; a linha "lida de volta" afirma um token diferente —
+        // exatamente o cenário de uma coluna adulterada por fora enquanto o restante permanece intacto.
+        var ex = Assert.Throws<EvWatermarkRejectedException>(() => EvWatermark.Rehydrate(
+            issued.Id, tenant, project, connector, "arch-1", EvDeltaPhase.Baseline, StrategyV1,
+            issued.ProducingExecutionId, "opaque-token-FORGED", issued.IssuedAtUtc, issued.LineageHash));
+        Assert.Equal(EvWatermarkRejectionReason.Tampered, ex.Reason);
+    }
+
+    [Fact]
+    public void RehydrateFailsClosedWhenOnlyTheProducingExecutionIdIsAlteredButTheRestOfTheRowStaysIntact()
+    {
+        var tenant = Tenant;
+        var project = Project;
+        var connector = ConnectorId.New();
+        var now = DateTimeOffset.UtcNow;
+        var issued = IssueWatermark(tenant, project, connector, "arch-1", EvDeltaPhase.Baseline, StrategyV1, now);
+
+        var ex = Assert.Throws<EvWatermarkRejectedException>(() => EvWatermark.Rehydrate(
+            issued.Id, tenant, project, connector, "arch-1", EvDeltaPhase.Baseline, StrategyV1,
+            Guid.NewGuid(), issued.OpaqueToken, issued.IssuedAtUtc, issued.LineageHash));
+        Assert.Equal(EvWatermarkRejectionReason.Tampered, ex.Reason);
+    }
+
+    [Fact]
+    public void RehydrateFailsClosedWhenOnlyIssuedAtUtcIsAlteredButTheRestOfTheRowStaysIntact()
+    {
+        var tenant = Tenant;
+        var project = Project;
+        var connector = ConnectorId.New();
+        var now = DateTimeOffset.UtcNow;
+        var issued = IssueWatermark(tenant, project, connector, "arch-1", EvDeltaPhase.Baseline, StrategyV1, now);
+
+        // Adulteração isolada de issued_at_utc é o cenário que poderia, sem esta cobertura, promover
+        // artificialmente um watermark antigo a "mais recente" (GetLatestCanonicalAsync ORDER BY issued_at_utc
+        // DESC) — o hash precisa recusar mesmo essa alteração isolada.
+        var ex = Assert.Throws<EvWatermarkRejectedException>(() => EvWatermark.Rehydrate(
+            issued.Id, tenant, project, connector, "arch-1", EvDeltaPhase.Baseline, StrategyV1,
+            issued.ProducingExecutionId, issued.OpaqueToken, issued.IssuedAtUtc.AddDays(1), issued.LineageHash));
         Assert.Equal(EvWatermarkRejectionReason.Tampered, ex.Reason);
     }
 

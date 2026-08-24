@@ -37,9 +37,20 @@ public sealed record EvDeltaStrategyDescriptor(
     IReadOnlyList<EvDeltaPhase> SupportedPhases,
     int Precedence)
 {
-    /// <summary>Verdadeiro quando esta entrada é elegível para seleção (Compatible ou acima) e cobre a fase pedida.</summary>
+    /// <summary>
+    /// Verdadeiro SOMENTE quando esta entrada está <see cref="EvDeltaStrategyCertification.Certified"/> e
+    /// cobre a fase pedida (AB-4C-009 fix — fail-closed): <see cref="EvDeltaStrategyCertification.Compatible"/>
+    /// e <see cref="EvDeltaStrategyCertification.Tested"/> significam apenas que a arquitetura comporta a
+    /// strategy ou que ela foi exercitada em laboratório, NUNCA que ela está autorizada a avançar
+    /// baseline/delta/final-delta e criar um watermark canônico em produção — mesma honestidade comercial de
+    /// <see cref="Connector.ConnectorCapabilityHandshake"/>, que só marca <c>ExportCapable</c> quando o
+    /// support level é <see cref="Connector.ConnectorSupportLevel.Certified"/>. Enquanto nenhuma família
+    /// estiver Certified, <see cref="EvDeltaStrategySelectionPolicy"/> nunca devolve
+    /// <see cref="EvDeltaStrategySelectionOutcome.Supported"/> para ela — o desfecho é
+    /// <see cref="EvDeltaStrategySelectionOutcome.Unsupported"/>, o mesmo usado para família vetada.
+    /// </summary>
     public bool IsEligibleFor(EvDeltaPhase phase) =>
-        Certification >= EvDeltaStrategyCertification.Compatible && SupportedPhases.Contains(phase);
+        Certification == EvDeltaStrategyCertification.Certified && SupportedPhases.Contains(phase);
 }
 
 /// <summary>

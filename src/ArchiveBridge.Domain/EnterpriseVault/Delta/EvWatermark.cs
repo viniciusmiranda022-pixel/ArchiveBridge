@@ -81,10 +81,17 @@ public sealed record EvWatermark
             throw new ArgumentException("producingExecutionId é obrigatório.", nameof(producingExecutionId));
         }
 
-        var lineageHash = ComputeLineageHash(tenant, project, connector, sanitizedArchiveId, phase, strategy);
+        // Canonicaliza ANTES de hashear/persistir (AB-4C-009 fix): a coluna ev_watermarks.issued_at_utc é
+        // DATETIME2(3) — deixar um resto de sub-milissegundo aqui e só truncar dentro do hash arriscaria
+        // divergir do que o SQL Server efetivamente grava (arredondamento vs truncamento na conversão de
+        // precisão são comportamentos distintos); zerando o resto já em memória, não sobra nada para o SQL
+        // Server arredondar, então o valor persistido é bit-a-bit igual ao usado para computar o hash.
+        var canonicalIssuedAtUtc = TruncateToMilliseconds(issuedAtUtc);
+        var lineageHash = ComputeLineageHash(
+            tenant, project, connector, sanitizedArchiveId, phase, strategy, producingExecutionId, sanitizedToken, canonicalIssuedAtUtc);
         return new EvWatermark(
             WatermarkId.New(), tenant, project, connector, sanitizedArchiveId, phase, strategy,
-            producingExecutionId, sanitizedToken, issuedAtUtc, lineageHash);
+            producingExecutionId, sanitizedToken, canonicalIssuedAtUtc, lineageHash);
     }
 
     /// <summary>Reconstrói um watermark já persistido, revalidando o hash de lineage contra os campos REALMENTE carregados (fail-closed).</summary>
@@ -101,7 +108,8 @@ public sealed record EvWatermark
         DateTimeOffset issuedAtUtc,
         Sha256Hash persistedLineageHash)
     {
-        var lineageHash = ComputeLineageHash(tenant, project, connector, externalArchiveId, phase, strategy);
+        var lineageHash = ComputeLineageHash(
+            tenant, project, connector, externalArchiveId, phase, strategy, producingExecutionId, opaqueToken, issuedAtUtc);
         if (!string.Equals(lineageHash.Value, persistedLineageHash.Value, StringComparison.Ordinal))
         {
             throw new EvWatermarkRejectedException(
@@ -144,7 +152,16 @@ public sealed record EvWatermark
     /// <summary>Instante de emissão (UTC) — usado apenas para ordenar/recusar stale, nunca como critério de delta.</summary>
     public DateTimeOffset IssuedAtUtc { get; }
 
-    /// <summary>Hash determinístico da lineage — detecta adulteração entre persistência e leitura.</summary>
+    /// <summary>
+    /// Hash determinístico de TODOS os campos que definem identidade/ordem/conteúdo persistidos do
+    /// watermark (tenant/projeto/connector/archive/fase/strategy + <see cref="ProducingExecutionId"/> +
+    /// <see cref="OpaqueToken"/> + <see cref="IssuedAtUtc"/>, este último canonicalizado em milissegundos —
+    /// a mesma precisão de <c>ev_watermarks.issued_at_utc DATETIME2(3)</c>, para que o hash calculado na
+    /// emissão sobreviva ao arredondamento do SQL Server e continue batendo na releitura) — detecta
+    /// adulteração de QUALQUER um desses campos entre persistência e leitura (AB-4C-009 fix). O nome do
+    /// campo permanece "lineage" por compatibilidade com a coluna <c>lineage_hash</c> já publicada; o
+    /// conteúdo coberto é a evidência completa do watermark, não apenas a lineage de escopo.
+    /// </summary>
     public Sha256Hash LineageHash { get; }
 
     /// <summary>
@@ -193,7 +210,7 @@ public sealed record EvWatermark
 
     private static Sha256Hash ComputeLineageHash(
         TenantId tenant, ProjectId project, ConnectorId connector, string externalArchiveId,
-        EvDeltaPhase phase, EvDeltaStrategyId strategy) =>
+        EvDeltaPhase phase, EvDeltaStrategyId strategy, Guid producingExecutionId, string opaqueToken, DateTimeOffset issuedAtUtc) =>
         DeterministicHash.Compute(
         [
             tenant.Value.ToString("N"),
@@ -203,5 +220,20 @@ public sealed record EvWatermark
             phase.ToString(),
             strategy.Name,
             strategy.Version.ToString(CultureInfo.InvariantCulture),
+            producingExecutionId.ToString("N"),
+            opaqueToken,
+            TruncateToMilliseconds(issuedAtUtc).UtcTicks.ToString(CultureInfo.InvariantCulture),
         ]);
+
+    /// <summary>
+    /// Trunca para milissegundos (mesma precisão de <c>ev_watermarks.issued_at_utc DATETIME2(3)</c>) — usada
+    /// tanto para canonicalizar <see cref="IssuedAtUtc"/> ANTES de persistir (<see cref="Issue"/>) quanto,
+    /// defensivamente, dentro do próprio hash (idempotente sobre um valor já truncado que veio da releitura
+    /// em <see cref="Rehydrate"/>).
+    /// </summary>
+    private static DateTimeOffset TruncateToMilliseconds(DateTimeOffset value)
+    {
+        var truncatedTicks = value.UtcTicks - (value.UtcTicks % TimeSpan.TicksPerMillisecond);
+        return new DateTimeOffset(truncatedTicks, TimeSpan.Zero);
+    }
 }

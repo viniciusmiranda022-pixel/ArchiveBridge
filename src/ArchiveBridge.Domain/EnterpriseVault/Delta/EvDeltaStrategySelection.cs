@@ -6,7 +6,12 @@ public enum EvDeltaStrategySelectionOutcome
     /// <summary>Versão EV não reconhecida por nenhuma família da matriz — nunca inferida (req 2).</summary>
     Unknown,
 
-    /// <summary>Família reconhecida, mas nenhuma strategy elegível para a fase pedida (vetada ou abaixo de Compatible).</summary>
+    /// <summary>
+    /// Família reconhecida, mas nenhuma strategy <see cref="EvDeltaStrategyCertification.Certified"/> cobre
+    /// a fase pedida — inclui tanto famílias explicitamente vetadas quanto famílias apenas
+    /// <see cref="EvDeltaStrategyCertification.Compatible"/>/<see cref="EvDeltaStrategyCertification.Tested"/>,
+    /// que não estão autorizadas a avançar execução canônica (AB-4C-009 fix, fail-closed).
+    /// </summary>
     Unsupported,
 
     /// <summary>Exatamente uma strategy elegível vence de forma determinística.</summary>
