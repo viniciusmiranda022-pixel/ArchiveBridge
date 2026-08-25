@@ -200,6 +200,7 @@ public sealed class SqlReconciliationAssessmentStore(TenantConnectionFactory con
             await using (var command = new SqlCommand(InsertAssessmentSql, connection.Connection, transaction))
             {
                 BindScope(command, wave, attempt, scope.Project);
+                command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = assessment.AssessmentVersion });
                 command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
                 command.Parameters.Add(new SqlParameter("@sourceFingerprint", SqlDbType.Char, 64) { Value = assessment.SourceFingerprint.Value });
                 command.Parameters.Add(new SqlParameter("@pstItemCount", SqlDbType.Int) { Value = assessment.PstItemCount });
@@ -216,6 +217,7 @@ public sealed class SqlReconciliationAssessmentStore(TenantConnectionFactory con
             {
                 await using var command = new SqlCommand(InsertPstItemSql, connection.Connection, transaction);
                 BindScope(command, wave, attempt, scope.Project);
+                command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = assessment.AssessmentVersion });
                 command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
                 command.Parameters.Add(new SqlParameter("@remoteName", SqlDbType.NVarChar, 300) { Value = item.RemoteName.Value });
                 command.Parameters.Add(new SqlParameter("@disposition", SqlDbType.TinyInt) { Value = (byte)item.Disposition });
@@ -232,6 +234,7 @@ public sealed class SqlReconciliationAssessmentStore(TenantConnectionFactory con
             {
                 await using var command = new SqlCommand(InsertArchiveItemSql, connection.Connection, transaction);
                 BindScope(command, wave, attempt, scope.Project);
+                command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = assessment.AssessmentVersion });
                 command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
                 command.Parameters.Add(new SqlParameter("@archive", SqlDbType.NVarChar, 320) { Value = item.Archive.Value });
                 command.Parameters.Add(new SqlParameter("@disposition", SqlDbType.TinyInt) { Value = (byte)item.Disposition });
