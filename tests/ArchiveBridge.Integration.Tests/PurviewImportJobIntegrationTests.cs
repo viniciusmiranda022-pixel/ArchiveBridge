@@ -399,10 +399,15 @@ public sealed class PurviewImportJobIntegrationTests(SqlServerFixture fixture)
 
     // ---- ImportPurviewServiceResultReportUseCase ----
 
-    private static byte[] ReportBytes(string remotePstName, string status = "Succeeded", long? itemCount = 10) =>
+    // Inclui as 3 colunas de contadores/status que a correlação exige para considerar uma linha
+    // CONCLUSIVA (Status + ImportedItemCount + ImportedSizeBytes — ver PurviewServiceResultCorrelation):
+    // um relatório "feliz"/completo genuíno reporta granularidade suficiente para concluir sucesso/falha
+    // por PST, não apenas a contagem de itens.
+    private static byte[] ReportBytes(string remotePstName, string status = "Succeeded", long? itemCount = 10, long? sizeBytes = 2048) =>
         new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(
-            $"RemotePstName,Status,ImportedItemCount\n{remotePstName},{status}," +
-            $"{(itemCount is { } value ? value.ToString(System.Globalization.CultureInfo.InvariantCulture) : string.Empty)}\n");
+            $"RemotePstName,Status,ImportedItemCount,ImportedSizeBytes\n{remotePstName},{status}," +
+            $"{(itemCount is { } value ? value.ToString(System.Globalization.CultureInfo.InvariantCulture) : string.Empty)}," +
+            $"{(sizeBytes is { } sizeValue ? sizeValue.ToString(System.Globalization.CultureInfo.InvariantCulture) : string.Empty)}\n");
 
     [Fact]
     public async Task ImportReportPersistsAndCorrelatesWithTheCanonicalPst()
@@ -533,6 +538,26 @@ public sealed class PurviewImportJobIntegrationTests(SqlServerFixture fixture)
         var assessment = await CompletenessUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, CancellationToken.None);
 
         Assert.Equal(PurviewServiceResultCompletenessOutcome.CompleteForProviderEvidence, assessment.Outcome);
+        Assert.Equal(1, assessment.CanonicalCount);
+        Assert.Equal(1, assessment.MatchedCount);
+    }
+
+    [Fact]
+    public async Task CompletenessIsInconclusiveWhenTheReportOmitsImportedSizeBytesEvenWithStatusAndItemCountPresent()
+    {
+        // Status + ImportedItemCount por si só não bastam: sem ImportedSizeBytes o serviço não expôs
+        // granularidade suficiente para concluir sucesso/falha por PST (regressão para AB-I6-002 —
+        // a correlação NUNCA deve degradar para CompleteForProviderEvidence só porque status/itemCount
+        // foram fornecidos).
+        var (scope, wave, _, execution) = await SeedPlannableWaveAsync("completeness-no-size.pst", "completeness-no-size@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var noSizeBytesReport = new UTF8Encoding(false).GetBytes($"RemotePstName,Status,ImportedItemCount\n{remoteName},Succeeded,10\n");
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, noSizeBytesReport, "operator", CancellationToken.None);
+
+        var assessment = await CompletenessUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, CancellationToken.None);
+
+        Assert.Equal(PurviewServiceResultCompletenessOutcome.Inconclusive, assessment.Outcome);
         Assert.Equal(1, assessment.CanonicalCount);
         Assert.Equal(1, assessment.MatchedCount);
     }
