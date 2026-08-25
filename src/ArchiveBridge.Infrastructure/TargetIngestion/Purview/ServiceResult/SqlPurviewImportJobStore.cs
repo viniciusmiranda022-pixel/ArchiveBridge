@@ -43,6 +43,9 @@ public sealed class SqlPurviewImportJobStore(TenantConnectionFactory connectionF
     private const string GetPlanByNameSql =
         $"SELECT {PlanColumns} FROM dbo.purview_import_job_plans WHERE wave_id = @wave AND project_id = @project AND planned_job_name = @name;";
 
+    private const string GetPlansForWaveSql =
+        $"SELECT {PlanColumns} FROM dbo.purview_import_job_plans WHERE wave_id = @wave AND project_id = @project ORDER BY attempt_sequence;";
+
     // AB-I6-003 Blocker 3: locka TODOS os planos existentes desta onda (mesmo predicado/força de lock da
     // antiga SELECT MAX) para servir DUAS decisões sob a MESMA seção crítica: (a) a próxima
     // attempt_sequence a alocar SE nenhum plano convergir, e (b) se algum plano JÁ existente tem a MESMA
@@ -213,6 +216,25 @@ public sealed class SqlPurviewImportJobStore(TenantConnectionFactory connectionF
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadPlan(reader) : null;
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<PurviewImportJobPlan>> GetPlansForWaveAsync(
+        TenantScope scope, WaveId wave, CancellationToken cancellationToken)
+    {
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var command = new SqlCommand(GetPlansForWaveSql, connection.Connection);
+        command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+
+        var plans = new List<PurviewImportJobPlan>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            plans.Add(ReadPlan(reader));
+        }
+
+        return plans;
     }
 
     /// <inheritdoc />

@@ -4,12 +4,12 @@ Delta sobre o modelo de ameaças da plataforma, incorporado abaixo do capítulo 
 ([`threat-model-slice-06.md`](threat-model-slice-06.md), Passo 1 — mesmo formato). Escopo: captura,
 normalização, persistência e revalidação **read-only** de estatísticas do Exchange Online Archive
 before/after (runbook §25.2/§26.2), de forma tenant/project/wave/archive-scoped, versionada, idempotente e
-tamper-evident (work order [`AB-I6-005.md`](../engineering/requests/AB-I6-005.md)) — **sem** write
-EXO/Graph/Purview, sem `Enable-Mailbox`/auto-expansion/hold change, sem automação do portal Purview, sem
-import job automático, sem `expected vs observed` final, sem outcome/disposition/certificate, sem
-conclusão de wave/projeto, sem decommission EV e sem I7 Hardening/I8 Production Acceptance
-(STOP-THE-LINE do work order). Nenhum destes fluxos existe no código deste Passo — não há superfície de
-ameaça nova a analisar para eles aqui.
+tamper-evident (work order [`AB-I6-005.md`](../engineering/requests/AB-I6-005.md), com o gate temporal do
+baseline `BeforeImport` corrigido pelo AB-I6-006) — **sem** write EXO/Graph/Purview, sem
+`Enable-Mailbox`/auto-expansion/hold change, sem automação do portal Purview, sem import job automático,
+sem `expected vs observed` final, sem outcome/disposition/certificate, sem conclusão de wave/projeto, sem
+decommission EV e sem I7 Hardening/I8 Production Acceptance (STOP-THE-LINE do work order). Nenhum destes
+fluxos existe no código deste Passo — não há superfície de ameaça nova a analisar para eles aqui.
 
 ## Ativos adicionais
 
@@ -45,6 +45,7 @@ separado neste Passo — a evidência append-only É a trilha de auditoria, mesm
 | Ameaça | Mitigação |
 | --- | --- |
 | `AfterImport` capturado antes de o provider ter reportado conclusão suficiente do import, mascarando um estado pré-import como pós-import | `CaptureExoArchiveStatisticsUseCase.ExecuteAfterImportAsync` reaproveita `EvaluatePurviewServiceResultCompletenessUseCase` (Passo 1) e recusa fail-closed com `ExoArchiveStatisticsPrerequisiteException` — **sem sondar o adapter** — a menos que o desfecho seja `CompleteForProviderEvidence` (todo PST canônico da onda com status/contadores conclusivos). `ImportCompleted`/`Complete` observado permanece apenas evidência do provider; nenhum caso de uso deste Passo marca onda/projeto como concluído. |
+| `BeforeImport` capturado DEPOIS que a execução do import já começou/terminou (ex.: já existe observação `ImportStarted`/`ImportCompleted`/`ImportFailed`), rotulando um estado pós-import como "baseline anterior" e contaminando o futuro `expected vs observed` mesmo com hashes/CI corretos (AB-I6-006) | `CaptureExoArchiveStatisticsUseCase.ExecuteBeforeImportAsync` verifica, ANTES de sondar o adapter, TODOS os planos de import job já existentes para a onda (`IPurviewImportJobStore.GetPlansForWaveAsync`) e recusa fail-closed (`ExoArchiveStatisticsPrerequisiteException`) se a observação mais recente de QUALQUER um deles indicar `ExoBeforeImportEligibility.IsImportExecutionStartedOrBeyond` (o estado observado mais precoce/inequívoco de início real de `Import data`, runbook §25.9 item 79 — `JobCreated`/`ValidationAttached`/`AnalysisCompleted` continuam permitidos, pois representam apenas planejamento/validação, nunca execução). A decisão vem inteiramente de evidência server-side — nenhum identificador ou timestamp fornecido pelo caller decide o boundary. Um baseline já capturado ANTES do boundary continua legível/revalidável (`GetLatestAsync`/`GetFoldersAsync` não são afetados); apenas uma NOVA captura depois do boundary é bloqueada, sem criar versão N+1. |
 | Mailbox/archive fornecido pelo caller usado diretamente na sondagem do adapter (IDOR) | `CaptureExoArchiveStatisticsUseCase` resolve a `ArchiveRef` canônica a partir de `wave.Selection.Entries` via `IWaveStore` (mesmo padrão anti-IDOR de `SubmitMailboxPrecheckUseCase`/AB-I5-003) — o caller fornece apenas `TargetArchiveId` (identificador opaco). Onda inexistente, archive fora da seleção ou archive sem identidade resolvida produzem TODOS o mesmo `ExoArchiveStatisticsSourceNotFoundException`, sem sondar o adapter e sem vazar existência/UPN/GUID de outro escopo. |
 | Archive/onda de outro tenant/projeto acessado por IDOR na leitura de snapshots persistidos | Toda leitura (`GetLatestAsync`, `GetFoldersAsync`) filtra `project_id` explicitamente e participa de `rls.tenant_isolation_policy` (FILTER + BLOCK) nas duas tabelas novas — um snapshot de outro escopo é indistinguível de inexistente. |
 | Campo ausente do provider (ex.: `ItemCount`, holds) convertido em zero/false, mascarando dados realmente ausentes como valores reais | Todo contador é `long?`, toda data é `DateTimeOffset?` e os três flags de hold/auto-expansion são `bool?` — o adapter nunca é obrigado a inventar um valor; `ExoArchiveStatisticsSnapshot.Create`/`Rehydrate` preservam `null` sem coerção. Comprovado por `CreateAllowsEveryOptionalFieldAsNullUnknown`/`BeforeImportPreservesUnknownFieldsAsNullNeverAsZeroOrFalse` (Domain/Integration). |

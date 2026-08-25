@@ -53,10 +53,13 @@ public sealed class ExoArchiveStatisticsSourceNotFoundException : Exception
 }
 
 /// <summary>
-/// Lançada quando <see cref="ExoStatisticsPhase.AfterImport"/> é solicitado antes de existir evidência
-/// canônica suficiente de que a importação Purview observada concluiu a etapa necessária para iniciar
-/// reconciliação (AB-I6-005 itens 4/critério de aceite 2). O adapter NUNCA é sondado quando esta exceção
-/// é lançada.
+/// Lançada quando um pré-requisito temporal/de evidência canônica do gate de fase não está satisfeito —
+/// nas duas direções: (a) <see cref="ExoStatisticsPhase.AfterImport"/> solicitado antes de existir
+/// evidência canônica suficiente de que a importação Purview observada concluiu a etapa necessária para
+/// iniciar reconciliação (AB-I6-005 itens 4/critério de aceite 2); ou (b)
+/// <see cref="ExoStatisticsPhase.BeforeImport"/> solicitado depois de já existir evidência canônica de que
+/// a execução do import começou/terminou para algum plano da onda, o que tornaria o baseline
+/// semanticamente falso (AB-I6-006). O adapter NUNCA é sondado quando esta exceção é lançada.
 /// </summary>
 public sealed class ExoArchiveStatisticsPrerequisiteException : Exception
 {

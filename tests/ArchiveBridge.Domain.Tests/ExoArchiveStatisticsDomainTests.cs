@@ -3,6 +3,7 @@ using ArchiveBridge.Domain.IdentityAndAccess;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Domain.TargetIngestion.Purview;
 using ArchiveBridge.Domain.TargetIngestion.Purview.ExoStatistics;
+using ArchiveBridge.Domain.TargetIngestion.Purview.ServiceResult;
 using ArchiveBridge.Domain.Waves;
 using Xunit;
 
@@ -11,9 +12,10 @@ namespace ArchiveBridge.Domain.Tests;
 /// <summary>
 /// AB-I6-005 — <see cref="ExoArchiveFolderStatistic"/>/<see cref="ExoArchiveFolderStatisticsSet"/>
 /// (bounded/canonicalizado/fail-closed), <see cref="ExoArchiveFolderStatisticsHash"/> (determinístico,
-/// independente de ordem) e <see cref="ExoArchiveStatisticsSnapshot"/> (Create/Rehydrate tamper-evident,
-/// convergência idempotente por <see cref="ExoArchiveStatisticsSnapshot.ObservationHash"/>). Campo
-/// ausente permanece <see langword="null"/> (Unknown/NotReported), nunca zero/false/data mínima.
+/// independente de ordem), <see cref="ExoArchiveStatisticsSnapshot"/> (Create/Rehydrate tamper-evident,
+/// convergência idempotente por <see cref="ExoArchiveStatisticsSnapshot.ObservationHash"/>) e AB-I6-006 —
+/// <see cref="ExoBeforeImportEligibility"/> (gate temporal do baseline). Campo ausente permanece
+/// <see langword="null"/> (Unknown/NotReported), nunca zero/false/data mínima.
 /// </summary>
 public sealed class ExoArchiveStatisticsDomainTests
 {
@@ -334,5 +336,29 @@ public sealed class ExoArchiveStatisticsDomainTests
         Assert.Equal(2, values.Length);
         Assert.Contains(ExoStatisticsPhase.BeforeImport, values);
         Assert.Contains(ExoStatisticsPhase.AfterImport, values);
+    }
+
+    // ---- ExoBeforeImportEligibility (AB-I6-006) ----
+
+    [Theory]
+    [InlineData(PurviewImportJobObservedStatus.JobCreated)]
+    [InlineData(PurviewImportJobObservedStatus.ValidationAttached)]
+    [InlineData(PurviewImportJobObservedStatus.AnalysisCompleted)]
+    public void BeforeImportEligibilityAllowsStatusesThatOnlyRepresentPlanningOrValidation(PurviewImportJobObservedStatus status)
+    {
+        // O archive de destino ainda não foi tocado pelo import nestes estados — um baseline capturado
+        // aqui continua sendo o "estado anterior" legítimo (work order item 5).
+        Assert.False(ExoBeforeImportEligibility.IsImportExecutionStartedOrBeyond(status));
+    }
+
+    [Theory]
+    [InlineData(PurviewImportJobObservedStatus.ImportStarted)]
+    [InlineData(PurviewImportJobObservedStatus.ImportCompleted)]
+    [InlineData(PurviewImportJobObservedStatus.ImportFailed)]
+    public void BeforeImportEligibilityBlocksStatusesThatIndicateImportExecutionStartedOrBeyond(PurviewImportJobObservedStatus status)
+    {
+        // Mesmo uma falha (ImportFailed) indica que a execução chegou a começar — o archive pode já ter
+        // sido parcialmente alterado, então um novo baseline não é mais defensável como "anterior".
+        Assert.True(ExoBeforeImportEligibility.IsImportExecutionStartedOrBeyond(status));
     }
 }

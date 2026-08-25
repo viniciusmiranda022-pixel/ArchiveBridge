@@ -75,11 +75,13 @@ public sealed class ExoArchiveStatisticsIntegrationTests(SqlServerFixture fixtur
 
     private ImportPurviewServiceResultReportUseCase ImportReportUseCase() => new(EvidenceResolver(), MappingStore(), Jobs(), Reports(), Clock);
 
+    private RegisterPurviewImportJobObservationUseCase ObservationUseCase() => new(EvidenceResolver(), MappingStore(), Jobs(), Clock);
+
     private EvaluatePurviewServiceResultCompletenessUseCase CompletenessUseCase() =>
         new(EvidenceResolver(), MappingStore(), Jobs(), Reports());
 
     private CaptureExoArchiveStatisticsUseCase CaptureUseCase(IExoArchiveStatisticsAdapter adapter) =>
-        new(Slice2Support.WaveStore(fixture), adapter, Snapshots(), CompletenessUseCase(), Clock);
+        new(Slice2Support.WaveStore(fixture), Jobs(), adapter, Snapshots(), CompletenessUseCase(), Clock);
 
     private async Task<PartitionExecutionRecord> RegisterAndExecuteAsync(TenantScope scope, string name)
     {
@@ -191,6 +193,13 @@ public sealed class ExoArchiveStatisticsIntegrationTests(SqlServerFixture fixtur
 
         return (scope, wave, entry, plannedJobName);
     }
+
+    /// <summary>Registra uma observação de progresso do import job (runbook §25.9) — usada para posicionar o boundary temporal do AB-I6-006.</summary>
+    private Task<PurviewImportJobObservation> RecordObservationAsync(
+        TenantScope scope, WaveId waveId, PurviewImportJobName plannedJobName, PurviewImportJobObservedStatus status) =>
+        ObservationUseCase().ExecuteAsync(
+            scope, waveId, plannedJobName, PurviewProviderOperationId.Create("PJ-boundary-0001"), status, DateTimeOffset.UtcNow,
+            "operator", CancellationToken.None);
 
     // Fixos (nunca Guid.NewGuid()/DateTimeOffset.UtcNow por chamada): dois capturas com o mesmo conteúdo
     // lógico precisam produzir o MESMO ObservationHash para os testes de idempotência/convergência —
@@ -363,6 +372,99 @@ public sealed class ExoArchiveStatisticsIntegrationTests(SqlServerFixture fixtur
 
         await Assert.ThrowsAsync<ExoArchiveStatisticsValidationException>(() => CaptureUseCase(adapter).ExecuteBeforeImportAsync(
             scope, wave.Id, entry.Archive.Identity, CorrelationId.New(), CancellationToken.None));
+    }
+
+    // ---- BeforeImport: gate temporal do baseline (AB-I6-006) ----
+
+    [Fact]
+    public async Task BeforeImportIsAllowedWhenTheWaveHasAnImportJobPlanButNoObservationYet()
+    {
+        var (scope, wave, entry, _, _) = await SeedPlannedWaveAsync("before-plan-no-obs.pst", "before-plan-no-obs@contoso.com");
+        var adapter = new FakeExoArchiveStatisticsAdapter(Observation());
+
+        var snapshot = await CaptureUseCase(adapter).ExecuteBeforeImportAsync(
+            scope, wave.Id, entry.Archive.Identity, CorrelationId.New(), CancellationToken.None);
+
+        Assert.Equal(1, snapshot.SnapshotVersion);
+        Assert.Equal(1, adapter.ObserveCallCount);
+    }
+
+    [Theory]
+    [InlineData(PurviewImportJobObservedStatus.JobCreated)]
+    [InlineData(PurviewImportJobObservedStatus.ValidationAttached)]
+    [InlineData(PurviewImportJobObservedStatus.AnalysisCompleted)]
+    public async Task BeforeImportIsAllowedWhileTheLatestObservationIsStillOnlyPlanningOrValidation(
+        PurviewImportJobObservedStatus status)
+    {
+        var (scope, wave, entry, _, plannedJobName) = await SeedPlannedWaveAsync($"before-preexec-{status}.pst", $"before-preexec-{status}@contoso.com");
+        await RecordObservationAsync(scope, wave.Id, plannedJobName, status);
+        var adapter = new FakeExoArchiveStatisticsAdapter(Observation());
+
+        var snapshot = await CaptureUseCase(adapter).ExecuteBeforeImportAsync(
+            scope, wave.Id, entry.Archive.Identity, CorrelationId.New(), CancellationToken.None);
+
+        Assert.Equal(1, snapshot.SnapshotVersion);
+        Assert.Equal(1, adapter.ObserveCallCount);
+    }
+
+    [Theory]
+    [InlineData(PurviewImportJobObservedStatus.ImportStarted)]
+    [InlineData(PurviewImportJobObservedStatus.ImportCompleted)]
+    [InlineData(PurviewImportJobObservedStatus.ImportFailed)]
+    public async Task BeforeImportFailsClosedOnceImportExecutionHasBeenObservedAndNeverProbesTheAdapter(
+        PurviewImportJobObservedStatus status)
+    {
+        var (scope, wave, entry, _, plannedJobName) = await SeedPlannedWaveAsync($"before-postexec-{status}.pst", $"before-postexec-{status}@contoso.com");
+        await RecordObservationAsync(scope, wave.Id, plannedJobName, status);
+        var adapter = new FakeExoArchiveStatisticsAdapter(Observation());
+
+        await Assert.ThrowsAsync<ExoArchiveStatisticsPrerequisiteException>(() => CaptureUseCase(adapter).ExecuteBeforeImportAsync(
+            scope, wave.Id, entry.Archive.Identity, CorrelationId.New(), CancellationToken.None));
+        Assert.Equal(0, adapter.ObserveCallCount);
+
+        var count = await CountAsync(
+            scope, "SELECT COUNT(*) FROM dbo.purview_exo_archive_statistics_snapshots WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+        Assert.Equal(0, count);
+    }
+
+    [Fact]
+    public async Task ABaselineCapturedBeforeTheBoundaryRemainsReadableAfterImportStartsIsObserved()
+    {
+        var (scope, wave, entry, _, plannedJobName) =
+            await SeedPlannedWaveAsync("before-boundary-replay.pst", "before-boundary-replay@contoso.com");
+        var snapshot = await CaptureUseCase(new FakeExoArchiveStatisticsAdapter(Observation())).ExecuteBeforeImportAsync(
+            scope, wave.Id, entry.Archive.Identity, CorrelationId.New(), CancellationToken.None);
+
+        // O boundary é cruzado DEPOIS que o baseline legítimo já foi capturado — leitura/replay do
+        // snapshot já persistido continua funcionando normalmente (item 3: o gate só bloqueia uma NOVA
+        // captura, nunca a releitura de uma evidência já canônica).
+        await RecordObservationAsync(scope, wave.Id, plannedJobName, PurviewImportJobObservedStatus.ImportStarted);
+
+        var reread = await Snapshots().GetLatestAsync(scope, wave.Id, entry.Archive.Identity, ExoStatisticsPhase.BeforeImport, CancellationToken.None);
+        Assert.Equal(snapshot.SnapshotVersion, reread!.SnapshotVersion);
+        var folders = await Snapshots().GetFoldersAsync(
+            scope, wave.Id, entry.Archive.Identity, ExoStatisticsPhase.BeforeImport, reread.SnapshotVersion, CancellationToken.None);
+        Assert.NotEmpty(folders);
+    }
+
+    [Fact]
+    public async Task ANewBeforeImportCaptureAttemptAfterTheBoundaryDoesNotCreateVersionNPlusOne()
+    {
+        var (scope, wave, entry, _, plannedJobName) =
+            await SeedPlannedWaveAsync("before-boundary-no-nplus1.pst", "before-boundary-no-nplus1@contoso.com");
+        await CaptureUseCase(new FakeExoArchiveStatisticsAdapter(Observation())).ExecuteBeforeImportAsync(
+            scope, wave.Id, entry.Archive.Identity, CorrelationId.New(), CancellationToken.None);
+        await RecordObservationAsync(scope, wave.Id, plannedJobName, PurviewImportJobObservedStatus.ImportStarted);
+
+        await Assert.ThrowsAsync<ExoArchiveStatisticsPrerequisiteException>(() =>
+            CaptureUseCase(new FakeExoArchiveStatisticsAdapter(Observation(itemCount: 999))).ExecuteBeforeImportAsync(
+                scope, wave.Id, entry.Archive.Identity, CorrelationId.New(), CancellationToken.None));
+
+        var count = await CountAsync(
+            scope,
+            "SELECT COUNT(*) FROM dbo.purview_exo_archive_statistics_snapshots WHERE wave_id = @wave AND phase = 0;",
+            ("@wave", wave.Id.Value));
+        Assert.Equal(1, count);
     }
 
     // ---- AfterImport ----

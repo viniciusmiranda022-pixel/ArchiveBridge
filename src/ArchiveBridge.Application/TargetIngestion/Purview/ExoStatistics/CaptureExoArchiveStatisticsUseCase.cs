@@ -2,6 +2,7 @@ using ArchiveBridge.Application.TargetIngestion.Purview.ServiceResult;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.TargetIngestion.Purview.ExoStatistics;
+using ArchiveBridge.Contracts.TargetIngestion.Purview.ServiceResult;
 using ArchiveBridge.Contracts.Waves;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.TargetIngestion.Purview.ExoStatistics;
@@ -22,6 +23,18 @@ namespace ArchiveBridge.Application.TargetIngestion.Purview.ExoStatistics;
 /// UPN/GUID/detalhes cross-tenant/project (item 13).
 /// </para>
 /// <para>
+/// <see cref="ExecuteBeforeImportAsync"/> aplica o gate temporal do baseline (AB-I6-006): antes de sondar o
+/// adapter, verifica TODOS os planos de import job já existentes para a onda
+/// (<see cref="IPurviewImportJobStore.GetPlansForWaveAsync"/>) e recusa fail-closed
+/// (<see cref="ExoArchiveStatisticsPrerequisiteException"/>) se a observação mais recente de QUALQUER um
+/// deles já indicar execução de import iniciada/concluída/falha
+/// (<see cref="ExoBeforeImportEligibility.IsImportExecutionStartedOrBeyond"/>) — a decisão vem
+/// inteiramente de evidência server-side, nunca de um identificador ou timestamp fornecido pelo chamador.
+/// Um baseline já capturado ANTES desse boundary continua legível/revalidável normalmente
+/// (<c>GetLatestAsync</c>/<c>GetFoldersAsync</c> não são afetados por este gate); apenas uma NOVA captura
+/// depois do boundary é bloqueada, e nenhuma versão N+1 é criada quando isso acontece.
+/// </para>
+/// <para>
 /// <see cref="ExecuteAfterImportAsync"/> reaproveita <see cref="EvaluatePurviewServiceResultCompletenessUseCase"/>
 /// (Passo 1) como a evidência canônica de conclusão do import exigida pelo item 4/critério de aceite 2: o
 /// adapter só é sondado quando o desfecho é
@@ -32,6 +45,7 @@ namespace ArchiveBridge.Application.TargetIngestion.Purview.ExoStatistics;
 /// </summary>
 public sealed class CaptureExoArchiveStatisticsUseCase(
     IWaveStore waves,
+    IPurviewImportJobStore jobs,
     IExoArchiveStatisticsAdapter adapter,
     IExoArchiveStatisticsStore snapshots,
     EvaluatePurviewServiceResultCompletenessUseCase completeness,
@@ -42,13 +56,20 @@ public sealed class CaptureExoArchiveStatisticsUseCase(
         "autorizada no escopo do chamador.";
 
     private readonly IWaveStore _waves = waves;
+    private readonly IPurviewImportJobStore _jobs = jobs;
     private readonly IExoArchiveStatisticsAdapter _adapter = adapter;
     private readonly IExoArchiveStatisticsStore _snapshots = snapshots;
     private readonly EvaluatePurviewServiceResultCompletenessUseCase _completeness = completeness;
     private readonly IClock _clock = clock;
 
-    /// <summary>Captura <see cref="ExoStatisticsPhase.BeforeImport"/> — representa o estado anterior real; nenhum pré-requisito de conclusão de import.</summary>
+    /// <summary>
+    /// Captura <see cref="ExoStatisticsPhase.BeforeImport"/> — representa o estado anterior real. Só é
+    /// aceita enquanto NENHUM plano de import job desta onda tiver evidência observada de execução de
+    /// import iniciada/concluída/falha (AB-I6-006) — o adapter NUNCA é sondado quando esse boundary já foi
+    /// cruzado.
+    /// </summary>
     /// <exception cref="ExoArchiveStatisticsSourceNotFoundException">Onda/archive inexistente ou fora do escopo (anti-IDOR).</exception>
+    /// <exception cref="ExoArchiveStatisticsPrerequisiteException">A execução do import já começou/terminou para algum plano desta onda.</exception>
     /// <exception cref="ExoArchiveStatisticsValidationException">Estatística de pasta inválida/oversized/duplicada retornada pelo adapter.</exception>
     public Task<ExoArchiveStatisticsSnapshot> ExecuteBeforeImportAsync(
         TenantScope scope, WaveId waveId, TargetArchiveId archive, CorrelationId correlation, CancellationToken cancellationToken) =>
@@ -94,6 +115,28 @@ public sealed class CaptureExoArchiveStatisticsUseCase(
         }
 
         var mailbox = canonicalEntry.Archive;
+
+        if (phase == ExoStatisticsPhase.BeforeImport)
+        {
+            // AB-I6-006: um baseline BeforeImport só é defensável enquanto NENHUM plano desta onda tiver
+            // evidência observada de que a execução do import (não apenas planejamento/validação) já
+            // começou — verificado ANTES de qualquer contato com o adapter, a partir de evidência
+            // inteiramente server-side (nunca de um identificador/timestamp fornecido pelo chamador).
+            var plans = await _jobs.GetPlansForWaveAsync(scope, waveId, cancellationToken).ConfigureAwait(false);
+            foreach (var plan in plans)
+            {
+                var latestObservation = await _jobs
+                    .GetLatestObservationAsync(scope, waveId, plan.PlannedJobName, cancellationToken)
+                    .ConfigureAwait(false);
+                if (latestObservation is not null && ExoBeforeImportEligibility.IsImportExecutionStartedOrBeyond(latestObservation.ObservedStatus))
+                {
+                    throw new ExoArchiveStatisticsPrerequisiteException(
+                        "Captura BeforeImport recusada (fail-closed): já existe evidência canônica de que a execução do " +
+                        $"import desta onda começou (plano {plan.PlannedJobName.Value}, status observado " +
+                        $"{latestObservation.ObservedStatus}) — um baseline anterior ao import não é mais defensável.");
+                }
+            }
+        }
 
         if (phase == ExoStatisticsPhase.AfterImport)
         {
