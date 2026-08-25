@@ -77,11 +77,19 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
         return await Slice4bPstProcessingSupport.ExecuteUseCase(fixture).ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
     }
 
-    /// <summary>Persiste o precheck de mailbox com o status de archive informado (identidade já resolvida pela entrada).</summary>
+    /// <summary>
+    /// Persiste o precheck de mailbox com o status de archive informado (identidade já resolvida pela
+    /// entrada). A próxima versão é derivada do vigente (mesma regra de <c>SubmitMailboxPrecheckUseCase</c>:
+    /// <c>(latest?.Version ?? 0) + 1</c>) para que chamadas repetidas com conteúdo REAL diferente produzam
+    /// versões sucessivas em vez de colidir com a versão 1 já persistida (o store é append-only e recusa
+    /// fail-closed uma reescrita de versão já ocupada com conteúdo divergente).
+    /// </summary>
     private async Task SeedPrecheckAsync(TenantScope scope, WaveEntry entry, MailboxArchiveStatus status)
     {
+        var latest = await Prechecks().GetLatestAsync(scope, entry.Archive.Identity, CancellationToken.None);
+        var nextVersion = (latest?.Version ?? 0) + 1;
         var snapshot = MailboxPrecheckSnapshot.Observe(
-            PrecheckSnapshotId.New(), scope.Tenant, scope.Project, entry.Archive, version: 1,
+            PrecheckSnapshotId.New(), scope.Tenant, scope.Project, entry.Archive, nextVersion,
             exchangeGuid: Guid.NewGuid(), archiveGuid: status == MailboxArchiveStatus.Active ? Guid.NewGuid() : null,
             status, "UserMailbox", autoExpandingArchiveEnabled: false, litigationHoldEnabled: false, retentionHoldEnabled: false,
             archiveItemCount: 10, archiveTotalSizeBytes: 4096, observedAvailableBytes: 100_000_000_000,
