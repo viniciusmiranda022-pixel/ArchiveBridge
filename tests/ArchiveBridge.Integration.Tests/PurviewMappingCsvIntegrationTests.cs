@@ -392,10 +392,16 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
         Assert.Equal(bindings[0].CreatedAtUtc, bindings[1].CreatedAtUtc); // empate real confirmado.
 
         // Cada chamada relê SQL do zero (evidenceResolver + bindings store) — nenhuma reaproveita um
-        // resultado em memória do lado do teste — antes de decidir se reaproveita a versão persistida.
-        var first = await GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
-        var second = await GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
-        var third = await GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        // resultado em memória do lado do teste — antes de decidir se reaproveita a versão persistida. O
+        // artifact store, porém, precisa ser o MESMO nas três chamadas: em produção ele representa um
+        // único local de armazenamento persistente entre requisições; `Artifacts()` cria um diretório novo
+        // e vazio a cada chamada, o que faria a 2ª/3ª leitura nunca enxergar o artefato publicado pela 1ª e
+        // disparar o fail-closed de "versão utilizável sem artefato persistido" — um falso positivo do
+        // teste, não uma inconsistência real de evidência.
+        var artifacts = Artifacts();
+        var first = await GenerateUseCase(artifacts).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var second = await GenerateUseCase(artifacts).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var third = await GenerateUseCase(artifacts).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
 
         Assert.Equal(2, first.Document.RowCount);
         Assert.True(first.Regenerated);
