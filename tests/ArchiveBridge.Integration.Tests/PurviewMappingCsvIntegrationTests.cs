@@ -349,6 +349,64 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
             GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
     }
 
+    /// <summary>Iguala <c>created_at_utc</c> de TODOS os vínculos da onda ao MESMO instante DATETIME2(3) (empate real).</summary>
+    private async Task TieBindingCreatedAtUtcAsync(TenantScope scope, WaveId wave)
+    {
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+        await using (var context = new SqlCommand("EXEC sys.sp_set_session_context @key = N'tenant_id', @value = @tenant;", connection))
+        {
+            context.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+            await context.ExecuteNonQueryAsync();
+        }
+
+        await using var command = new SqlCommand(
+            "UPDATE dbo.wave_partition_output_bindings SET created_at_utc = @tied " +
+            "WHERE wave_id = @wave AND project_id = @project;",
+            connection);
+        command.Parameters.Add(new SqlParameter("@tied", SqlDbType.DateTime2) { Value = new DateTime(2026, 8, 25, 12, 0, 0, DateTimeKind.Utc) });
+        command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        await command.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
+    public async Task GenerateProducesTheSameCsvBytesAndHashAcrossRepeatedSqlReadsWhenBindingsShareTheSameCreatedAtUtc()
+    {
+        // AB-I5-016: SqlWavePartitionOutputBindingStore.ListForWaveAsync ordena SOMENTE por
+        // created_at_utc (DATETIME2(3)). Dois vínculos persistidos com o MESMO instante (empate real,
+        // reproduzido aqui via UPDATE direto) não têm ordem relativa garantida pelo SQL Server entre
+        // leituras — o mapping precisa continuar produzindo o MESMO CSV/hash mesmo assim, porque o
+        // Domain canonicaliza por Name antes de serializar, nunca por CreatedAtUtc/ordem de leitura.
+        var (scope, wave, executionA, executionB) = await SeedTwoEntryBoundWaveAsync("tie");
+        await MarkUploadVerifiedAsync(scope, wave, [executionA, executionB]);
+        await TieBindingCreatedAtUtcAsync(scope, wave.Id);
+
+        var bindings = await Bindings().ListForWaveAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(2, bindings.Count);
+        Assert.Equal(bindings[0].CreatedAtUtc, bindings[1].CreatedAtUtc); // empate real confirmado.
+
+        // Cada chamada relê SQL do zero (evidenceResolver + bindings store) — nenhuma reaproveita um
+        // resultado em memória do lado do teste — antes de decidir se reaproveita a versão persistida.
+        var first = await GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var second = await GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var third = await GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+
+        Assert.Equal(2, first.Document.RowCount);
+        Assert.True(first.Regenerated);
+        Assert.False(second.Regenerated); // mesma evidência/fingerprint: reaproveita, nunca gera bytes divergentes.
+        Assert.False(third.Regenerated);
+        Assert.Equal(first.Document.Bytes, second.Document.Bytes);
+        Assert.Equal(first.Document.Bytes, third.Document.Bytes);
+        Assert.Equal(first.Document.ContentSha256, second.Document.ContentSha256);
+        Assert.Equal(first.Document.ContentSha256, third.Document.ContentSha256);
+        Assert.Equal(first.Version.Version, second.Version.Version);
+        Assert.Equal(first.Version.Version, third.Version.Version);
+
+        var count = await CountAsync(scope, "SELECT COUNT(*) FROM dbo.purview_mapping_csv_versions WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+        Assert.Equal(1, count); // nenhuma versão espúria criada por instabilidade de ordenação.
+    }
+
     [Fact]
     public async Task ARepeatedGenerationWithNoRealEvidenceChangeReusesTheSameVersionWithoutRegenerating()
     {

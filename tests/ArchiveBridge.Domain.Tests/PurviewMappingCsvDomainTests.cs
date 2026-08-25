@@ -142,6 +142,41 @@ public sealed class PurviewMappingCsvDomainTests
         Assert.Equal(first.Evidence.Fingerprint, second.Evidence.Fingerprint);
     }
 
+    // AB-I5-016: o mapping é lido de SqlWavePartitionOutputBindingStore ordenado apenas por
+    // CreatedAtUtc(DATETIME2(3)), que pode empatar entre bindings persistidos na mesma onda — SQL Server
+    // não garante ordem relativa entre empates. O MESMO conjunto canônico de linhas, entregue em QUALQUER
+    // ordem de entrada (aqui: ordem inversa e embaralhada), deve produzir bytes/SHA-256/fingerprint
+    // IDÊNTICOS — não apenas o fingerprint lógico (já coberto acima), mas o CSV físico serializado.
+    [Fact]
+    public void GenerateProducesIdenticalBytesHashAndFingerprintRegardlessOfInputRowOrder()
+    {
+        var wave = WaveId.New();
+        var project = new ProjectId(Guid.NewGuid());
+        var a = Row("p_aaaa_part001.pst", "alice@contoso.com", isArchive: true);
+        var b = Row("p_bbbb_part001.pst", "bob@contoso.com", isArchive: false);
+        var c = Row("p_cccc_part001.pst", "carol@contoso.com", isArchive: true);
+
+        var ascending = PurviewMappingCsvGenerator.Generate(
+            wave, project, Folder, [a, b, c], Hash("attempt"), MappingVersion.Initial, "operator", Now);
+        var reversed = PurviewMappingCsvGenerator.Generate(
+            wave, project, Folder, [c, b, a], Hash("attempt"), MappingVersion.Initial, "operator", Now);
+        var shuffled = PurviewMappingCsvGenerator.Generate(
+            wave, project, Folder, [b, a, c], Hash("attempt"), MappingVersion.Initial, "operator", Now);
+
+        Assert.Equal(ascending.Document.Bytes, reversed.Document.Bytes);
+        Assert.Equal(ascending.Document.Bytes, shuffled.Document.Bytes);
+        Assert.Equal(ascending.Document.ContentSha256, reversed.Document.ContentSha256);
+        Assert.Equal(ascending.Document.ContentSha256, shuffled.Document.ContentSha256);
+        Assert.Equal(ascending.Evidence.Fingerprint, reversed.Evidence.Fingerprint);
+        Assert.Equal(ascending.Evidence.Fingerprint, shuffled.Evidence.Fingerprint);
+
+        // A ordem física das linhas segue Name (Ordinal): a, b, c — nunca a ordem de entrada.
+        var lines = System.Text.Encoding.UTF8.GetString(ascending.Document.Bytes)
+            .Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
+        var names = lines[1..].Select(line => line.Split(',')[2]).ToArray();
+        Assert.Equal(["p_aaaa_part001.pst", "p_bbbb_part001.pst", "p_cccc_part001.pst"], names);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]

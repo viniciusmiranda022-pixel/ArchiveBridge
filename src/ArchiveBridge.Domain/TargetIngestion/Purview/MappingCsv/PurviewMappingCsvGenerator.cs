@@ -107,9 +107,16 @@ public static class PurviewMappingCsvGenerator
             }
         }
 
-        var content = PurviewMappingCsvSerializer.Serialize(rows);
-        var document = new PurviewMappingDocument(content, rows.Count);
-        var orderedRowsHash = ComputeOrderedRowsHash(rows);
+        // Ordem canônica TOTAL e estável, baseada em Name (já comprovado único acima, derivado de
+        // ArtifactId+PartSequence — nunca de CreatedAtUtc, que pode empatar entre bindings persistidos em
+        // DATETIME2(3) e não tem ordem relativa garantida pelo SQL Server). Canonicaliza ANTES de serializar
+        // e ANTES do cálculo do fingerprint: o mesmo conjunto lógico de linhas, entregue em QUALQUER ordem
+        // pelo caller, produz sempre os MESMOS bytes/SHA-256/fingerprint (AB-I5-012 acceptance criterion 5).
+        var orderedRows = rows.OrderBy(row => row.Name, StringComparer.Ordinal).ToList();
+
+        var content = PurviewMappingCsvSerializer.Serialize(orderedRows);
+        var document = new PurviewMappingDocument(content, orderedRows.Count);
+        var orderedRowsHash = ComputeOrderedRowsHash(orderedRows);
         var fingerprint = PurviewMappingGenerationFingerprint.Compute(
             wave, targetRootFolder, orderedRowsHash, uploadAttemptIdentityHash, MappingSchema.Version, GeneratorVersion);
         var evidence = new PurviewMappingCsvVersion(
@@ -127,13 +134,14 @@ public static class PurviewMappingCsvGenerator
         return new PurviewMappingGenerationResult(document, evidence);
     }
 
-    // Hash agregado, ORDENADO por Name (já garantido único acima), do conteúdo lógico de cada linha —
-    // insensível à ordem em que o chamador entregou as linhas, igual ao padrão de
-    // WaveSelection.ComputeHash/MappingGenerationFingerprint.
+    // Hash agregado do conteúdo lógico de cada linha, na MESMA ordem canônica (por Name, Ordinal) já
+    // aplicada pelo chamador antes de invocar este método — nunca reordena por conta própria, para que o
+    // fingerprint reflita EXATAMENTE a sequência usada na serialização física (nenhuma ordem "equivalente
+    // por acaso").
     private static Sha256Hash ComputeOrderedRowsHash(IReadOnlyList<PurviewMappingRow> rows)
     {
         var parts = new List<string> { nameof(PurviewMappingCsvGenerator) };
-        foreach (var row in rows.OrderBy(row => row.Name, StringComparer.Ordinal))
+        foreach (var row in rows)
         {
             parts.Add(row.FilePath);
             parts.Add(row.Name);

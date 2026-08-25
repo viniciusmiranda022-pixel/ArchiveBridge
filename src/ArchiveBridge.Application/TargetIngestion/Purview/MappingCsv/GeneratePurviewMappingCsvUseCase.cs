@@ -42,8 +42,11 @@ public sealed class GeneratePurviewMappingCsvUseCase(
         var evidence = await _evidenceResolver.ExecuteAsync(scope, waveId, cancellationToken).ConfigureAwait(false);
         var targetRootFolder = evidence.Wave.TargetRootFolder;
 
+        // Ordem de entrada IRRELEVANTE: PurviewMappingCsvGenerator.Generate(...) canonicaliza por Name
+        // (Ordinal) antes de serializar/calcular o fingerprint (AB-I5-016) — nunca dependa de
+        // CreatedAtUtc aqui, que pode empatar entre bindings persistidos em DATETIME2(3) sem ordem
+        // relativa garantida pelo SQL Server.
         var rows = evidence.Rows
-            .OrderBy(row => row.Binding.CreatedAtUtc)
             .Select(row => BuildRow(scope, waveId, targetRootFolder, row))
             .ToList();
 
