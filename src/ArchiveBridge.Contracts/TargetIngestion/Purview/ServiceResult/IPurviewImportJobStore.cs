@@ -45,6 +45,15 @@ public interface IPurviewImportJobStore
     Task<PurviewImportJobPlan?> GetPlanByNameAsync(
         TenantScope scope, WaveId wave, PurviewImportJobName plannedJobName, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// TODOS os planos (todas as tentativas) desta onda, em qualquer ordem — usado para determinar,
+    /// server-side e sem depender de um identificador opaco fornecido pelo caller, se ALGUMA tentativa de
+    /// planejamento desta onda já tem evidência observada de progressão (AB-I6-006: gate temporal do
+    /// baseline BeforeImport de estatísticas EXO). Lista vazia se a onda ainda não tem nenhum plano.
+    /// </summary>
+    Task<IReadOnlyList<PurviewImportJobPlan>> GetPlansForWaveAsync(
+        TenantScope scope, WaveId wave, CancellationToken cancellationToken);
+
     /// <summary>A observação mais recente registrada para este plano (<see langword="null"/> se nenhuma).</summary>
     Task<PurviewImportJobObservation?> GetLatestObservationAsync(
         TenantScope scope, WaveId wave, PurviewImportJobName plannedJobName, CancellationToken cancellationToken);

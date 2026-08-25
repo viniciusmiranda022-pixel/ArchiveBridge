@@ -539,6 +539,52 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Migration0035AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0034 tivesse divergido, isto lançaria. Confirma a 0035 (AB-I6-005): as duas tabelas de
+        // estatísticas de archive EXO before/after (header + estatísticas de pasta filhas), ambas
+        // append-only, e a UNIQUE de convergência idempotente por observation_hash.
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 35;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var tables = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.tables WHERE name IN ('purview_exo_archive_statistics_snapshots', 'purview_exo_archive_folder_statistics');",
+            connection))
+        {
+            Assert.Equal(2, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var index = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.indexes WHERE name = 'UQ_peass_observation' AND is_unique = 1;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await index.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // Append-only: a aplicação recebe apenas SELECT/INSERT nas duas tabelas novas (nenhum UPDATE/DELETE).
+        await using var grants = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.database_permissions AS p
+            JOIN sys.objects AS o ON o.object_id = p.major_id
+            JOIN sys.database_principals AS r ON r.principal_id = p.grantee_principal_id
+            WHERE r.name = 'ab_app_role'
+              AND o.name IN ('purview_exo_archive_statistics_snapshots', 'purview_exo_archive_folder_statistics')
+              AND p.permission_name NOT IN ('SELECT', 'INSERT');
+            """,
+            connection);
+        Assert.Equal(0, Convert.ToInt32(await grants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
         var original = await ReadHashAsync(1);

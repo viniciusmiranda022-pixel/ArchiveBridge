@@ -11,7 +11,8 @@ namespace ArchiveBridge.Architecture.Tests;
 public sealed partial class VendorBoundaryTests
 {
     [GeneratedRegex(
-        "aspose|libpff|microsoft\\.graph|purview|enterprisevault|symantec|veritas|azcopy|azure\\.storage|exchange\\.webservices",
+        "aspose|libpff|microsoft\\.graph|purview|enterprisevault|symantec|veritas|azcopy|azure\\.storage|" +
+        "exchange\\.webservices|exchangeonlinemanagement|microsoft\\.exchange",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex VendorAssemblyPattern();
 
