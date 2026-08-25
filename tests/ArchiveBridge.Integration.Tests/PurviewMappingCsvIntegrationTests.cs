@@ -54,8 +54,22 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
     private FileSystemMappingArtifactStore Artifacts() =>
         new(Path.Combine(fixture.ArtifactRoot, "purview-mapping-" + Guid.NewGuid().ToString("N")));
 
-    private CreateWavePartitionOutputBindingUseCase BindingUseCase() =>
-        new(Slice2Support.WaveStore(fixture), Slice4bPstProcessingSupport.ExecutionStore(fixture), Bindings(), Clock);
+    private CreateWavePartitionOutputBindingUseCase BindingUseCase() => BindingUseCase(Clock);
+
+    /// <summary>
+    /// Mesmo caso de uso, com o relógio informado — usado quando o teste precisa controlar
+    /// deterministicamente o <c>created_at_utc</c> persistido de um vínculo (ex.: reproduzir um empate
+    /// REAL entre dois vínculos sem violar o hash de integridade, já que <c>createdAtUtc</c> participa do
+    /// <c>BindingHash</c> calculado em <see cref="WavePartitionOutputBinding.Create"/>).
+    /// </summary>
+    private CreateWavePartitionOutputBindingUseCase BindingUseCase(IClock clock) =>
+        new(Slice2Support.WaveStore(fixture), Slice4bPstProcessingSupport.ExecutionStore(fixture), Bindings(), clock);
+
+    /// <summary>Relógio fixo — usado para forçar deterministicamente o mesmo instante entre vínculos.</summary>
+    private sealed class FixedClock(DateTimeOffset now) : IClock
+    {
+        public DateTimeOffset UtcNow => now;
+    }
 
     private ResolvePurviewMappingEvidenceUseCase EvidenceResolver() => new(
         Slice2Support.WaveStore(fixture), Bindings(), Slice4bPstProcessingSupport.ExecutionStore(fixture),
@@ -262,9 +276,16 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
             GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
     }
 
-    /// <summary>Onda aprovada com DOIS PSTs vinculados e prechecks Active — o teste decide a manifestação verificada.</summary>
+    /// <summary>
+    /// Onda aprovada com DOIS PSTs vinculados e prechecks Active — o teste decide a manifestação
+    /// verificada. Os dois vínculos são criados com o <paramref name="bindingClock"/> informado (o padrão
+    /// é o relógio real da suíte); um teste pode informar um relógio fixo para que ambos os vínculos
+    /// persistam com o MESMO <c>created_at_utc</c> — um empate REAL e íntegro (o hash é calculado com esse
+    /// mesmo instante em <see cref="WavePartitionOutputBinding.Create"/>), em vez de forçar o empate via
+    /// UPDATE direto no SQL depois da criação, o que quebraria o <c>binding_hash</c> tamper-evident.
+    /// </summary>
     private async Task<(TenantScope Scope, MigrationWave Wave, PartitionExecutionRecord ExecutionA, PartitionExecutionRecord ExecutionB)>
-        SeedTwoEntryBoundWaveAsync(string prefix)
+        SeedTwoEntryBoundWaveAsync(string prefix, IClock? bindingClock = null)
     {
         var scope = SqlServerFixture.NewScope();
         await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
@@ -276,11 +297,12 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
         var wave = Slice2Support.Approve(Slice2Support.NewWave(scope, new WaveSelection([entryA, entryB])));
         await Slice2Support.WaveStore(fixture).AddAsync(wave, CorrelationId.New(), CancellationToken.None);
 
-        await BindingUseCase().ExecuteAsync(
+        var bindingUseCase = BindingUseCase(bindingClock ?? Clock);
+        await bindingUseCase.ExecuteAsync(
             new CreateWavePartitionOutputBindingRequest(
                 scope, wave.Id, WaveEntryId.Derive(wave.Id, entryA), executionA.Plan, executionA.Part, CorrelationId.New()),
             CancellationToken.None);
-        await BindingUseCase().ExecuteAsync(
+        await bindingUseCase.ExecuteAsync(
             new CreateWavePartitionOutputBindingRequest(
                 scope, wave.Id, WaveEntryId.Derive(wave.Id, entryB), executionB.Plan, executionB.Part, CorrelationId.New()),
             CancellationToken.None);
@@ -349,38 +371,21 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
             GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
     }
 
-    /// <summary>Iguala <c>created_at_utc</c> de TODOS os vínculos da onda ao MESMO instante DATETIME2(3) (empate real).</summary>
-    private async Task TieBindingCreatedAtUtcAsync(TenantScope scope, WaveId wave)
-    {
-        await using var connection = new SqlConnection(fixture.AdminConnectionString);
-        await connection.OpenAsync();
-        await using (var context = new SqlCommand("EXEC sys.sp_set_session_context @key = N'tenant_id', @value = @tenant;", connection))
-        {
-            context.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
-            await context.ExecuteNonQueryAsync();
-        }
-
-        await using var command = new SqlCommand(
-            "UPDATE dbo.wave_partition_output_bindings SET created_at_utc = @tied " +
-            "WHERE wave_id = @wave AND project_id = @project;",
-            connection);
-        command.Parameters.Add(new SqlParameter("@tied", SqlDbType.DateTime2) { Value = new DateTime(2026, 8, 25, 12, 0, 0, DateTimeKind.Utc) });
-        command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
-        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
-        await command.ExecuteNonQueryAsync();
-    }
-
     [Fact]
     public async Task GenerateProducesTheSameCsvBytesAndHashAcrossRepeatedSqlReadsWhenBindingsShareTheSameCreatedAtUtc()
     {
         // AB-I5-016: SqlWavePartitionOutputBindingStore.ListForWaveAsync ordena SOMENTE por
-        // created_at_utc (DATETIME2(3)). Dois vínculos persistidos com o MESMO instante (empate real,
-        // reproduzido aqui via UPDATE direto) não têm ordem relativa garantida pelo SQL Server entre
-        // leituras — o mapping precisa continuar produzindo o MESMO CSV/hash mesmo assim, porque o
-        // Domain canonicaliza por Name antes de serializar, nunca por CreatedAtUtc/ordem de leitura.
-        var (scope, wave, executionA, executionB) = await SeedTwoEntryBoundWaveAsync("tie");
+        // created_at_utc (DATETIME2(3)). Dois vínculos persistidos com o MESMO instante (empate real) não
+        // têm ordem relativa garantida pelo SQL Server entre leituras — o mapping precisa continuar
+        // produzindo o MESMO CSV/hash mesmo assim, porque o Domain canonicaliza por Name antes de
+        // serializar, nunca por CreatedAtUtc/ordem de leitura. O empate é produzido com um relógio FIXO
+        // injetado nos dois `Create` (em vez de um UPDATE direto pós-criação): `createdAtUtc` participa do
+        // `BindingHash` tamper-evident (WavePartitionOutputBinding.Rehydrate), então adulterar a coluna
+        // depois de persistida faria o próprio invariante de integridade recusar a leitura fail-closed —
+        // exatamente o comportamento correto que este teste não quer exercitar.
+        var tiedInstant = new FixedClock(new DateTimeOffset(2026, 8, 25, 12, 0, 0, TimeSpan.Zero));
+        var (scope, wave, executionA, executionB) = await SeedTwoEntryBoundWaveAsync("tie", tiedInstant);
         await MarkUploadVerifiedAsync(scope, wave, [executionA, executionB]);
-        await TieBindingCreatedAtUtcAsync(scope, wave.Id);
 
         var bindings = await Bindings().ListForWaveAsync(scope, wave.Id, CancellationToken.None);
         Assert.Equal(2, bindings.Count);
