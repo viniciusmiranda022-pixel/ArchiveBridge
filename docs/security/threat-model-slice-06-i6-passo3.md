@@ -1,0 +1,64 @@
+# Threat model — I6/EPIC-07, Passo 3 (Expected-vs-Observed Reconciliation Foundation)
+
+Delta sobre o modelo de ameaças da plataforma, incorporado abaixo do capítulo do Passo anterior
+([`threat-model-slice-06-i6-passo2.md`](threat-model-slice-06-i6-passo2.md), Passo 2 — mesmo formato).
+Escopo: transformação **read-only** de evidências canônicas JÁ PERSISTIDAS (mapping/vínculo/execução/upload
+revalidados sem drift, service result do Purview do Passo 1, snapshots EXO before/after do Passo 2) numa
+avaliação técnica, determinística, auditável e fail-closed por PST/archive/wave (work order
+[`AB-I6-007.md`](../engineering/requests/AB-I6-007.md)) — **sem** disposition humana/final, **sem**
+certificate, **sem** `ReconciliationOutcome=PASS` terminal ou conclusão de wave/projeto, **sem**
+decommission/retention/freeze/unfreeze no Enterprise Vault, **sem** writes em Exchange
+Online/Graph/Purview, **sem** `Enable-Mailbox`/auto-expansion/hold change, **sem** automação do portal
+Purview/import job e **sem** I7 Hardening/I8 Production Acceptance (STOP-THE-LINE do work order). Nenhum
+destes fluxos existe no código deste Passo — não há superfície de ameaça nova a analisar para eles aqui.
+
+## Ativos adicionais
+
+- **Avaliações de reconciliação** (`purview_reconciliation_assessments`): header IMUTÁVEL e versionado por
+  `(onda, plano de import job)` — impressão digital determinística do conjunto de evidências-fonte
+  (`source_fingerprint`, item 10), contagens/hashes agregados dos itens filhos e o hash de integridade do
+  próprio header (`assessment_hash`). Nunca contém contador/status bruto; apenas metadados de versão e
+  hashes agregados.
+- **Itens de PST da avaliação** (`purview_reconciliation_pst_items`): disposition técnica explícita
+  (`MatchedWithinEvidence`/`Mismatch`/`IncompleteEvidence`/`BlockedIntegrity`/`ExtraInProvider`) por PST
+  esperado (resolvido server-side) ou observado-fora-do-esperado, com os contadores já observados pelo
+  Passo 1 (nunca mailbox/UPN/caminho local/conteúdo de mensagem).
+- **Itens de archive da avaliação** (`purview_reconciliation_archive_items`): disposition técnica explícita
+  por archive/mailbox de destino, com deltas `item_count`/`total_item_size_bytes` calculados SOMENTE quando
+  ambos os lados (`Before`/`After`) são conhecidos — nunca fabricados.
+
+## Classificação de dados
+
+Nenhuma das três tabelas novas é "zero PII" no sentido absoluto — `archive_identity` é o `TargetArchiveId`
+canônico (mesma classificação já aceita em `purview_mailbox_prechecks`/`purview_exo_archive_statistics_snapshots`)
+e `remote_pst_name` é a mesma identidade de transporte já persistida por `purview_service_result_rows` —
+mas nenhuma delas contém SAS, credencial, token, conteúdo de e-mail, transcript PowerShell bruto ou stack
+trace. Este Passo não introduz nenhum parser de entrada hostil novo: todo dado consumido (linhas do service
+result, snapshots EXO) já foi validado/revalidado por hash pelos Passos 1/2 antes de chegar aqui — a
+correlação deste Passo é **pura** (nenhum I/O, nenhuma sondagem de adapter, nenhuma leitura de
+entrada externa não confiável nova).
+
+## Ameaças e mitigações (delta)
+
+| Ameaça | Mitigação |
+| --- | --- |
+| Conjunto esperado fornecido/influenciado pelo chamador (mailbox, path, contador, lista de PSTs) em vez de resolvido server-side | `EvaluateReconciliationUseCase.ExecuteAsync` reaproveita `ResolvePurviewMappingEvidenceUseCase` (via `PurviewImportJobEvidenceGuard`, o MESMO guard dos Passos 1/2) para resolver a cadeia canônica `WaveEntry ↔ Binding ↔ PartitionExecution ↔ Upload manifest ↔ Mapping` inteiramente server-side — a assinatura do caso de uso não aceita path/mailbox/contador/lista de PST algum; o único parâmetro de escopo é `WaveId`+`PurviewImportJobName` já resolvidos. |
+| Avaliação canônica calculada/lida sem revalidar drift de mapping/binding/upload/execução desde a última avaliação | `ExecuteAsync` roda `PurviewImportJobEvidenceGuard.ResolveAndVerifyNoDriftAsync` SEMPRE, ANTES de qualquer cálculo — nunca condicionalmente, nunca depois. Drift real (ex.: precheck mudou sem o mapping ser regenerado/republicado) recusa fail-closed (`PurviewImportJobPrerequisiteException`) a computação de QUALQUER nova versão; como esta é a ÚNICA via sancionada para tratar uma avaliação como canônica (mesmo desenho de `EvaluatePurviewServiceResultCompletenessUseCase`), uma avaliação antiga nunca é silenciosamente reaproveitada como vigente após drift real (item 4/12; comprovado por `EvaluateFailsClosedWhenTheCanonicalChainDriftedSinceThePreviousAssessmentAndNeverTreatsTheOldOneAsCanonical`). |
+| Ausência de evidência (PST esperado sem linha correlacionada, contador/status `Unknown`, archive sem `Before`/`After` capturado) interpretada como sucesso, zero ou match | `ReconciliationPstCorrelation.Correlate`/`ReconciliationArchiveCorrelation.Correlate` são funções PURAS que nunca convertem ausência em `MatchedWithinEvidence`: PST ausente do provider e status/contador `Unknown` produzem `IncompleteEvidence`; archive sem `Before` ou sem `After` produz `IncompleteEvidence` sem fabricar delta histórico (comprovado por `CorrelateMarksAnExpectedPstAbsentFromTheProviderResultAsIncompleteEvidenceNeverAsMismatch`/`CorrelateNeverConvertsAnUnknownObservedStatusIntoMatchOrZero`/`ArchiveCorrelateIsIncompleteEvidenceWhenAfterIsMissing`, Domain/Integration). |
+| `Mismatch` inventado a partir de ausência de dado, em vez de exigir divergência observável concreta | `ReconciliationPstCorrelation.Classify` só produz `Mismatch` quando o status observado é `Failed`/`SkippedOrCorrupted` (divergência CONCRETA do provider); `ReconciliationArchiveCorrelation.Correlate` só produz `Mismatch` quando um delta REALMENTE calculado (ambos os lados conhecidos) é negativo — nunca a partir de um delta `Unknown` (comprovado por `CorrelateRequiresAConcreteObservedDivergenceBeforeMarkingMismatch`/`ArchiveCorrelateLeavesTheDeltaUnknownWhenEitherSideOfTheMetricIsUnknown`). |
+| Item extra/duplicado no service result observado descartado silenciosamente, ou usado para escolher arbitrariamente qual evidência prevalece | Um item observado fora do conjunto esperado ATUAL vira explicitamente `ExtraInProvider` no read model (nunca descartado — item 7, comprovado por `CorrelateMarksAnObservedRowOutsideTheExpectedSetAsExtraInProviderNeverSilentlyDropped`); duas linhas observadas com o MESMO nome remoto (entrada estruturalmente inválida — nunca ocorre pela via normal de importação do Passo 1, mas a função de correlação deste Passo é defendida independentemente) recusam fail-closed (`ReconciliationValidationException`, comprovado por `CorrelateFailsClosedWhenObservedRowsContainADuplicateRemoteName`) em vez de escolher uma das duas silenciosamente. |
+| Snapshot `BeforeImport`/`AfterImport` de archive ou fase diferente do esperado comparado como se fosse válido | `ReconciliationArchiveCorrelation.Correlate` verifica, independentemente do filtro exato já aplicado por `IExoArchiveStatisticsStore.GetLatestAsync`, que o snapshot resolvido tem EXATAMENTE a `Archive`/`Phase` esperada — qualquer divergência (defesa em profundidade contra um bug de chamador) produz `BlockedIntegrity` em vez de ser comparado (item 8, comprovado por `ArchiveCorrelateRejectsASnapshotCapturedForADifferentArchiveAsBlockedIntegrity`/`ArchiveCorrelateRejectsASnapshotWithAMismatchedPhaseAsBlockedIntegrity`). |
+| Avaliação/item persistido adulterado diretamente no SQL e lido como canônico | Mesma fronteira NÃO CONFIÁVEL dos Passos 1/2: `ReconciliationAssessment.Rehydrate` recomputa `assessment_hash` a partir dos campos REALMENTE carregados e recusa fail-closed qualquer divergência; `SqlReconciliationAssessmentStore` recarrega os itens de PST/archive filhos em TODO caminho que trata uma versão como evidência canônica (`GetLatestAsync`, `GetPstItemsAsync`, `GetArchiveItemsAsync`, o ramo de convergência de `PersistAsync`) e recusa fail-closed se a contagem divergir de `pst_item_count`/`archive_item_count` ou o hash agregado recomputado (`ReconciliationPstItemsHash`/`ReconciliationArchiveItemsHash`) divergir de `pst_items_sha256`/`archive_items_sha256` — inserção/remoção/duplicação/alteração de qualquer item é detectada, não só alteração de campo do header. |
+| Corrida concorrente duplicando avaliações para o MESMO conjunto de evidências-fonte, ou perdendo uma mudança real | `SqlReconciliationAssessmentStore.PersistAsync` locka (`UPDLOCK, HOLDLOCK`) TODAS as versões existentes do escopo (onda/plano) na MESMA transação e decide, sob esse lock, a próxima versão E se alguma já existente converge pelo MESMO `source_fingerprint` (mesmo padrão de `SqlExoArchiveStatisticsStore`/`SqlPurviewServiceResultReportStore`) — chamadas repetidas com o MESMO conjunto de evidências-fonte convergem; uma mudança REAL (nova versão de service result, novo snapshot EXO) aloca N+1 sem perder nenhuma das duas. O índice único `UQ_pra_fingerprint (wave_id, attempt_sequence, source_fingerprint)` é o backstop no BANCO. |
+| Wave/plano/item de outro tenant/projeto acessado por IDOR na leitura de avaliações persistidas | Toda leitura (`GetLatestAsync`, `GetPstItemsAsync`, `GetArchiveItemsAsync`) filtra `project_id` explicitamente e as três tabelas novas participam de `rls.tenant_isolation_policy` (FILTER + BLOCK) — uma avaliação/item de outro escopo é indistinguível de inexistente. |
+| Avaliação deste Passo confundida com aprovação/certificate/conclusão de onda/projeto | `ReconciliationDisposition` expõe SOMENTE `MatchedWithinEvidence`/`Mismatch`/`IncompleteEvidence`/`BlockedIntegrity`/`ExtraInProvider` — nenhum valor `Pass`/`Certificate`/`Completed` existe (comprovado por `ReconciliationDispositionNeverExposesATerminalPassCertificateOrOutcomeValue`, Domain); nenhum caso de uso deste Passo referencia `ArchiveBridge.Domain.Reconciliation.ReconciliationOutcome`, escreve em EXO/Graph/Purview/EV ou altera `WaveStatus` — comprovado end-to-end por `EvaluateProducesMatchedWithinEvidenceForACompleteExpectedSetAndConclusiveObservedEvidence`, que relê a onda após a avaliação e confirma que o `WaveStatus` permanece inalterado. |
+| Dependência vazando de Domain/Application para ExchangeOnlineManagement/PowerShell/Graph/Purview SDK/browser automation/vendor concreto | Nenhum pacote/assembly de fornecedor é referenciado por `ArchiveBridge.Domain`/`ArchiveBridge.Application`/`ArchiveBridge.Contracts` deste módulo — `ReconciliationPstCorrelation`/`ReconciliationArchiveCorrelation`/`ReconciliationAssessment` são funções/records puros (registros/enum/`Sha256Hash`, sem tipo de fornecedor na assinatura); a única integração externa é com os Passos 1/2/4 (já auditados, Domain/Application-only) e com `IExoArchiveStatisticsStore`/`IPurviewServiceResultReportStore` (portas já existentes). Verificado pelos testes já existentes de `VendorBoundaryTests`/`DependencyRuleTests` (sem necessidade de nova allowlist — nenhum token de vendor novo aparece no código deste Passo). |
+| SQL injection | Todo acesso a dados é parametrizado (`SqlCommand`/`SqlParameter`), sem concatenação de entrada — reaproveita o mesmo padrão dos módulos anteriores. |
+
+## Fora de escopo deste Passo (herdado do STOP-THE-LINE)
+
+Exception disposition humana/final, certificate/certificado de reconciliação, `ReconciliationOutcome=PASS`
+terminal ou conclusão da wave/projeto, decommission/retention/freeze/unfreeze no Enterprise Vault, writes em
+Exchange Online/Graph/Purview, `Enable-Mailbox`/auto-expansion/hold change, automação do portal
+Purview/import job, I7 Hardening ou I8 Production Acceptance. Nenhum destes fluxos existe no código deste
+Passo — não há superfície de ameaça nova a analisar para eles aqui.
