@@ -448,6 +448,97 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Migration0033AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0032 tivesse divergido, isto lançaria. Confirma a 0033 (AB-I6-001): os planos do import job,
+        // o vínculo plano→provider (índice único de reassociação) e as observações, todas append-only.
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 33;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var tables = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.tables
+            WHERE name IN ('purview_import_job_plans', 'purview_import_job_provider_bindings', 'purview_import_job_observations');
+            """,
+            connection))
+        {
+            Assert.Equal(3, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var index = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.indexes WHERE name = 'UQ_pijpb_provider_operation_id' AND is_unique = 1;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await index.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using var grants = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.database_permissions AS p
+            JOIN sys.objects AS o ON o.object_id = p.major_id
+            JOIN sys.database_principals AS r ON r.principal_id = p.grantee_principal_id
+            WHERE r.name = 'ab_app_role'
+              AND o.name IN ('purview_import_job_plans', 'purview_import_job_provider_bindings', 'purview_import_job_observations')
+              AND p.permission_name NOT IN ('SELECT', 'INSERT');
+            """,
+            connection);
+        Assert.Equal(0, Convert.ToInt32(await grants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
+    public async Task Migration0034AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0033 tivesse divergido, isto lançaria. Confirma a 0034 (AB-I6-001): a custódia versionada do
+        // service result report e suas linhas normalizadas, ambas append-only.
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 34;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var tables = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.tables WHERE name IN ('purview_service_result_report_versions', 'purview_service_result_rows');",
+            connection))
+        {
+            Assert.Equal(2, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var index = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.indexes WHERE name = 'UQ_psrrv_content' AND is_unique = 1;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await index.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using var grants = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.database_permissions AS p
+            JOIN sys.objects AS o ON o.object_id = p.major_id
+            JOIN sys.database_principals AS r ON r.principal_id = p.grantee_principal_id
+            WHERE r.name = 'ab_app_role'
+              AND o.name IN ('purview_service_result_report_versions', 'purview_service_result_rows')
+              AND p.permission_name NOT IN ('SELECT', 'INSERT');
+            """,
+            connection);
+        Assert.Equal(0, Convert.ToInt32(await grants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
         var original = await ReadHashAsync(1);
