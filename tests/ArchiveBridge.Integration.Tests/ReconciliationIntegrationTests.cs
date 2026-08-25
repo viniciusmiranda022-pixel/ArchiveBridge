@@ -470,8 +470,13 @@ public sealed class ReconciliationIntegrationTests(SqlServerFixture fixture)
             scope, wave.Id, plannedJobName, ReportBytes([(remoteName, "Succeeded", 10, 2048)]), "operator", CancellationToken.None);
         var assessment = await ReconciliationUseCase().ExecuteAsync(scope, wave.Id, plannedJobName, CorrelationId.New(), CancellationToken.None);
 
+        // O item seedado ("Succeeded" com contadores presentes) já persiste como disposition
+        // MatchedWithinEvidence (0) — usar esse MESMO valor aqui não seria tampering algum (a
+        // linha permaneceria idêntica e o hash agregado bateria). Adultera para Mismatch (1) para
+        // realmente divergir do que foi persistido e provar que ValidateAndLoadPstItemsAsync
+        // detecta a adulteração via pst_items_sha256.
         await ExecuteAdminSqlAsync(
-            scope, "UPDATE dbo.purview_reconciliation_pst_items SET disposition = 0 WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+            scope, "UPDATE dbo.purview_reconciliation_pst_items SET disposition = 1 WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
 
         await Assert.ThrowsAsync<ReconciliationIntegrityViolationException>(() =>
             Assessments().GetPstItemsAsync(scope, wave.Id, plannedJobName, assessment.AssessmentVersion, CancellationToken.None));
