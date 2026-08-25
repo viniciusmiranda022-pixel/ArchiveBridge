@@ -395,6 +395,59 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Migration0032AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0031 tivesse divergido, isto lançaria. Confirma a 0032 (AB-I5-015): a coluna manifest_hash,
+        // a tabela nova de manifestação por arquivo, seu índice único de execução e que a role da aplicação
+        // recebe apenas SELECT/INSERT (append-only).
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 32;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var column = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.columns
+            WHERE object_id = OBJECT_ID('dbo.purview_upload_attempts') AND name = 'manifest_hash';
+            """,
+            connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await column.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var table = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.tables WHERE name = 'purview_upload_attempt_manifest_items';", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await table.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var index = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.indexes WHERE name = 'UX_puami_execution' AND is_unique = 1;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await index.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using var grants = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.database_permissions AS p
+            JOIN sys.objects AS o ON o.object_id = p.major_id
+            JOIN sys.database_principals AS r ON r.principal_id = p.grantee_principal_id
+            WHERE r.name = 'ab_app_role' AND o.name = 'purview_upload_attempt_manifest_items'
+              AND p.permission_name NOT IN ('SELECT', 'INSERT');
+            """,
+            connection);
+        Assert.Equal(0, Convert.ToInt32(await grants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
         var original = await ReadHashAsync(1);

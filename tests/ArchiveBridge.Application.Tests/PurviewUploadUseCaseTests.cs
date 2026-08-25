@@ -274,6 +274,19 @@ public sealed class PurviewUploadUseCaseTests
         Assert.Equal(2, attempt.Evidence!.ExpectedFileCount);
         Assert.Equal(8192, attempt.Evidence.ExpectedTotalBytes);
         Assert.Equal(binary, attempt.Evidence.Binary);
+
+        // AB-I5-015: a manifestação por arquivo prova, item a item, exatamente QUAIS execuções foram
+        // transportadas — nome remoto/hash/tamanho derivados das MESMAS execuções despachadas, nunca de
+        // contadores agregados soltos.
+        Assert.Equal(2, attempt.Evidence.Manifest.Count);
+        foreach (var (binding, execution) in new[] { partA, partB })
+        {
+            var manifestItem = Assert.Single(attempt.Evidence.Manifest, item => item.Execution == execution.Id);
+            Assert.Equal(PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value, manifestItem.RemoteName.Value);
+            Assert.Equal(execution.OutputHash, manifestItem.OutputHash);
+            Assert.Equal(execution.OutputSizeBytes, manifestItem.ExpectedSizeBytes);
+            _ = binding; // apenas para desconstrução do par (Binding, Execution).
+        }
     }
 
     [Fact]

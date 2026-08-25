@@ -120,12 +120,36 @@ public sealed class ResolvePurviewMappingEvidenceUseCase(
                 "O prefixo remoto da evidência de upload não corresponde ao prefixo canônico da onda (fail-closed).");
         }
 
-        var expectedTotalBytes = rows.Sum(row => row.Execution.OutputSizeBytes);
-        if (evidence.ExpectedFileCount != rows.Count || evidence.ExpectedTotalBytes != expectedTotalBytes)
+        // (AB-I5-015 item 4) Correspondência EXATA 1:1 entre cada binding/execução ATUAL e um item da
+        // manifestação verificada — nunca apenas contagem/soma de bytes agregados (item 5: dois conjuntos
+        // diferentes de PSTs podem coincidir em quantidade e soma de bytes por acidente). Item ausente,
+        // extra, duplicado ou divergente (nome remoto/hash/tamanho) bloqueia a geração inteira.
+        var manifestByExecution = evidence.Manifest.ToDictionary(item => item.Execution);
+        if (manifestByExecution.Count != rows.Count)
         {
             throw new PurviewMappingCsvGenerationException(
-                "A evidência de upload verificada não corresponde ao conjunto ATUAL de vínculos canônicos da onda " +
-                "(fail-closed) — repita o upload antes de gerar o mapping.");
+                "A evidência de upload verificada não corresponde EXATAMENTE ao conjunto ATUAL de vínculos canônicos " +
+                "da onda (quantidade de itens da manifestação divergente, fail-closed) — repita o upload antes de gerar o mapping.");
+        }
+
+        foreach (var row in rows)
+        {
+            if (!manifestByExecution.TryGetValue(row.Execution.Id, out var manifestItem))
+            {
+                throw new PurviewMappingCsvGenerationException(
+                    "A evidência de upload verificada não cobre um dos vínculos/execuções canônicos ATUAIS da onda " +
+                    "(item ausente na manifestação, fail-closed) — repita o upload antes de gerar o mapping.");
+            }
+
+            var expectedRemoteName = PurviewRemotePstName.ForPart(row.Execution.Artifact, row.Execution.PartSequence);
+            if (!string.Equals(manifestItem.RemoteName.Value, expectedRemoteName.Value, StringComparison.Ordinal)
+                || manifestItem.OutputHash != row.Execution.OutputHash
+                || manifestItem.ExpectedSizeBytes != row.Execution.OutputSizeBytes)
+            {
+                throw new PurviewMappingCsvGenerationException(
+                    "A evidência de upload verificada diverge do vínculo/execução canônico ATUAL (nome remoto, hash ou " +
+                    "tamanho, fail-closed) — repita o upload antes de gerar o mapping.");
+            }
         }
 
         return new PurviewMappingEvidence(waveAggregate, rows, attempt);

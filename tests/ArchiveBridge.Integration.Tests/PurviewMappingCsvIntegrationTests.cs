@@ -97,8 +97,17 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
         await Prechecks().AppendAsync(snapshot, CancellationToken.None);
     }
 
-    /// <summary>Marca o upload da onda como verificado (Uploaded) com a evidência exatamente coerente com os vínculos informados.</summary>
-    private async Task MarkUploadVerifiedAsync(TenantScope scope, MigrationWave wave, IReadOnlyList<PartitionExecutionRecord> executions)
+    /// <summary>A manifestação canônica (AB-I5-015) de UMA execução — a MESMA regra usada pelo upload real.</summary>
+    private static PurviewUploadFileManifestItem CanonicalManifestItem(PartitionExecutionRecord execution) =>
+        new(execution.Id, PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence), execution.OutputHash, execution.OutputSizeBytes);
+
+    /// <summary>Marca o upload da onda como verificado (Uploaded) com a manifestação exatamente coerente com os vínculos informados.</summary>
+    private Task MarkUploadVerifiedAsync(TenantScope scope, MigrationWave wave, IReadOnlyList<PartitionExecutionRecord> executions) =>
+        MarkUploadVerifiedWithManifestAsync(scope, wave, [.. executions.Select(CanonicalManifestItem)]);
+
+    /// <summary>Marca o upload da onda como verificado (Uploaded) com a manifestação EXATA informada (permite cenários de drift/tampering).</summary>
+    private async Task MarkUploadVerifiedWithManifestAsync(
+        TenantScope scope, MigrationWave wave, IReadOnlyList<PurviewUploadFileManifestItem> manifest)
     {
         var enqueue = await UploadRequests().EnqueueIdempotentAsync(scope, wave.Id, CorrelationId.New(), CancellationToken.None);
         var jobs = new ArchiveBridge.Infrastructure.Jobs.SqlJobStore(fixture.Factory, Clock, agingInterval: TimeSpan.FromSeconds(30));
@@ -113,9 +122,7 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
         var now = Clock.UtcNow;
         var evidence = new PurviewUploadEvidence(
             new AzCopyBinaryIdentity("10.25.0", new Sha256Hash(new string('a', 64))),
-            expectedFileCount: executions.Count,
-            expectedTotalBytes: executions.Sum(execution => execution.OutputSizeBytes),
-            PurviewRemoteUploadPrefix.ForWave(scope.Tenant, scope.Project, wave.Id));
+            PurviewRemoteUploadPrefix.ForWave(scope.Tenant, scope.Project, wave.Id), manifest);
         var record = new PurviewUploadAttemptRecord(
             enqueue.RequestId, PurviewUploadAttemptId.New(), AttemptNumber: 1, new Sha256Hash(new string('b', 64)),
             PurviewUploadAttemptOutcome.Uploaded, BlockingReason: null, evidence, ProcessExitCode: 0, now, now);
@@ -255,6 +262,93 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
             GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
     }
 
+    /// <summary>Onda aprovada com DOIS PSTs vinculados e prechecks Active — o teste decide a manifestação verificada.</summary>
+    private async Task<(TenantScope Scope, MigrationWave Wave, PartitionExecutionRecord ExecutionA, PartitionExecutionRecord ExecutionB)>
+        SeedTwoEntryBoundWaveAsync(string prefix)
+    {
+        var scope = SqlServerFixture.NewScope();
+        await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
+
+        var executionA = await RegisterAndExecuteAsync(scope, $"{prefix}-a.pst");
+        var executionB = await RegisterAndExecuteAsync(scope, $"{prefix}-b.pst");
+        var entryA = Slice2Support.Entry($"{prefix}-a.pst", $"{prefix}-a@contoso.com", executionA.OutputSizeBytes);
+        var entryB = Slice2Support.Entry($"{prefix}-b.pst", $"{prefix}-b@contoso.com", executionB.OutputSizeBytes);
+        var wave = Slice2Support.Approve(Slice2Support.NewWave(scope, new WaveSelection([entryA, entryB])));
+        await Slice2Support.WaveStore(fixture).AddAsync(wave, CorrelationId.New(), CancellationToken.None);
+
+        await BindingUseCase().ExecuteAsync(
+            new CreateWavePartitionOutputBindingRequest(
+                scope, wave.Id, WaveEntryId.Derive(wave.Id, entryA), executionA.Plan, executionA.Part, CorrelationId.New()),
+            CancellationToken.None);
+        await BindingUseCase().ExecuteAsync(
+            new CreateWavePartitionOutputBindingRequest(
+                scope, wave.Id, WaveEntryId.Derive(wave.Id, entryB), executionB.Plan, executionB.Part, CorrelationId.New()),
+            CancellationToken.None);
+        await SeedPrecheckAsync(scope, entryA, MailboxArchiveStatus.Active);
+        await SeedPrecheckAsync(scope, entryB, MailboxArchiveStatus.Active);
+
+        return (scope, wave, executionA, executionB);
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenTheManifestHasTheSameAggregateCountAndBytesButSwappedPerFileIdentity()
+    {
+        // AB-I5-015 item 5: dois conjuntos DIFERENTES de PSTs que coincidam em quantidade e soma de bytes
+        // — cada item aqui referencia a EXECUÇÃO correta (mesma correlação binding<->entry), mas carrega o
+        // nome remoto/hash da OUTRA execução. A validação agregada antiga (contagem/soma) não detectaria
+        // isto; a correspondência exata 1:1 por item detecta.
+        var (scope, wave, executionA, executionB) = await SeedTwoEntryBoundWaveAsync("swap");
+        var swapped = new[]
+        {
+            new PurviewUploadFileManifestItem(
+                executionA.Id, PurviewRemotePstName.ForPart(executionB.Artifact, executionB.PartSequence),
+                executionB.OutputHash, executionA.OutputSizeBytes),
+            new PurviewUploadFileManifestItem(
+                executionB.Id, PurviewRemotePstName.ForPart(executionA.Artifact, executionA.PartSequence),
+                executionA.OutputHash, executionB.OutputSizeBytes),
+        };
+        await MarkUploadVerifiedWithManifestAsync(scope, wave, swapped);
+
+        await Assert.ThrowsAsync<PurviewMappingCsvGenerationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenTheManifestHasAnExtraItemNotBelongingToAnyCurrentBinding()
+    {
+        var (scope, wave, executionA, executionB) = await SeedTwoEntryBoundWaveAsync("extra");
+        var manifest = new[]
+        {
+            CanonicalManifestItem(executionA),
+            CanonicalManifestItem(executionB),
+            new PurviewUploadFileManifestItem(
+                PartitionExecutionId.New(), PurviewRemotePstName.ForPart(ArtifactId.New(), 1), new Sha256Hash(new string('9', 64)), 4096),
+        };
+        await MarkUploadVerifiedWithManifestAsync(scope, wave, manifest);
+
+        await Assert.ThrowsAsync<PurviewMappingCsvGenerationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenTheManifestReferencesAnExecutionNeverBoundToTheWave()
+    {
+        var (scope, wave, executionA, executionB) = await SeedTwoEntryBoundWaveAsync("wrongexec");
+        var manifest = new[]
+        {
+            CanonicalManifestItem(executionA),
+            // Item com uma execução TOTALMENTE alheia à onda no lugar da execução B realmente vinculada —
+            // a contagem ainda bate (2), mas o binding de B não encontra correspondência na manifestação.
+            new PurviewUploadFileManifestItem(
+                PartitionExecutionId.New(), PurviewRemotePstName.ForPart(executionB.Artifact, executionB.PartSequence),
+                executionB.OutputHash, executionB.OutputSizeBytes),
+        };
+        await MarkUploadVerifiedWithManifestAsync(scope, wave, manifest);
+
+        await Assert.ThrowsAsync<PurviewMappingCsvGenerationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
     [Fact]
     public async Task ARepeatedGenerationWithNoRealEvidenceChangeReusesTheSameVersionWithoutRegenerating()
     {
@@ -300,6 +394,44 @@ public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
         var previous = await MappingStore().GetByVersionAsync(scope, wave.Id, first.Version.Version, CancellationToken.None);
         Assert.NotNull(previous);
         Assert.Equal(MappingVersionStatus.Superseded, previous!.Status); // preservada, nunca apagada.
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenThePersistedFileManifestIsTamperedDirectlyInTheRow()
+    {
+        // AB-I5-015 item 2/6: tampering direto na manifestação persistida (fora do Domain/Application) é
+        // detectado no rehydrate da tentativa de upload — a geração do mapping nunca alcança um estado em
+        // que confiaria numa manifestação adulterada.
+        var (scope, wave, _, _) = await SeedVerifiedSingleEntryWaveAsync("e2e-manifest-tampered.pst", "manifest-tampered@contoso.com");
+
+        await TamperManifestOutputHashAsync(scope, wave.Id);
+
+        await Assert.ThrowsAsync<PurviewUploadAttemptIntegrityViolationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
+    private async Task TamperManifestOutputHashAsync(TenantScope scope, WaveId wave)
+    {
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+        await using (var context = new SqlCommand("EXEC sys.sp_set_session_context @key = N'tenant_id', @value = @tenant;", connection))
+        {
+            context.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+            await context.ExecuteNonQueryAsync();
+        }
+
+        await using var command = new SqlCommand(
+            """
+            UPDATE m SET m.output_hash = REPLICATE('0', 64)
+            FROM dbo.purview_upload_attempt_manifest_items AS m
+            JOIN dbo.purview_upload_attempts AS a ON a.attempt_id = m.attempt_id
+            JOIN dbo.purview_upload_requests AS r ON r.request_id = a.request_id
+            WHERE r.wave_id = @wave AND r.project_id = @project;
+            """,
+            connection);
+        command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        await command.ExecuteNonQueryAsync();
     }
 
     [Fact]

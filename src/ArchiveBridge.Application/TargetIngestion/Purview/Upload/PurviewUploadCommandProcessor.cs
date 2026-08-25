@@ -295,8 +295,10 @@ public sealed class PurviewUploadCommandProcessor(
         // revalidado. Qualquer falha (exit code != 0, timeout, limite de output) interrompe o conjunto
         // inteiro — nunca um sucesso parcial "meio enviado" (item 8: identidade lógica única, sem falso
         // sucesso duplicado).
-        var uploadedCount = 0;
-        var uploadedBytes = 0L;
+        // (AB-I5-015 item 1/3) A manifestação por arquivo é construída SOMENTE a partir dos bindings/
+        // execuções REALMENTE despachados neste attempt — nunca de input do caller nem de contadores
+        // agregados — um item por PST efetivamente transportado, com o MESMO nome remoto usado pelo AzCopy.
+        var manifest = new List<PurviewUploadFileManifestItem>(executionRecords.Count);
         foreach (var execution in executionRecords)
         {
             var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence);
@@ -310,14 +312,13 @@ public sealed class PurviewUploadCommandProcessor(
                     identityHash, fileResult.ExitCode).ConfigureAwait(false);
             }
 
-            uploadedCount++;
-            uploadedBytes += execution.OutputSizeBytes;
+            manifest.Add(new PurviewUploadFileManifestItem(execution.Id, remoteName, execution.OutputHash, execution.OutputSizeBytes));
         }
 
         // (item 10/13) Evidência SANITIZADA: contadores/identidades já conhecidos server-side, nunca output
         // bruto do processo. Uploaded aqui significa "transporte comprovado" — nunca importação/reconciliação
         // Purview (STOP-THE-LINE), que permanecem estados distintos e fora deste Passo.
-        var evidence = new PurviewUploadEvidence(observedBinary, uploadedCount, uploadedBytes, remotePrefix);
+        var evidence = new PurviewUploadEvidence(observedBinary, remotePrefix, manifest);
         var success = new PurviewUploadAttemptRecord(
             request.Id, attemptId, attemptNumber, identityHash, PurviewUploadAttemptOutcome.Uploaded, BlockingReason: null,
             evidence, ProcessExitCode: 0, startedAtUtc, _clock.UtcNow);

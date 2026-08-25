@@ -475,3 +475,43 @@ ingestão automática do validation report do Purview; início de `Import data`;
 conclusão de wave/projeto; edição manual/Excel do CSV; fragmentação automática em múltiplos jobs para
 ultrapassar 500 linhas; aceitar PST/mailbox/path/target root arbitrário do caller. Nenhum destes fluxos
 existe no código deste Passo — não há superfície de ameaça nova a analisar para eles aqui.
+
+# Threat model — I5/EPIC-06, Passo 4 (AB-I5-015: manifestação determinística por arquivo da evidência de upload Purview)
+
+Delta sobre o capítulo imediatamente anterior (mesmo formato). Corrige um blocker de cadeia de custódia
+identificado na revisão de AB-I5-012/013: `ResolvePurviewMappingEvidenceUseCase` validava apenas a evidência
+AGREGADA da tentativa `Uploaded` (prefixo remoto, `ExpectedFileCount`, `ExpectedTotalBytes`) contra o
+conjunto atual de vínculos canônicos — isso prova CONTAGEM e SOMA de bytes, mas não prova, POR LINHA, que o
+MESMO `WavePartitionOutputBinding`/`PartitionExecution`/`PurviewRemotePstName` participou efetivamente do
+transporte verificado. Dois conjuntos DIFERENTES de PSTs que coincidam em quantidade e soma de bytes por
+acidente (ex.: dois PSTs do mesmo tamanho com identidades trocadas) satisfariam a validação agregada e
+produziriam mapping para arquivos não individualmente comprovados — o exato erro que a cadeia de custódia
+deste Passo existe para prevenir.
+
+## Ativos adicionais
+
+- **Manifestação por arquivo da evidência de upload** (`PurviewUploadEvidence.Manifest`,
+  `dbo.purview_upload_attempt_manifest_items`): a identidade canônica ORDENADA de CADA PST efetivamente
+  coberto pelo transporte comprovado de uma tentativa `Uploaded` — a execução/binding que o produziu
+  (`PartitionExecutionId`, a MESMA referência de `WavePartitionOutputBinding.Execution`), o nome remoto
+  EXATO usado pelo AzCopy real (`PurviewRemotePstName`), e o hash/tamanho canônicos do output. Nenhum
+  caminho físico/local, mailbox/UPN ou segredo. `ExpectedFileCount`/`ExpectedTotalBytes` (colunas
+  agregadas pré-existentes de 0029) passam a ser SEMPRE derivados do `Manifest` — nunca informados
+  independentemente — eliminando estruturalmente a possibilidade de dois conjuntos coincidirem apenas em
+  agregado.
+- **`manifest_hash`** (`dbo.purview_upload_attempts`): hash determinístico da manifestação completa
+  (`PurviewUploadFileManifestHash.Compute`, ordenado por `Execution` — nunca pela ordem de leitura/
+  inserção). Revalidado a cada leitura persistida (mesmo princípio de `binding_hash`/`handle_hash`):
+  qualquer item inserido, removido, duplicado ou alterado diretamente na linha é recusado fail-closed
+  (`PurviewUploadAttemptIntegrityViolationException`), nunca reidratado como evidência válida.
+
+## Ameaças e mitigações (delta)
+
+| Ameaça | Mitigação |
+| --- | --- |
+| Dois conjuntos DIFERENTES de PSTs coincidem em `ExpectedFileCount`/`ExpectedTotalBytes` e a evidência agregada antiga aceitaria mapping para arquivos não comprovados individualmente (AB-I5-015 item 5) | `ResolvePurviewMappingEvidenceUseCase` exige correspondência EXATA 1:1 entre cada binding/execução ATUAL da onda e um item da manifestação verificada — mesma execução, mesmo nome remoto, mesmo hash, mesmo tamanho. Item ausente, extra, ou divergente em qualquer campo bloqueia a geração inteira; contagem agregada sozinha nunca mais decide. Comprovado sob SQL real por `GenerateFailsClosedWhenTheManifestHasTheSameAggregateCountAndBytesButSwappedPerFileIdentity`, `GenerateFailsClosedWhenTheManifestHasAnExtraItemNotBelongingToAnyCurrentBinding`, `GenerateFailsClosedWhenTheManifestReferencesAnExecutionNeverBoundToTheWave`. |
+| A manifestação por arquivo é construída a partir de input do caller ou de contadores agregados soltos, em vez dos bindings/execuções REALMENTE despachados | `PurviewUploadCommandProcessor.DispatchAsync` constrói UM item por PST efetivamente transportado, DENTRO do próprio laço de transporte (mesmo `execution`/`remoteName` já usados pela chamada real ao AzCopy) — nunca reconstruída depois a partir de contadores. `PurviewUploadEvidence` recusa fail-closed (`ArgumentException`) uma manifestação vazia ou com mais de um item para a mesma execução. Comprovado por `ASuccessfulTransportPersistsSanitizedEvidenceAndCompletesTheJob` (Application) e `EvidenceConstructionRejectsAnEmptyManifest`/`EvidenceConstructionRejectsAManifestWithMoreThanOneItemForTheSameExecution` (Domain). |
+| Adulteração direta de um item de manifestação (hash, nome remoto, tamanho) ou inserção/remoção de item na tabela, sem tocar nenhum outro campo | `manifest_hash` cobre a manifestação completa; `SqlPurviewUploadAttemptStore` recomputa o hash a partir dos itens REALMENTE carregados a cada `GetLatestAsync`/`ListAttemptsAsync` e recusa fail-closed (`PurviewUploadAttemptIntegrityViolationException`) qualquer divergência — inclusive quando a manifestação e os agregados (`expected_file_count`/`expected_total_bytes`) persistidos divergem entre si (defesa em profundidade adicional contra adulteração isolada dos agregados). Comprovado por `AttemptReadFailsClosedWhenAPersistedManifestItemHashIsTamperedDirectlyInTheRow`, `AttemptReadFailsClosedWhenAnExtraManifestItemIsInsertedDirectlyInTheRow` e, no caminho de geração do mapping, `GenerateFailsClosedWhenThePersistedFileManifestIsTamperedDirectlyInTheRow`. |
+| Manifestação persistida PARCIALMENTE (attempt gravado sem todos os itens, ou itens sem o attempt) sob falha durante a gravação | A manifestação é gravada NA MESMA transação SQL do `INSERT` da tentativa (`SqlPurviewUploadAttemptStore.AppendAsync`) — qualquer falha faz rollback de ambos juntos; nenhuma tentativa `Uploaded` pode existir sem sua manifestação completa, nem vice-versa. O FK composto (`attempt_id, tenant_id, project_id`) reforça, no banco, que todo item pertence a um attempt do MESMO escopo. |
+| `dbo.purview_upload_attempt_manifest_items` sem isolamento por tenant/projeto (IDOR entre escopos) | A tabela participa integralmente da RLS existente (`rls.tenant_isolation_policy`) e toda leitura é filtrada explicitamente por `tenant_id`/`project_id` nos parâmetros da query — mesmo padrão de todas as tabelas anteriores deste Slice. |
+| Migrations históricas (0001-0031) alteradas para acomodar a nova coluna/tabela | `0032_i5_purview_upload_attempt_file_manifest.sql` é estritamente aditiva (`ALTER TABLE ADD COLUMN`/`ADD CONSTRAINT`, `CREATE TABLE`) — nenhuma migration anterior foi tocada. `MigrationHashTests.Migration0032AppliesCleanlyAndPriorHashesRemainStable` reexecuta o runner (revalidando os hashes 0001-0031 armazenados) antes de confirmar a 0032. |
