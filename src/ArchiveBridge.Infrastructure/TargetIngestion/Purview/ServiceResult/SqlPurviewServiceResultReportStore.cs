@@ -22,9 +22,14 @@ namespace ArchiveBridge.Infrastructure.TargetIngestion.Purview.ServiceResult;
 /// conteúdo bruto (custódia) e as linhas filhas quando não há convergência — nunca em transações separadas
 /// (nunca existe uma versão "parcial" visível). Toda leitura que trata uma versão persistida como evidência
 /// canônica (replay, latest, versão específica) revalida os bytes REALMENTE persistidos de
-/// <c>raw_content</c> contra <c>raw_size_bytes</c>/<c>content_sha256</c> (AB-I6-003 Blocker 2), além do
-/// hash agregado das linhas contra <c>rows_sha256</c> em <see cref="GetRowsAsync"/> (fail-closed sob
-/// tampering). RLS por SESSION_CONTEXT.
+/// <c>raw_content</c> contra <c>raw_size_bytes</c>/<c>content_sha256</c> (AB-I6-003 Blocker 2) E o hash
+/// agregado das linhas normalizadas filhas contra <c>rows_sha256</c> (AB-I6-004): <see cref="GetByContentHashAsync"/>
+/// (replay), <see cref="GetLatestAsync"/> (completeness), <see cref="GetRowsAsync"/> e o ramo de convergência
+/// concorrente de <see cref="PersistAsync"/> compartilham a MESMA rotina interna
+/// (<see cref="ValidateAndLoadRowsAsync"/>) — nenhum caminho pode devolver uma versão persistida como
+/// evidência canônica sem que as linhas filhas realmente persistidas tenham sido recarregadas e revalidadas
+/// (count + hash) na MESMA chamada, mesmo que o chamador nunca invoque <see cref="GetRowsAsync"/>
+/// separadamente. RLS por SESSION_CONTEXT.
 /// </summary>
 public sealed class SqlPurviewServiceResultReportStore(TenantConnectionFactory connectionFactory) : IPurviewServiceResultReportStore
 {
@@ -112,14 +117,27 @@ public sealed class SqlPurviewServiceResultReportStore(TenantConnectionFactory c
             return null;
         }
 
-        await using var command = new SqlCommand(GetByContentHashSql, connection.Connection);
-        command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
-        command.Parameters.Add(new SqlParameter("@attempt", SqlDbType.Int) { Value = attempt.Value });
-        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
-        command.Parameters.Add(new SqlParameter("@contentHash", SqlDbType.Char, 64) { Value = contentSha256.Value });
+        PurviewServiceResultReportEvidence? evidence;
+        await using (var command = new SqlCommand(GetByContentHashSql, connection.Connection))
+        {
+            command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
+            command.Parameters.Add(new SqlParameter("@attempt", SqlDbType.Int) { Value = attempt.Value });
+            command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+            command.Parameters.Add(new SqlParameter("@contentHash", SqlDbType.Char, 64) { Value = contentSha256.Value });
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadEvidence(reader, plannedJobName) : null;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            evidence = await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadEvidence(reader, plannedJobName) : null;
+        }
+
+        if (evidence is not null)
+        {
+            // AB-I6-004: replay por content hash não pode devolver a evidência como canônica sem revalidar
+            // também as linhas filhas realmente persistidas — nunca apenas o raw blob/metadados.
+            _ = await ValidateAndLoadRowsAsync(connection.Connection, null, scope, wave, attempt.Value, evidence, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        return evidence;
     }
 
     /// <inheritdoc />
@@ -182,6 +200,11 @@ public sealed class SqlPurviewServiceResultReportStore(TenantConnectionFactory c
 
             if (converged is not null)
             {
+                // AB-I6-004: mesmo dentro da seção crítica de convergência concorrente, a versão encontrada
+                // já é uma evidência PERSISTIDA (por esta chamada ou por outra) — revalida as linhas filhas
+                // pela MESMA rotina antes de devolvê-la como canônica, nunca apenas o raw blob/metadados.
+                _ = await ValidateAndLoadRowsAsync(connection.Connection, transaction, scope, wave, attempt, converged, cancellationToken)
+                    .ConfigureAwait(false);
                 await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(now), cancellationToken)
                     .ConfigureAwait(false);
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -252,13 +275,26 @@ public sealed class SqlPurviewServiceResultReportStore(TenantConnectionFactory c
             return null;
         }
 
-        await using var command = new SqlCommand(GetLatestSql, connection.Connection);
-        command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
-        command.Parameters.Add(new SqlParameter("@attempt", SqlDbType.Int) { Value = attempt.Value });
-        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        PurviewServiceResultReportEvidence? evidence;
+        await using (var command = new SqlCommand(GetLatestSql, connection.Connection))
+        {
+            command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
+            command.Parameters.Add(new SqlParameter("@attempt", SqlDbType.Int) { Value = attempt.Value });
+            command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadEvidence(reader, plannedJobName) : null;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            evidence = await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadEvidence(reader, plannedJobName) : null;
+        }
+
+        if (evidence is not null)
+        {
+            // AB-I6-004: a versão mais recente não pode ser devolvida como evidência canônica (ex.: para
+            // avaliação de completude) sem revalidar também as linhas filhas realmente persistidas.
+            _ = await ValidateAndLoadRowsAsync(connection.Connection, null, scope, wave, attempt.Value, evidence, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        return evidence;
     }
 
     /// <inheritdoc />
@@ -282,12 +318,28 @@ public sealed class SqlPurviewServiceResultReportStore(TenantConnectionFactory c
                 : throw new PurviewImportJobSourceNotFoundException("Versão de service result report inexistente/fora do escopo (fail-closed).");
         }
 
+        return await ValidateAndLoadRowsAsync(connection.Connection, null, scope, wave, attempt, evidence, cancellationToken).ConfigureAwait(false);
+    }
+
+    // AB-I6-004: rotina única compartilhada por GetByContentHashAsync (replay), GetLatestAsync (completeness)
+    // e GetRowsAsync — carrega as linhas filhas REALMENTE persistidas para a versão da evidência informada e
+    // revalida, na MESMA chamada, que a contagem bate com row_count E que o hash agregado recomputado
+    // (PurviewServiceResultRowsHash) bate com rows_sha256. Nenhum caminho que trata uma versão persistida
+    // como evidência canônica pode pular esta revalidação — evidence_hash cobre os METADADOS da versão, não
+    // o conteúdo das linhas filhas, então adulterar uma linha (status/contador/remote name) ou remover/
+    // adicionar uma linha sem tocar os metadados da versão não seria detectado sem isto.
+    private static async Task<IReadOnlyList<PurviewServiceResultRow>> ValidateAndLoadRowsAsync(
+        SqlConnection connection, SqlTransaction? transaction, TenantScope scope, WaveId wave, int attempt,
+        PurviewServiceResultReportEvidence evidence, CancellationToken cancellationToken)
+    {
         var rows = new List<PurviewServiceResultRow>(evidence.RowCount);
-        await using (var command = new SqlCommand(SelectRowsSql, connection.Connection))
+        await using (var command = transaction is null
+            ? new SqlCommand(SelectRowsSql, connection)
+            : new SqlCommand(SelectRowsSql, connection, transaction))
         {
             command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
             command.Parameters.Add(new SqlParameter("@attempt", SqlDbType.Int) { Value = attempt });
-            command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = reportVersion });
+            command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = evidence.ReportVersion });
             command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))

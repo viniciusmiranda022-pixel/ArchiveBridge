@@ -597,6 +597,78 @@ public sealed class PurviewImportJobIntegrationTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task ImportReportReplayFailsClosedWhenAPersistedChildRowIsTamperedDirectlyInSql()
+    {
+        // AB-I6-004: evidence_hash cobre os METADADOS da versão (content_sha256/rows_sha256/etc.), não o
+        // conteúdo das linhas filhas em si. Adulterar status/contador de uma linha SEM tocar os metadados da
+        // versão não pode ser invisível para o replay — reenviar exatamente os mesmos bytes deve falhar
+        // fechado, nunca devolver a evidência (com linhas filhas adulteradas) como canônica.
+        var (scope, wave, _, execution) =
+            await SeedPlannableWaveAsync("report-row-tamper-replay.pst", "report-row-tamper-replay@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None);
+
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.purview_service_result_rows SET imported_item_count = 999999 WHERE wave_id = @wave;",
+            ("@wave", wave.Id.Value));
+
+        await Assert.ThrowsAsync<PurviewServiceResultIntegrityViolationException>(() =>
+            ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ImportReportReplayFailsClosedWhenAChildRowIsDeletedDirectlyInSql()
+    {
+        // AB-I6-004: remover uma linha filha preserva evidence_hash/content_sha256 intactos (nenhum deles
+        // cobre row_count real vs. o que está persistido) — deve falhar por divergência de count/hash, nunca
+        // convergir silenciosamente para uma evidência com menos linhas do que row_count declara.
+        var (scope, wave, _, execution) =
+            await SeedPlannableWaveAsync("report-row-delete-replay.pst", "report-row-delete-replay@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None);
+
+        await ExecuteAdminSqlAsync(
+            scope, "DELETE FROM dbo.purview_service_result_rows WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+
+        await Assert.ThrowsAsync<PurviewServiceResultIntegrityViolationException>(() =>
+            ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ImportReportReplayFailsClosedWhenAnExtraChildRowIsInsertedDirectlyInSql()
+    {
+        // AB-I6-004: uma linha filha adicionada diretamente no SQL também preserva evidence_hash/
+        // content_sha256/row_count originais intactos — deve falhar por divergência de count/hash contra
+        // row_count e rows_sha256 REALMENTE armazenados, nunca aceitar a linha extra silenciosamente.
+        var (scope, wave, _, execution) =
+            await SeedPlannableWaveAsync("report-row-insert-replay.pst", "report-row-insert-replay@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None);
+
+        await ExecuteAdminSqlAsync(
+            scope,
+            """
+            INSERT INTO dbo.purview_service_result_rows
+                (wave_id, attempt_sequence, report_version, tenant_id, project_id, remote_pst_name, status,
+                 imported_item_count, imported_size_bytes, skipped_item_count, corrupted_item_count)
+            SELECT wave_id, attempt_sequence, report_version, tenant_id, project_id, N'extra-injected-row', status,
+                 imported_item_count, imported_size_bytes, skipped_item_count, corrupted_item_count
+            FROM dbo.purview_service_result_rows WHERE wave_id = @wave;
+            """,
+            ("@wave", wave.Id.Value));
+
+        await Assert.ThrowsAsync<PurviewServiceResultIntegrityViolationException>(() =>
+            ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None));
+    }
+
+    [Fact]
     public async Task ImportReportConvergesToTheSameVersionUnderConcurrentByteIdenticalImports()
     {
         // AB-I6-003 Blocker 3: 5 importações simultâneas do MESMO conteúdo bruto devem convergir para a
@@ -744,6 +816,49 @@ public sealed class PurviewImportJobIntegrationTests(SqlServerFixture fixture)
             scope,
             "UPDATE dbo.purview_service_result_report_versions SET raw_content = @tampered WHERE wave_id = @wave;",
             ("@tampered", tampered), ("@wave", wave.Id.Value));
+
+        await Assert.ThrowsAsync<PurviewServiceResultIntegrityViolationException>(() =>
+            CompletenessUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CompletenessFailsClosedWhenAPersistedChildRowIsTamperedDirectlyInSql()
+    {
+        // AB-I6-004: GetLatestAsync (usada pela avaliação de completude) não pode tratar a versão mais
+        // recente como canônica sem revalidar também as linhas filhas realmente persistidas — uma linha
+        // adulterada (status/contador) sem tocar os metadados da versão deve falhar fechado ANTES de
+        // qualquer correlação/desfecho ser calculado.
+        var (scope, wave, _, execution) =
+            await SeedPlannableWaveAsync("completeness-row-tamper.pst", "completeness-row-tamper@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None);
+
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.purview_service_result_rows SET status = 3 WHERE wave_id = @wave;",
+            ("@wave", wave.Id.Value));
+
+        await Assert.ThrowsAsync<PurviewServiceResultIntegrityViolationException>(() =>
+            CompletenessUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CompletenessFailsClosedWhenAChildRowIsDeletedDirectlyInSql()
+    {
+        // AB-I6-004: remover uma linha filha diretamente no SQL preserva row_count/rows_sha256 originais na
+        // linha da versão intactos — a avaliação de completude deve falhar por divergência de count/hash
+        // REALMENTE persistido, nunca avaliar completude contra um conjunto de linhas incompleto.
+        var (scope, wave, _, execution) =
+            await SeedPlannableWaveAsync("completeness-row-delete.pst", "completeness-row-delete@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None);
+
+        await ExecuteAdminSqlAsync(
+            scope, "DELETE FROM dbo.purview_service_result_rows WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
 
         await Assert.ThrowsAsync<PurviewServiceResultIntegrityViolationException>(() =>
             CompletenessUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, CancellationToken.None));
