@@ -66,4 +66,7 @@ public readonly record struct PurviewRemotePstName
         return new PurviewRemotePstName(
             $"p_{artifact.Value:N}_part{partSequence.ToString("D3", CultureInfo.InvariantCulture)}.pst");
     }
+
+    /// <summary>Reconstrói o nome a partir do valor JÁ PERSISTIDO (uso exclusivo da camada de persistência).</summary>
+    public static PurviewRemotePstName FromPersistedValue(string value) => new(value);
 }

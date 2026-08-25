@@ -13,6 +13,8 @@ namespace ArchiveBridge.Domain.Tests;
 /// ser criado a partir de uma <see cref="PartitionExecutionRecord"/> já verificada (nunca de IDs soltos),
 /// nunca cruza escopo de tenant/projeto, e a fronteira Create/Rehydrate NÃO CONFIÁVEL já usada em
 /// <c>PurviewSasUploadHandle</c>/<c>PartitionExecutionRecord</c> se aplica igualmente aqui.
+/// AB-I5-013 — a correlação com a <see cref="WaveEntryId"/> de destino é parte do CONTEÚDO protegido pelo
+/// hash e da comparação de convergência idempotente/incompatibilidade (<see cref="WavePartitionOutputBinding.IsSameLogicalOutputAs"/>).
 /// </summary>
 public sealed class WavePartitionOutputBindingDomainTests
 {
@@ -22,6 +24,9 @@ public sealed class WavePartitionOutputBindingDomainTests
     private static readonly PartitionExecutorIdentity Executor = new("TestExecutor", "1.0");
 
     private static Sha256Hash Hash(string seed) => DeterministicHash.Compute([seed]);
+
+    private static WaveEntryId NewEntryId(WaveId wave, string seed = "mailbox@contoso.com") =>
+        WaveEntryId.Derive(wave, new WaveEntry($"C:\\pst\\{seed}.pst", $"{seed}.pst", new ArchiveRef(seed), 4096, 10));
 
     private static PartitionExecutionRecord NewExecution(TenantId tenant, ProjectId project, Sha256Hash? planHash = null, int sequence = 1)
     {
@@ -39,10 +44,11 @@ public sealed class WavePartitionOutputBindingDomainTests
         var tenant = new TenantId(Guid.NewGuid());
         var project = new ProjectId(Guid.NewGuid());
         var wave = WaveId.New();
+        var entry = NewEntryId(wave);
         var execution = NewExecution(tenant, project);
 
         var binding = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, wave, execution, CorrelationId.New(), Now);
+            WavePartitionOutputBindingId.New(), tenant, project, wave, entry, execution, CorrelationId.New(), Now);
 
         Assert.Equal(execution.Plan, binding.Plan);
         Assert.Equal(execution.Part, binding.Part);
@@ -52,6 +58,7 @@ public sealed class WavePartitionOutputBindingDomainTests
         Assert.Equal(execution.OutputHash, binding.OutputHash);
         Assert.Equal(execution.OutputSizeBytes, binding.OutputSizeBytes);
         Assert.Equal(wave, binding.Wave);
+        Assert.Equal(entry, binding.Entry);
     }
 
     [Fact]
@@ -60,11 +67,13 @@ public sealed class WavePartitionOutputBindingDomainTests
         var bindingTenant = new TenantId(Guid.NewGuid());
         var executionTenant = new TenantId(Guid.NewGuid());
         var project = new ProjectId(Guid.NewGuid());
+        var wave = WaveId.New();
         var execution = NewExecution(executionTenant, project);
 
         Assert.Throws<ArgumentException>(() =>
             WavePartitionOutputBinding.Create(
-                WavePartitionOutputBindingId.New(), bindingTenant, project, WaveId.New(), execution, CorrelationId.New(), Now));
+                WavePartitionOutputBindingId.New(), bindingTenant, project, wave, NewEntryId(wave), execution,
+                CorrelationId.New(), Now));
     }
 
     [Fact]
@@ -73,11 +82,13 @@ public sealed class WavePartitionOutputBindingDomainTests
         var tenant = new TenantId(Guid.NewGuid());
         var bindingProject = new ProjectId(Guid.NewGuid());
         var executionProject = new ProjectId(Guid.NewGuid());
+        var wave = WaveId.New();
         var execution = NewExecution(tenant, executionProject);
 
         Assert.Throws<ArgumentException>(() =>
             WavePartitionOutputBinding.Create(
-                WavePartitionOutputBindingId.New(), tenant, bindingProject, WaveId.New(), execution, CorrelationId.New(), Now));
+                WavePartitionOutputBindingId.New(), tenant, bindingProject, wave, NewEntryId(wave), execution,
+                CorrelationId.New(), Now));
     }
 
     [Fact]
@@ -85,15 +96,36 @@ public sealed class WavePartitionOutputBindingDomainTests
     {
         var tenant = new TenantId(Guid.NewGuid());
         var project = new ProjectId(Guid.NewGuid());
+        var wave = WaveId.New();
         var execution = NewExecution(tenant, project);
         var binding = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, WaveId.New(), execution, CorrelationId.New(), Now);
+            WavePartitionOutputBindingId.New(), tenant, project, wave, NewEntryId(wave), execution, CorrelationId.New(), Now);
 
         Assert.Throws<WavePartitionOutputBindingIntegrityViolationException>(() =>
             WavePartitionOutputBinding.Rehydrate(
-                binding.Id, binding.Tenant, binding.Project, binding.Wave, binding.Plan, binding.Part,
+                binding.Id, binding.Tenant, binding.Project, binding.Wave, binding.Entry, binding.Plan, binding.Part,
                 binding.Execution, binding.Artifact, binding.PartKey, binding.OutputHash, binding.OutputSizeBytes,
                 binding.Correlation, binding.CreatedAtUtc, Hash("tampered-hash")));
+    }
+
+    [Fact]
+    public void RehydrateFailsClosedWhenTheEntryCorrelationWasTamperedEvenIfEveryOtherFieldMatches()
+    {
+        // AB-I5-013 item 5: entry_id faz parte do binding_hash — trocar SOMENTE a entrada persistida
+        // (mantendo todos os demais campos) deve ser detectado como adulteração, não silenciosamente aceito.
+        var tenant = new TenantId(Guid.NewGuid());
+        var project = new ProjectId(Guid.NewGuid());
+        var wave = WaveId.New();
+        var execution = NewExecution(tenant, project);
+        var binding = WavePartitionOutputBinding.Create(
+            WavePartitionOutputBindingId.New(), tenant, project, wave, NewEntryId(wave, "original"), execution, CorrelationId.New(), Now);
+        var swappedEntry = NewEntryId(wave, "swapped");
+
+        Assert.Throws<WavePartitionOutputBindingIntegrityViolationException>(() =>
+            WavePartitionOutputBinding.Rehydrate(
+                binding.Id, binding.Tenant, binding.Project, binding.Wave, swappedEntry, binding.Plan, binding.Part,
+                binding.Execution, binding.Artifact, binding.PartKey, binding.OutputHash, binding.OutputSizeBytes,
+                binding.Correlation, binding.CreatedAtUtc, binding.BindingHash));
     }
 
     [Fact]
@@ -101,12 +133,13 @@ public sealed class WavePartitionOutputBindingDomainTests
     {
         var tenant = new TenantId(Guid.NewGuid());
         var project = new ProjectId(Guid.NewGuid());
+        var wave = WaveId.New();
         var execution = NewExecution(tenant, project);
         var binding = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, WaveId.New(), execution, CorrelationId.New(), Now);
+            WavePartitionOutputBindingId.New(), tenant, project, wave, NewEntryId(wave), execution, CorrelationId.New(), Now);
 
         var rehydrated = WavePartitionOutputBinding.Rehydrate(
-            binding.Id, binding.Tenant, binding.Project, binding.Wave, binding.Plan, binding.Part,
+            binding.Id, binding.Tenant, binding.Project, binding.Wave, binding.Entry, binding.Plan, binding.Part,
             binding.Execution, binding.Artifact, binding.PartKey, binding.OutputHash, binding.OutputSizeBytes,
             binding.Correlation, binding.CreatedAtUtc, binding.BindingHash);
 
@@ -114,17 +147,18 @@ public sealed class WavePartitionOutputBindingDomainTests
     }
 
     [Fact]
-    public void IsSameLogicalOutputAsIsTrueForTwoBindingsOfTheSameWaveAndExecutionRegardlessOfIdOrCorrelation()
+    public void IsSameLogicalOutputAsIsTrueForTwoBindingsOfTheSameWaveEntryAndExecutionRegardlessOfIdOrCorrelation()
     {
         var tenant = new TenantId(Guid.NewGuid());
         var project = new ProjectId(Guid.NewGuid());
         var wave = WaveId.New();
+        var entry = NewEntryId(wave);
         var execution = NewExecution(tenant, project);
 
         var first = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, wave, execution, CorrelationId.New(), Now);
+            WavePartitionOutputBindingId.New(), tenant, project, wave, entry, execution, CorrelationId.New(), Now);
         var second = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, wave, execution, CorrelationId.New(), Now.AddMinutes(1));
+            WavePartitionOutputBindingId.New(), tenant, project, wave, entry, execution, CorrelationId.New(), Now.AddMinutes(1));
 
         Assert.True(first.IsSameLogicalOutputAs(second));
     }
@@ -135,14 +169,15 @@ public sealed class WavePartitionOutputBindingDomainTests
         var tenant = new TenantId(Guid.NewGuid());
         var project = new ProjectId(Guid.NewGuid());
         var wave = WaveId.New();
+        var entry = NewEntryId(wave);
         var planHash = Hash("shared-plan-hash");
         var firstExecution = NewExecution(tenant, project, planHash);
         var secondExecution = NewExecution(tenant, project, planHash);
 
         var first = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, wave, firstExecution, CorrelationId.New(), Now);
+            WavePartitionOutputBindingId.New(), tenant, project, wave, entry, firstExecution, CorrelationId.New(), Now);
         var second = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, wave, secondExecution, CorrelationId.New(), Now);
+            WavePartitionOutputBindingId.New(), tenant, project, wave, entry, secondExecution, CorrelationId.New(), Now);
 
         Assert.False(first.IsSameLogicalOutputAs(second));
     }
@@ -152,12 +187,32 @@ public sealed class WavePartitionOutputBindingDomainTests
     {
         var tenant = new TenantId(Guid.NewGuid());
         var project = new ProjectId(Guid.NewGuid());
+        var firstWave = WaveId.New();
+        var secondWave = WaveId.New();
         var execution = NewExecution(tenant, project);
 
         var first = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, WaveId.New(), execution, CorrelationId.New(), Now);
+            WavePartitionOutputBindingId.New(), tenant, project, firstWave, NewEntryId(firstWave), execution, CorrelationId.New(), Now);
         var second = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, WaveId.New(), execution, CorrelationId.New(), Now);
+            WavePartitionOutputBindingId.New(), tenant, project, secondWave, NewEntryId(secondWave), execution, CorrelationId.New(), Now);
+
+        Assert.False(first.IsSameLogicalOutputAs(second));
+    }
+
+    [Fact]
+    public void IsSameLogicalOutputAsIsFalseWhenOnlyTheEntryDiffersForTheSameWaveAndExecution()
+    {
+        // AB-I5-013 item 4: mesmo output físico, mesma onda, mas apontando para uma entrada de destino
+        // diferente — reassignação ambígua, nunca convergência idempotente.
+        var tenant = new TenantId(Guid.NewGuid());
+        var project = new ProjectId(Guid.NewGuid());
+        var wave = WaveId.New();
+        var execution = NewExecution(tenant, project);
+
+        var first = WavePartitionOutputBinding.Create(
+            WavePartitionOutputBindingId.New(), tenant, project, wave, NewEntryId(wave, "mailbox-a"), execution, CorrelationId.New(), Now);
+        var second = WavePartitionOutputBinding.Create(
+            WavePartitionOutputBindingId.New(), tenant, project, wave, NewEntryId(wave, "mailbox-b"), execution, CorrelationId.New(), Now);
 
         Assert.False(first.IsSameLogicalOutputAs(second));
     }

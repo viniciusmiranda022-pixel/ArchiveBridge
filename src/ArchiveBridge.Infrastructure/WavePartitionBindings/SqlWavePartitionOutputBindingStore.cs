@@ -25,8 +25,8 @@ public sealed class SqlWavePartitionOutputBindingStore(TenantConnectionFactory c
     private const string CanonicalIndexName = "UX_wpob_canonical";
 
     private const string Columns =
-        "binding_id, tenant_id, project_id, wave_id, plan_id, part_id, execution_id, artifact_id, part_key, " +
-        "output_hash, output_size_bytes, correlation_id, created_at_utc, binding_hash";
+        "binding_id, tenant_id, project_id, wave_id, entry_id, plan_id, part_id, execution_id, artifact_id, " +
+        "part_key, output_hash, output_size_bytes, correlation_id, created_at_utc, binding_hash";
 
     private const string FindCanonicalSql =
         $"""
@@ -52,14 +52,14 @@ public sealed class SqlWavePartitionOutputBindingStore(TenantConnectionFactory c
         """
         SET NOCOUNT ON;
         INSERT INTO dbo.wave_partition_output_bindings
-            (binding_id, tenant_id, project_id, wave_id, plan_id, part_id, execution_id, artifact_id, part_key,
-             output_hash, output_size_bytes, correlation_id, created_at_utc, binding_hash)
-        OUTPUT inserted.binding_id, inserted.tenant_id, inserted.project_id, inserted.wave_id, inserted.plan_id,
-               inserted.part_id, inserted.execution_id, inserted.artifact_id, inserted.part_key,
+            (binding_id, tenant_id, project_id, wave_id, entry_id, plan_id, part_id, execution_id, artifact_id,
+             part_key, output_hash, output_size_bytes, correlation_id, created_at_utc, binding_hash)
+        OUTPUT inserted.binding_id, inserted.tenant_id, inserted.project_id, inserted.wave_id, inserted.entry_id,
+               inserted.plan_id, inserted.part_id, inserted.execution_id, inserted.artifact_id, inserted.part_key,
                inserted.output_hash, inserted.output_size_bytes, inserted.correlation_id, inserted.created_at_utc,
                inserted.binding_hash
         VALUES
-            (@bindingId, @tenant, @project, @wave, @plan, @part, @execution, @artifact, @partKey,
+            (@bindingId, @tenant, @project, @wave, @entry, @plan, @part, @execution, @artifact, @partKey,
              @outputHash, @outputSize, @correlation, @createdAt, @bindingHash);
         """;
 
@@ -132,6 +132,7 @@ public sealed class SqlWavePartitionOutputBindingStore(TenantConnectionFactory c
         command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = binding.Tenant.Value });
         command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = binding.Project.Value });
         command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = binding.Wave.Value });
+        command.Parameters.Add(new SqlParameter("@entry", SqlDbType.Char, 64) { Value = binding.Entry.Value.Value });
         command.Parameters.Add(new SqlParameter("@plan", SqlDbType.UniqueIdentifier) { Value = binding.Plan.Value });
         command.Parameters.Add(new SqlParameter("@part", SqlDbType.UniqueIdentifier) { Value = binding.Part.Value });
         command.Parameters.Add(new SqlParameter("@execution", SqlDbType.UniqueIdentifier) { Value = binding.Execution.Value });
@@ -149,14 +150,15 @@ public sealed class SqlWavePartitionOutputBindingStore(TenantConnectionFactory c
         new TenantId(reader.GetGuid(1)),
         new ProjectId(reader.GetGuid(2)),
         new WaveId(reader.GetGuid(3)),
-        new PartitionPlanId(reader.GetGuid(4)),
-        new PartitionPlanPartId(reader.GetGuid(5)),
-        new PartitionExecutionId(reader.GetGuid(6)),
-        new ArtifactId(reader.GetGuid(7)),
-        new Sha256Hash(reader.GetString(8).TrimEnd()),
+        new WaveEntryId(new Sha256Hash(reader.GetString(4).TrimEnd())),
+        new PartitionPlanId(reader.GetGuid(5)),
+        new PartitionPlanPartId(reader.GetGuid(6)),
+        new PartitionExecutionId(reader.GetGuid(7)),
+        new ArtifactId(reader.GetGuid(8)),
         new Sha256Hash(reader.GetString(9).TrimEnd()),
-        reader.GetInt64(10),
-        new CorrelationId(reader.GetGuid(11)),
-        SqlJobMapping.ReadUtc(reader.GetDateTime(12)),
-        new Sha256Hash(reader.GetString(13).TrimEnd()));
+        new Sha256Hash(reader.GetString(10).TrimEnd()),
+        reader.GetInt64(11),
+        new CorrelationId(reader.GetGuid(12)),
+        SqlJobMapping.ReadUtc(reader.GetDateTime(13)),
+        new Sha256Hash(reader.GetString(14).TrimEnd()));
 }

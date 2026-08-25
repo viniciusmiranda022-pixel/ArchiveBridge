@@ -56,8 +56,9 @@ public sealed class PurviewUploadUseCaseTests
             PartitionExecutionId.New(), Scope.Tenant, Scope.Project, ArtifactId.New(), PartitionPlanId.New(), PartitionPlanPartId.New(),
             planHash, 1, PartitionPlanIdentity.ComputePartKey(planHash, 1), sourceHash, 4096, sourceHash, 4096, Executor,
             CorrelationId.New(), StartedAt, StartedAt.AddSeconds(5));
+        var entry = WaveEntryId.Derive(wave, new WaveEntry("C:\\pst\\mailbox.pst", "mailbox.pst", new ArchiveRef("mailbox@contoso.com"), 4096, 10));
         var binding = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), Scope.Tenant, Scope.Project, wave, execution, CorrelationId.New(), Now);
+            WavePartitionOutputBindingId.New(), Scope.Tenant, Scope.Project, wave, entry, execution, CorrelationId.New(), Now);
         return (binding, execution);
     }
 
@@ -273,6 +274,19 @@ public sealed class PurviewUploadUseCaseTests
         Assert.Equal(2, attempt.Evidence!.ExpectedFileCount);
         Assert.Equal(8192, attempt.Evidence.ExpectedTotalBytes);
         Assert.Equal(binary, attempt.Evidence.Binary);
+
+        // AB-I5-015: a manifestação por arquivo prova, item a item, exatamente QUAIS execuções foram
+        // transportadas — nome remoto/hash/tamanho derivados das MESMAS execuções despachadas, nunca de
+        // contadores agregados soltos.
+        Assert.Equal(2, attempt.Evidence.Manifest.Count);
+        foreach (var (binding, execution) in new[] { partA, partB })
+        {
+            var manifestItem = Assert.Single(attempt.Evidence.Manifest, item => item.Execution == execution.Id);
+            Assert.Equal(PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value, manifestItem.RemoteName.Value);
+            Assert.Equal(execution.OutputHash, manifestItem.OutputHash);
+            Assert.Equal(execution.OutputSizeBytes, manifestItem.ExpectedSizeBytes);
+            _ = binding; // apenas para desconstrução do par (Binding, Execution).
+        }
     }
 
     [Fact]

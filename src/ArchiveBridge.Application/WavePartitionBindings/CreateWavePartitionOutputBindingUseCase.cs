@@ -12,12 +12,22 @@ namespace ArchiveBridge.Application.WavePartitionBindings;
 
 /// <summary>
 /// Pedido de vínculo entre uma onda e um output de particionamento. Carrega SOMENTE identificadores OPACOS
-/// (<see cref="Wave"/>/<see cref="Plan"/>/<see cref="Part"/>) — nunca path físico, filename, hash ou
-/// tenant/project scope fornecido pelo chamador como autoridade (AB-I5-010 item 3); todos os dados
-/// canônicos são reidratados dos stores autorizados por este caso de uso.
+/// (<see cref="Wave"/>/<see cref="Entry"/>/<see cref="Plan"/>/<see cref="Part"/>) — nunca path físico,
+/// filename, hash ou tenant/project scope fornecido pelo chamador como autoridade (AB-I5-010 item 3);
+/// todos os dados canônicos são reidratados dos stores autorizados por este caso de uso.
+/// <see cref="Entry"/> (AB-I5-013 item 3) é a <see cref="WaveEntryId"/> OPACA da entrada planejada
+/// (mailbox/PST) à qual o output desta partição pertence — o chamador (operador/ferramenta que já sabe
+/// qual artefato de custódia corresponde a qual entrada da seleção) a obtém a partir de uma leitura prévia
+/// da onda; este caso de uso nunca a aceita como autoridade final: sempre a RESOLVE contra a seleção
+/// corrente da onda e recusa fail-closed uma entrada que não seja membro (item 3 "non-member entry").
 /// </summary>
 public sealed record CreateWavePartitionOutputBindingRequest(
-    TenantScope Scope, WaveId Wave, PartitionPlanId Plan, PartitionPlanPartId Part, CorrelationId Correlation);
+    TenantScope Scope,
+    WaveId Wave,
+    WaveEntryId Entry,
+    PartitionPlanId Plan,
+    PartitionPlanPartId Part,
+    CorrelationId Correlation);
 
 /// <summary>
 /// Cria (ou converge idempotentemente para) o vínculo canônico entre uma onda existente e uma execução de
@@ -57,10 +67,13 @@ public sealed class CreateWavePartitionOutputBindingUseCase(
 
     /// <summary>Cria (ou converge idempotentemente para) o vínculo.</summary>
     /// <exception cref="WavePartitionOutputBindingSourceNotFoundException">
-    /// Onda ou execução canônica inexistente/fora do escopo (causas deliberadamente indistinguíveis).
+    /// Onda, entrada (não-membro da seleção corrente) ou execução canônica inexistente/fora do escopo
+    /// (causas deliberadamente indistinguíveis).
     /// </exception>
     /// <exception cref="WavePartitionOutputBindingIncompatibleException">
-    /// Já existe um vínculo canônico para (wave, plano, parte) apontando para um output DIFERENTE.
+    /// Já existe um vínculo canônico para (wave, plano, parte) apontando para um output ou uma entrada
+    /// DIFERENTE, OU o artefato físico desta execução já está canonicamente vinculado a OUTRA entrada
+    /// nesta mesma onda (reassignação ambígua entre destinos — AB-I5-013 item 4).
     /// </exception>
     public async Task<WavePartitionOutputBinding> ExecuteAsync(
         CreateWavePartitionOutputBindingRequest request, CancellationToken cancellationToken)
@@ -73,12 +86,35 @@ public sealed class CreateWavePartitionOutputBindingUseCase(
             throw new WavePartitionOutputBindingSourceNotFoundException(SourceNotFoundMessage);
         }
 
+        // Item 3: a entrada é sempre RESOLVIDA server-side contra a seleção CORRENTE da onda — nunca
+        // aceita como autoridade só porque o caller a informou. Entrada não-membro é indistinguível de
+        // onda/execução inexistente (mesmo padrão anti-IDOR já usado neste caso de uso).
+        if (wave.Selection.ResolveEntry(request.Wave, request.Entry) is null)
+        {
+            throw new WavePartitionOutputBindingSourceNotFoundException(SourceNotFoundMessage);
+        }
+
         var execution = await _executions
             .FindCanonicalAsync(request.Scope, request.Plan, request.Part, cancellationToken)
             .ConfigureAwait(false);
         if (execution is null)
         {
             throw new WavePartitionOutputBindingSourceNotFoundException(SourceNotFoundMessage);
+        }
+
+        // Item 4: um artefato físico já canonicamente vinculado a OUTRA entrada, sob (plano, parte)
+        // DIFERENTES (ex.: replanejamento do mesmo artefato), nunca é silenciosamente reatribuído a um
+        // novo destino — múltiplos vínculos para a MESMA entrada são esperados (um PST grande dividido em
+        // várias partes, cada uma com seu próprio (plano, parte)); o que é vedado é o INVERSO: o mesmo
+        // artefato aparecendo sob duas entradas de destino distintas.
+        var waveBindings = await _bindings.ListForWaveAsync(request.Scope, request.Wave, cancellationToken).ConfigureAwait(false);
+        var conflictingArtifactBinding = waveBindings.FirstOrDefault(
+            existingBinding => existingBinding.Artifact == execution.Artifact && existingBinding.Entry != request.Entry);
+        if (conflictingArtifactBinding is not null)
+        {
+            throw new WavePartitionOutputBindingIncompatibleException(
+                "O artefato físico desta execução já está canonicamente vinculado a uma entrada de destino " +
+                "diferente nesta onda — reassignação ambígua recusada (fail-closed).");
         }
 
         for (var attempt = 0; attempt < MaxConvergenceAttempts; attempt++)
@@ -89,7 +125,7 @@ public sealed class CreateWavePartitionOutputBindingUseCase(
 
             var candidate = WavePartitionOutputBinding.Create(
                 WavePartitionOutputBindingId.New(), request.Scope.Tenant, request.Scope.Project, request.Wave,
-                execution, request.Correlation, _clock.UtcNow);
+                request.Entry, execution, request.Correlation, _clock.UtcNow);
 
             if (existing is not null)
             {
@@ -97,7 +133,8 @@ public sealed class CreateWavePartitionOutputBindingUseCase(
                 {
                     throw new WavePartitionOutputBindingIncompatibleException(
                         "Já existe um vínculo canônico para esta onda/plano/parte apontando para um output " +
-                        "de particionamento diferente — a evidência anterior nunca é substituída silenciosamente.");
+                        "de particionamento ou uma entrada de destino diferente — a evidência anterior nunca " +
+                        "é substituída silenciosamente.");
                 }
 
                 return existing;

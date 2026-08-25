@@ -137,8 +137,9 @@ public sealed class PurviewUploadDomainTests
             PartitionExecutionId.New(), tenant, project, ArtifactId.New(), PartitionPlanId.New(), PartitionPlanPartId.New(),
             planHash, 1, PartitionPlanIdentity.ComputePartKey(planHash, 1), sourceHash, 4096, sourceHash, 4096, Executor,
             CorrelationId.New(), StartedAt, StartedAt.AddSeconds(5));
+        var entry = WaveEntryId.Derive(wave, new WaveEntry("C:\\pst\\mailbox.pst", "mailbox.pst", new ArchiveRef("mailbox@contoso.com"), 4096, 10));
         return WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, wave, execution, CorrelationId.New(), StartedAt);
+            WavePartitionOutputBindingId.New(), tenant, project, wave, entry, execution, CorrelationId.New(), StartedAt);
     }
 
     [Fact]
@@ -202,5 +203,95 @@ public sealed class PurviewUploadDomainTests
 
         Assert.Throws<ArgumentException>(() =>
             PurviewUploadRequestIdentity.Compute([], Guid.NewGuid(), 1, binary, prefix));
+    }
+
+    // ---- PurviewUploadEvidence / manifestação por arquivo (AB-I5-015) ----
+
+    private static readonly PurviewRemoteUploadPrefix Prefix =
+        PurviewRemoteUploadPrefix.ForWave(new TenantId(Guid.NewGuid()), new ProjectId(Guid.NewGuid()), WaveId.New());
+
+    private static readonly AzCopyBinaryIdentity Binary = new("10.25.0", Hash("binary"));
+
+    private static PurviewUploadFileManifestItem ManifestItem(long sizeBytes = 4096) =>
+        new(PartitionExecutionId.New(), PurviewRemotePstName.ForPart(ArtifactId.New(), 1), Hash("output-" + Guid.NewGuid()), sizeBytes);
+
+    [Fact]
+    public void EvidenceConstructionRejectsAnEmptyManifest()
+    {
+        Assert.Throws<ArgumentException>(() => new PurviewUploadEvidence(Binary, Prefix, []));
+    }
+
+    [Fact]
+    public void EvidenceConstructionRejectsAManifestWithMoreThanOneItemForTheSameExecution()
+    {
+        var execution = PartitionExecutionId.New();
+        var itemA = new PurviewUploadFileManifestItem(execution, PurviewRemotePstName.ForPart(ArtifactId.New(), 1), Hash("a"), 100);
+        var itemB = new PurviewUploadFileManifestItem(execution, PurviewRemotePstName.ForPart(ArtifactId.New(), 2), Hash("b"), 200);
+
+        Assert.Throws<ArgumentException>(() => new PurviewUploadEvidence(Binary, Prefix, [itemA, itemB]));
+    }
+
+    [Fact]
+    public void ManifestItemConstructionRejectsANegativeExpectedSize()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new PurviewUploadFileManifestItem(PartitionExecutionId.New(), PurviewRemotePstName.ForPart(ArtifactId.New(), 1), Hash("h"), -1));
+    }
+
+    [Fact]
+    public void ExpectedFileCountAndTotalBytesAreAlwaysDerivedFromTheManifest()
+    {
+        var itemA = ManifestItem(4096);
+        var itemB = ManifestItem(8192);
+
+        var evidence = new PurviewUploadEvidence(Binary, Prefix, [itemA, itemB]);
+
+        Assert.Equal(2, evidence.ExpectedFileCount);
+        Assert.Equal(12288, evidence.ExpectedTotalBytes);
+    }
+
+    [Fact]
+    public void ManifestIsCanonicallyOrderedByExecutionRegardlessOfConstructorInputOrder()
+    {
+        var itemA = ManifestItem();
+        var itemB = ManifestItem();
+        var expected = new[] { itemA, itemB }.OrderBy(item => item.Execution.Value).ToArray();
+
+        var forward = new PurviewUploadEvidence(Binary, Prefix, [itemA, itemB]);
+        var reversed = new PurviewUploadEvidence(Binary, Prefix, [itemB, itemA]);
+
+        Assert.Equal(expected.Select(item => item.Execution), forward.Manifest.Select(item => item.Execution));
+        Assert.Equal(expected.Select(item => item.Execution), reversed.Manifest.Select(item => item.Execution));
+        Assert.Equal(forward.ManifestHash, reversed.ManifestHash);
+    }
+
+    [Fact]
+    public void ManifestHashChangesWhenAnyItemFieldChanges()
+    {
+        var execution = PartitionExecutionId.New();
+        var baseline = new PurviewUploadEvidence(
+            Binary, Prefix,
+            [new PurviewUploadFileManifestItem(execution, PurviewRemotePstName.ForPart(ArtifactId.New(), 1), Hash("output"), 4096)]);
+
+        var differentRemoteName = new PurviewUploadEvidence(
+            Binary, Prefix,
+            [new PurviewUploadFileManifestItem(execution, PurviewRemotePstName.ForPart(ArtifactId.New(), 2), Hash("output"), 4096)]);
+        var differentHash = new PurviewUploadEvidence(
+            Binary, Prefix,
+            [new PurviewUploadFileManifestItem(
+                execution, PurviewRemotePstName.ForPart(ArtifactId.New(), 1), Hash("different-output"), 4096)]);
+        var differentSize = new PurviewUploadEvidence(
+            Binary, Prefix,
+            [new PurviewUploadFileManifestItem(execution, PurviewRemotePstName.ForPart(ArtifactId.New(), 1), Hash("output"), 8192)]);
+
+        Assert.NotEqual(baseline.ManifestHash, differentRemoteName.ManifestHash);
+        Assert.NotEqual(baseline.ManifestHash, differentHash.ManifestHash);
+        Assert.NotEqual(baseline.ManifestHash, differentSize.ManifestHash);
+    }
+
+    [Fact]
+    public void ManifestHashComputationRejectsAnEmptyItemSet()
+    {
+        Assert.Throws<ArgumentException>(() => PurviewUploadFileManifestHash.Compute([]));
     }
 }

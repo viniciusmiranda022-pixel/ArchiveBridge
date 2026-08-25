@@ -1,0 +1,576 @@
+using System.Data;
+using System.Text;
+using ArchiveBridge.Application.TargetIngestion.Purview;
+using ArchiveBridge.Application.TargetIngestion.Purview.MappingCsv;
+using ArchiveBridge.Application.WavePartitionBindings;
+using ArchiveBridge.Contracts.Abstractions;
+using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Contracts.Mapping;
+using ArchiveBridge.Contracts.PstProcessing;
+using ArchiveBridge.Contracts.TargetIngestion.Purview;
+using ArchiveBridge.Contracts.TargetIngestion.Purview.Upload;
+using ArchiveBridge.Domain.Common;
+using ArchiveBridge.Domain.Mapping;
+using ArchiveBridge.Domain.PstProcessing;
+using ArchiveBridge.Domain.TargetIngestion.Purview;
+using ArchiveBridge.Domain.TargetIngestion.Purview.MappingCsv;
+using ArchiveBridge.Domain.TargetIngestion.Purview.Upload;
+using ArchiveBridge.Domain.Waves;
+using ArchiveBridge.Domain.WavePartitionBindings;
+using ArchiveBridge.Infrastructure.Mapping;
+using ArchiveBridge.Infrastructure.TargetIngestion.Purview;
+using ArchiveBridge.Infrastructure.TargetIngestion.Purview.MappingCsv;
+using ArchiveBridge.Infrastructure.TargetIngestion.Purview.Upload;
+using ArchiveBridge.Infrastructure.Time;
+using ArchiveBridge.Infrastructure.WavePartitionBindings;
+using ArchiveBridge.Integration.Tests.Support;
+using Microsoft.Data.SqlClient;
+using Xunit;
+
+namespace ArchiveBridge.Integration.Tests;
+
+/// <summary>
+/// AB-I5-012 (SQL Server real) — o builder do mapping CSV do Purview de ponta a ponta: resolução de
+/// evidência canônica (vínculo + execução + precheck de mailbox + upload verificado), geração/persistência
+/// versionada com o protocolo recuperável em duas fases, idempotência sob reaproveitamento, nova versão
+/// sob mudança real de evidência, isolamento cross-project (RLS/anti-IDOR) e download por referência
+/// opaca com revalidação de hash contra a evidência SQL.
+/// </summary>
+[Collection(SqlServerCollectionDefinition.Name)]
+public sealed class PurviewMappingCsvIntegrationTests(SqlServerFixture fixture)
+{
+    private static readonly SystemClock Clock = new();
+
+    private SqlWavePartitionOutputBindingStore Bindings() => new(fixture.Factory);
+
+    private SqlPurviewUploadRequestStore UploadRequests() => new(fixture.Factory, Clock);
+
+    private SqlPurviewUploadAttemptStore UploadAttempts() => new(fixture.Factory);
+
+    private SqlMailboxPrecheckStore Prechecks() => new(fixture.Factory);
+
+    private SqlPurviewMappingCsvStore MappingStore() => new(fixture.Factory, Clock);
+
+    private FileSystemMappingArtifactStore Artifacts() =>
+        new(Path.Combine(fixture.ArtifactRoot, "purview-mapping-" + Guid.NewGuid().ToString("N")));
+
+    private CreateWavePartitionOutputBindingUseCase BindingUseCase() => BindingUseCase(Clock);
+
+    /// <summary>
+    /// Mesmo caso de uso, com o relógio informado — usado quando o teste precisa controlar
+    /// deterministicamente o <c>created_at_utc</c> persistido de um vínculo (ex.: reproduzir um empate
+    /// REAL entre dois vínculos sem violar o hash de integridade, já que <c>createdAtUtc</c> participa do
+    /// <c>BindingHash</c> calculado em <see cref="WavePartitionOutputBinding.Create"/>).
+    /// </summary>
+    private CreateWavePartitionOutputBindingUseCase BindingUseCase(IClock clock) =>
+        new(Slice2Support.WaveStore(fixture), Slice4bPstProcessingSupport.ExecutionStore(fixture), Bindings(), clock);
+
+    /// <summary>Relógio fixo — usado para forçar deterministicamente o mesmo instante entre vínculos.</summary>
+    private sealed class FixedClock(DateTimeOffset now) : IClock
+    {
+        public DateTimeOffset UtcNow => now;
+    }
+
+    private ResolvePurviewMappingEvidenceUseCase EvidenceResolver() => new(
+        Slice2Support.WaveStore(fixture), Bindings(), Slice4bPstProcessingSupport.ExecutionStore(fixture),
+        UploadRequests(), UploadAttempts(), Prechecks());
+
+    private GeneratePurviewMappingCsvUseCase GenerateUseCase(FileSystemMappingArtifactStore artifacts) =>
+        new(EvidenceResolver(), MappingStore(), artifacts, Clock);
+
+    /// <summary>Registra/inspeciona/planeja/executa um PST real e devolve a execução canônica resultante.</summary>
+    private async Task<PartitionExecutionRecord> RegisterAndExecuteAsync(TenantScope scope, string name)
+    {
+        var bytes = Slice4bPstProcessingSupport.ValidUnicodeHeader();
+        var relative = Slice4bPstProcessingSupport.WriteFile(fixture, name, bytes);
+        var artifact = await Slice4bPstProcessingSupport.CustodyStore(fixture).RegisterAsync(
+            scope.Tenant, scope.Project, new PstRelativePath(relative), DeterministicHash.ComputeBytes(bytes), bytes.Length,
+            CancellationToken.None);
+        await Slice4bPstProcessingSupport.UseCase(fixture).ExecuteAsync(scope, artifact.Id, CorrelationId.New(), CancellationToken.None);
+        var plan = await Slice4bPstProcessingSupport.PlanUseCase(fixture).ExecuteAsync(scope, artifact.Id, CorrelationId.New(), CancellationToken.None);
+        return await Slice4bPstProcessingSupport.ExecuteUseCase(fixture).ExecuteAsync(scope, plan.Id, CorrelationId.New(), CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Persiste o precheck de mailbox com o status de archive informado (identidade já resolvida pela
+    /// entrada). A próxima versão é derivada do vigente (mesma regra de <c>SubmitMailboxPrecheckUseCase</c>:
+    /// <c>(latest?.Version ?? 0) + 1</c>) para que chamadas repetidas com conteúdo REAL diferente produzam
+    /// versões sucessivas em vez de colidir com a versão 1 já persistida (o store é append-only e recusa
+    /// fail-closed uma reescrita de versão já ocupada com conteúdo divergente).
+    /// </summary>
+    private async Task SeedPrecheckAsync(TenantScope scope, WaveEntry entry, MailboxArchiveStatus status)
+    {
+        var latest = await Prechecks().GetLatestAsync(scope, entry.Archive.Identity, CancellationToken.None);
+        var nextVersion = (latest?.Version ?? 0) + 1;
+        var snapshot = MailboxPrecheckSnapshot.Observe(
+            PrecheckSnapshotId.New(), scope.Tenant, scope.Project, entry.Archive, nextVersion,
+            exchangeGuid: Guid.NewGuid(), archiveGuid: status == MailboxArchiveStatus.Active ? Guid.NewGuid() : null,
+            status, "UserMailbox", autoExpandingArchiveEnabled: false, litigationHoldEnabled: false, retentionHoldEnabled: false,
+            archiveItemCount: 10, archiveTotalSizeBytes: 4096, observedAvailableBytes: 100_000_000_000,
+            DateTimeOffset.UtcNow, CorrelationId.New(), DateTimeOffset.UtcNow);
+        await Prechecks().AppendAsync(snapshot, CancellationToken.None);
+    }
+
+    /// <summary>A manifestação canônica (AB-I5-015) de UMA execução — a MESMA regra usada pelo upload real.</summary>
+    private static PurviewUploadFileManifestItem CanonicalManifestItem(PartitionExecutionRecord execution) =>
+        new(execution.Id, PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence), execution.OutputHash, execution.OutputSizeBytes);
+
+    /// <summary>Marca o upload da onda como verificado (Uploaded) com a manifestação exatamente coerente com os vínculos informados.</summary>
+    private Task MarkUploadVerifiedAsync(TenantScope scope, MigrationWave wave, IReadOnlyList<PartitionExecutionRecord> executions) =>
+        MarkUploadVerifiedWithManifestAsync(scope, wave, [.. executions.Select(CanonicalManifestItem)]);
+
+    /// <summary>Marca o upload da onda como verificado (Uploaded) com a manifestação EXATA informada (permite cenários de drift/tampering).</summary>
+    private async Task MarkUploadVerifiedWithManifestAsync(
+        TenantScope scope, MigrationWave wave, IReadOnlyList<PurviewUploadFileManifestItem> manifest)
+    {
+        var enqueue = await UploadRequests().EnqueueIdempotentAsync(scope, wave.Id, CorrelationId.New(), CancellationToken.None);
+        var jobs = new ArchiveBridge.Infrastructure.Jobs.SqlJobStore(fixture.Factory, Clock, agingInterval: TimeSpan.FromSeconds(30));
+        var claimed = await jobs.TryClaimNextAsync(
+            new ArchiveBridge.Contracts.Jobs.ClaimRequest(
+                scope, ArchiveBridge.Domain.IdentityAndAccess.Workload.Upload, new ArchiveBridge.Domain.Jobs.WorkerId("test-worker"),
+                TimeSpan.FromMinutes(5), CorrelationId.New()),
+            CancellationToken.None);
+        Assert.NotNull(claimed);
+        var fence = new JobFence(scope, claimed!.JobId, new ArchiveBridge.Domain.Jobs.WorkerId("test-worker"), claimed.Epoch);
+
+        var now = Clock.UtcNow;
+        var evidence = new PurviewUploadEvidence(
+            new AzCopyBinaryIdentity("10.25.0", new Sha256Hash(new string('a', 64))),
+            PurviewRemoteUploadPrefix.ForWave(scope.Tenant, scope.Project, wave.Id), manifest);
+        var record = new PurviewUploadAttemptRecord(
+            enqueue.RequestId, PurviewUploadAttemptId.New(), AttemptNumber: 1, new Sha256Hash(new string('b', 64)),
+            PurviewUploadAttemptOutcome.Uploaded, BlockingReason: null, evidence, ProcessExitCode: 0, now, now);
+        await UploadAttempts().AppendAsync(scope, record, fence, CancellationToken.None);
+    }
+
+    /// <summary>Constrói o cenário completo e verificado (onda aprovada, 1 entrada, PST executado, vínculo, upload verificado, precheck Active).</summary>
+    private async Task<(TenantScope Scope, MigrationWave Wave, WaveEntry Entry, PartitionExecutionRecord Execution)> SeedVerifiedSingleEntryWaveAsync(
+        string name, string mailbox, MailboxArchiveStatus precheckStatus = MailboxArchiveStatus.Active)
+    {
+        var scope = SqlServerFixture.NewScope();
+        await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
+
+        var execution = await RegisterAndExecuteAsync(scope, name);
+        var entry = Slice2Support.Entry(name, mailbox, execution.OutputSizeBytes);
+        var wave = Slice2Support.Approve(Slice2Support.NewWave(scope, new WaveSelection([entry])));
+        await Slice2Support.WaveStore(fixture).AddAsync(wave, CorrelationId.New(), CancellationToken.None);
+
+        await BindingUseCase().ExecuteAsync(
+            new CreateWavePartitionOutputBindingRequest(
+                scope, wave.Id, WaveEntryId.Derive(wave.Id, entry), execution.Plan, execution.Part, CorrelationId.New()),
+            CancellationToken.None);
+
+        await SeedPrecheckAsync(scope, entry, precheckStatus);
+        await MarkUploadVerifiedAsync(scope, wave, [execution]);
+
+        return (scope, wave, entry, execution);
+    }
+
+    [Fact]
+    public async Task GenerateProducesAUsableVersionWithTheExpectedRowDerivedFromRealUploadAndPrecheckEvidence()
+    {
+        var (scope, wave, entry, execution) = await SeedVerifiedSingleEntryWaveAsync(
+            "e2e-happy.pst", "alice-happy@contoso.com", MailboxArchiveStatus.Active);
+        var artifacts = Artifacts();
+
+        var outcome = await GenerateUseCase(artifacts).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+
+        Assert.True(outcome.Regenerated);
+        Assert.Equal(1, outcome.Document.RowCount);
+
+        var text = Encoding.UTF8.GetString(outcome.Document.Bytes);
+        var dataLine = text.Split("\r\n", StringSplitOptions.RemoveEmptyEntries)[1];
+        var fields = dataLine.Split(',');
+        Assert.Equal("Exchange", fields[0]);
+        Assert.Equal(PurviewRemoteUploadPrefix.ForWave(scope.Tenant, scope.Project, wave.Id).WaveSegment, fields[1]);
+        Assert.Equal(PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value, fields[2]);
+        Assert.Equal("alice-happy@contoso.com", fields[3]);
+        Assert.Equal("TRUE", fields[4]);
+        Assert.Equal(wave.TargetRootFolder.Value, fields[5]);
+        Assert.Equal(string.Empty, fields[6]);
+
+        var usable = await MappingStore().GetUsableAsync(scope, wave.Id, CancellationToken.None);
+        Assert.NotNull(usable);
+        Assert.Equal(outcome.Version.ContentSha256, usable!.ContentSha256);
+        Assert.Equal(MappingVersionStatus.Usable, usable.Status);
+    }
+
+    [Fact]
+    public async Task IsArchiveIsFalseWhenTheMailboxPrecheckDoesNotComproveAnActiveArchive()
+    {
+        var (scope, wave, _, _) = await SeedVerifiedSingleEntryWaveAsync(
+            "e2e-inactive.pst", "bob-inactive@contoso.com", MailboxArchiveStatus.Disabled);
+        var artifacts = Artifacts();
+
+        var outcome = await GenerateUseCase(artifacts).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+
+        var text = Encoding.UTF8.GetString(outcome.Document.Bytes);
+        var dataLine = text.Split("\r\n", StringSplitOptions.RemoveEmptyEntries)[1];
+        Assert.Equal("FALSE", dataLine.Split(',')[4]);
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenTheWaveHasNoCanonicalBindingsYet()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
+        var wave = Slice2Support.Approve(Slice2Support.NewWave(
+            scope, new WaveSelection([Slice2Support.Entry("no-binding.pst", "nobinding@contoso.com", 4096)])));
+        await Slice2Support.WaveStore(fixture).AddAsync(wave, CorrelationId.New(), CancellationToken.None);
+
+        await Assert.ThrowsAsync<PurviewMappingCsvGenerationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenTheUploadWasNeverRequestedForTheWave()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
+        var execution = await RegisterAndExecuteAsync(scope, "e2e-no-upload.pst");
+        var entry = Slice2Support.Entry("e2e-no-upload.pst", "noupload@contoso.com", execution.OutputSizeBytes);
+        var wave = Slice2Support.Approve(Slice2Support.NewWave(scope, new WaveSelection([entry])));
+        await Slice2Support.WaveStore(fixture).AddAsync(wave, CorrelationId.New(), CancellationToken.None);
+        await BindingUseCase().ExecuteAsync(
+            new CreateWavePartitionOutputBindingRequest(
+                scope, wave.Id, WaveEntryId.Derive(wave.Id, entry), execution.Plan, execution.Part, CorrelationId.New()),
+            CancellationToken.None);
+        await SeedPrecheckAsync(scope, entry, MailboxArchiveStatus.Active);
+
+        await Assert.ThrowsAsync<PurviewMappingCsvGenerationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenTheVerifiedUploadEvidenceHasDriftedFromTheCurrentBindings()
+    {
+        // Onda com DOIS PSTs vinculados, mas a evidência de upload verificada só cobre UM (drift real:
+        // ex. um novo vínculo foi criado depois do upload verificado) — recusado fail-closed.
+        var scope = SqlServerFixture.NewScope();
+        await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
+
+        var executionA = await RegisterAndExecuteAsync(scope, "drift-a.pst");
+        var executionB = await RegisterAndExecuteAsync(scope, "drift-b.pst");
+        var entryA = Slice2Support.Entry("drift-a.pst", "drift-a@contoso.com", executionA.OutputSizeBytes);
+        var entryB = Slice2Support.Entry("drift-b.pst", "drift-b@contoso.com", executionB.OutputSizeBytes);
+        var wave = Slice2Support.Approve(Slice2Support.NewWave(scope, new WaveSelection([entryA, entryB])));
+        await Slice2Support.WaveStore(fixture).AddAsync(wave, CorrelationId.New(), CancellationToken.None);
+
+        await BindingUseCase().ExecuteAsync(
+            new CreateWavePartitionOutputBindingRequest(
+                scope, wave.Id, WaveEntryId.Derive(wave.Id, entryA), executionA.Plan, executionA.Part, CorrelationId.New()),
+            CancellationToken.None);
+        await SeedPrecheckAsync(scope, entryA, MailboxArchiveStatus.Active);
+        await SeedPrecheckAsync(scope, entryB, MailboxArchiveStatus.Active);
+
+        // Evidência de upload verificada cobre SOMENTE o binding A (1 arquivo) — coerente no momento do upload.
+        await MarkUploadVerifiedAsync(scope, wave, [executionA]);
+
+        // Um SEGUNDO vínculo é criado DEPOIS do upload verificado (cenário de drift real).
+        await BindingUseCase().ExecuteAsync(
+            new CreateWavePartitionOutputBindingRequest(
+                scope, wave.Id, WaveEntryId.Derive(wave.Id, entryB), executionB.Plan, executionB.Part, CorrelationId.New()),
+            CancellationToken.None);
+
+        await Assert.ThrowsAsync<PurviewMappingCsvGenerationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
+    /// <summary>
+    /// Onda aprovada com DOIS PSTs vinculados e prechecks Active — o teste decide a manifestação
+    /// verificada. Os dois vínculos são criados com o <paramref name="bindingClock"/> informado (o padrão
+    /// é o relógio real da suíte); um teste pode informar um relógio fixo para que ambos os vínculos
+    /// persistam com o MESMO <c>created_at_utc</c> — um empate REAL e íntegro (o hash é calculado com esse
+    /// mesmo instante em <see cref="WavePartitionOutputBinding.Create"/>), em vez de forçar o empate via
+    /// UPDATE direto no SQL depois da criação, o que quebraria o <c>binding_hash</c> tamper-evident.
+    /// </summary>
+    private async Task<(TenantScope Scope, MigrationWave Wave, PartitionExecutionRecord ExecutionA, PartitionExecutionRecord ExecutionB)>
+        SeedTwoEntryBoundWaveAsync(string prefix, IClock? bindingClock = null)
+    {
+        var scope = SqlServerFixture.NewScope();
+        await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
+
+        var executionA = await RegisterAndExecuteAsync(scope, $"{prefix}-a.pst");
+        var executionB = await RegisterAndExecuteAsync(scope, $"{prefix}-b.pst");
+        var entryA = Slice2Support.Entry($"{prefix}-a.pst", $"{prefix}-a@contoso.com", executionA.OutputSizeBytes);
+        var entryB = Slice2Support.Entry($"{prefix}-b.pst", $"{prefix}-b@contoso.com", executionB.OutputSizeBytes);
+        var wave = Slice2Support.Approve(Slice2Support.NewWave(scope, new WaveSelection([entryA, entryB])));
+        await Slice2Support.WaveStore(fixture).AddAsync(wave, CorrelationId.New(), CancellationToken.None);
+
+        var bindingUseCase = BindingUseCase(bindingClock ?? Clock);
+        await bindingUseCase.ExecuteAsync(
+            new CreateWavePartitionOutputBindingRequest(
+                scope, wave.Id, WaveEntryId.Derive(wave.Id, entryA), executionA.Plan, executionA.Part, CorrelationId.New()),
+            CancellationToken.None);
+        await bindingUseCase.ExecuteAsync(
+            new CreateWavePartitionOutputBindingRequest(
+                scope, wave.Id, WaveEntryId.Derive(wave.Id, entryB), executionB.Plan, executionB.Part, CorrelationId.New()),
+            CancellationToken.None);
+        await SeedPrecheckAsync(scope, entryA, MailboxArchiveStatus.Active);
+        await SeedPrecheckAsync(scope, entryB, MailboxArchiveStatus.Active);
+
+        return (scope, wave, executionA, executionB);
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenTheManifestHasTheSameAggregateCountAndBytesButSwappedPerFileIdentity()
+    {
+        // AB-I5-015 item 5: dois conjuntos DIFERENTES de PSTs que coincidam em quantidade e soma de bytes
+        // — cada item aqui referencia a EXECUÇÃO correta (mesma correlação binding<->entry), mas carrega o
+        // nome remoto/hash da OUTRA execução. A validação agregada antiga (contagem/soma) não detectaria
+        // isto; a correspondência exata 1:1 por item detecta.
+        var (scope, wave, executionA, executionB) = await SeedTwoEntryBoundWaveAsync("swap");
+        var swapped = new[]
+        {
+            new PurviewUploadFileManifestItem(
+                executionA.Id, PurviewRemotePstName.ForPart(executionB.Artifact, executionB.PartSequence),
+                executionB.OutputHash, executionA.OutputSizeBytes),
+            new PurviewUploadFileManifestItem(
+                executionB.Id, PurviewRemotePstName.ForPart(executionA.Artifact, executionA.PartSequence),
+                executionA.OutputHash, executionB.OutputSizeBytes),
+        };
+        await MarkUploadVerifiedWithManifestAsync(scope, wave, swapped);
+
+        await Assert.ThrowsAsync<PurviewMappingCsvGenerationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenTheManifestHasAnExtraItemNotBelongingToAnyCurrentBinding()
+    {
+        var (scope, wave, executionA, executionB) = await SeedTwoEntryBoundWaveAsync("extra");
+        var manifest = new[]
+        {
+            CanonicalManifestItem(executionA),
+            CanonicalManifestItem(executionB),
+            new PurviewUploadFileManifestItem(
+                PartitionExecutionId.New(), PurviewRemotePstName.ForPart(ArtifactId.New(), 1), new Sha256Hash(new string('9', 64)), 4096),
+        };
+        await MarkUploadVerifiedWithManifestAsync(scope, wave, manifest);
+
+        await Assert.ThrowsAsync<PurviewMappingCsvGenerationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenTheManifestReferencesAnExecutionNeverBoundToTheWave()
+    {
+        var (scope, wave, executionA, executionB) = await SeedTwoEntryBoundWaveAsync("wrongexec");
+        var manifest = new[]
+        {
+            CanonicalManifestItem(executionA),
+            // Item com uma execução TOTALMENTE alheia à onda no lugar da execução B realmente vinculada —
+            // a contagem ainda bate (2), mas o binding de B não encontra correspondência na manifestação.
+            new PurviewUploadFileManifestItem(
+                PartitionExecutionId.New(), PurviewRemotePstName.ForPart(executionB.Artifact, executionB.PartSequence),
+                executionB.OutputHash, executionB.OutputSizeBytes),
+        };
+        await MarkUploadVerifiedWithManifestAsync(scope, wave, manifest);
+
+        await Assert.ThrowsAsync<PurviewMappingCsvGenerationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GenerateProducesTheSameCsvBytesAndHashAcrossRepeatedSqlReadsWhenBindingsShareTheSameCreatedAtUtc()
+    {
+        // AB-I5-016: SqlWavePartitionOutputBindingStore.ListForWaveAsync ordena SOMENTE por
+        // created_at_utc (DATETIME2(3)). Dois vínculos persistidos com o MESMO instante (empate real) não
+        // têm ordem relativa garantida pelo SQL Server entre leituras — o mapping precisa continuar
+        // produzindo o MESMO CSV/hash mesmo assim, porque o Domain canonicaliza por Name antes de
+        // serializar, nunca por CreatedAtUtc/ordem de leitura. O empate é produzido com um relógio FIXO
+        // injetado nos dois `Create` (em vez de um UPDATE direto pós-criação): `createdAtUtc` participa do
+        // `BindingHash` tamper-evident (WavePartitionOutputBinding.Rehydrate), então adulterar a coluna
+        // depois de persistida faria o próprio invariante de integridade recusar a leitura fail-closed —
+        // exatamente o comportamento correto que este teste não quer exercitar.
+        var tiedInstant = new FixedClock(new DateTimeOffset(2026, 8, 25, 12, 0, 0, TimeSpan.Zero));
+        var (scope, wave, executionA, executionB) = await SeedTwoEntryBoundWaveAsync("tie", tiedInstant);
+        await MarkUploadVerifiedAsync(scope, wave, [executionA, executionB]);
+
+        var bindings = await Bindings().ListForWaveAsync(scope, wave.Id, CancellationToken.None);
+        Assert.Equal(2, bindings.Count);
+        Assert.Equal(bindings[0].CreatedAtUtc, bindings[1].CreatedAtUtc); // empate real confirmado.
+
+        // Cada chamada relê SQL do zero (evidenceResolver + bindings store) — nenhuma reaproveita um
+        // resultado em memória do lado do teste — antes de decidir se reaproveita a versão persistida. O
+        // artifact store, porém, precisa ser o MESMO nas três chamadas: em produção ele representa um
+        // único local de armazenamento persistente entre requisições; `Artifacts()` cria um diretório novo
+        // e vazio a cada chamada, o que faria a 2ª/3ª leitura nunca enxergar o artefato publicado pela 1ª e
+        // disparar o fail-closed de "versão utilizável sem artefato persistido" — um falso positivo do
+        // teste, não uma inconsistência real de evidência.
+        var artifacts = Artifacts();
+        var first = await GenerateUseCase(artifacts).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var second = await GenerateUseCase(artifacts).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var third = await GenerateUseCase(artifacts).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+
+        Assert.Equal(2, first.Document.RowCount);
+        Assert.True(first.Regenerated);
+        Assert.False(second.Regenerated); // mesma evidência/fingerprint: reaproveita, nunca gera bytes divergentes.
+        Assert.False(third.Regenerated);
+        Assert.Equal(first.Document.Bytes, second.Document.Bytes);
+        Assert.Equal(first.Document.Bytes, third.Document.Bytes);
+        Assert.Equal(first.Document.ContentSha256, second.Document.ContentSha256);
+        Assert.Equal(first.Document.ContentSha256, third.Document.ContentSha256);
+        Assert.Equal(first.Version.Version, second.Version.Version);
+        Assert.Equal(first.Version.Version, third.Version.Version);
+
+        var count = await CountAsync(scope, "SELECT COUNT(*) FROM dbo.purview_mapping_csv_versions WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+        Assert.Equal(1, count); // nenhuma versão espúria criada por instabilidade de ordenação.
+    }
+
+    [Fact]
+    public async Task ARepeatedGenerationWithNoRealEvidenceChangeReusesTheSameVersionWithoutRegenerating()
+    {
+        var (scope, wave, _, _) = await SeedVerifiedSingleEntryWaveAsync("e2e-idempotent.pst", "idem@contoso.com");
+        var artifacts = Artifacts();
+        var useCase = GenerateUseCase(artifacts);
+
+        var first = await useCase.ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var second = await useCase.ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+
+        Assert.True(first.Regenerated);
+        Assert.False(second.Regenerated);
+        Assert.Equal(first.Version.Version, second.Version.Version);
+        Assert.Equal(first.Document.ContentSha256, second.Document.ContentSha256);
+
+        var count = await CountAsync(scope, "SELECT COUNT(*) FROM dbo.purview_mapping_csv_versions WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public async Task ARealChangeInMailboxPrecheckProducesANewVersionAndSupersedesThePrevious()
+    {
+        var (scope, wave, entry, _) = await SeedVerifiedSingleEntryWaveAsync(
+            "e2e-version-bump.pst", "bump@contoso.com", MailboxArchiveStatus.Disabled);
+        var artifacts = Artifacts();
+        var useCase = GenerateUseCase(artifacts);
+
+        var first = await useCase.ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        Assert.Equal(1, first.Version.Version.Value);
+
+        // Mudança REAL de evidência: o precheck agora comprova archive ativo — nova versão do snapshot.
+        await SeedPrecheckAsync(scope, entry, MailboxArchiveStatus.Active);
+        var second = await useCase.ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+
+        Assert.True(second.Regenerated);
+        Assert.Equal(2, second.Version.Version.Value);
+        Assert.NotEqual(first.Document.ContentSha256, second.Document.ContentSha256);
+
+        var usable = await MappingStore().GetUsableAsync(scope, wave.Id, CancellationToken.None);
+        Assert.NotNull(usable);
+        Assert.Equal(2, usable!.Version.Value);
+
+        var previous = await MappingStore().GetByVersionAsync(scope, wave.Id, first.Version.Version, CancellationToken.None);
+        Assert.NotNull(previous);
+        Assert.Equal(MappingVersionStatus.Superseded, previous!.Status); // preservada, nunca apagada.
+    }
+
+    [Fact]
+    public async Task GenerateFailsClosedWhenThePersistedFileManifestIsTamperedDirectlyInTheRow()
+    {
+        // AB-I5-015 item 2/6: tampering direto na manifestação persistida (fora do Domain/Application) é
+        // detectado no rehydrate da tentativa de upload — a geração do mapping nunca alcança um estado em
+        // que confiaria numa manifestação adulterada.
+        var (scope, wave, _, _) = await SeedVerifiedSingleEntryWaveAsync("e2e-manifest-tampered.pst", "manifest-tampered@contoso.com");
+
+        await TamperManifestOutputHashAsync(scope, wave.Id);
+
+        await Assert.ThrowsAsync<PurviewUploadAttemptIntegrityViolationException>(() =>
+            GenerateUseCase(Artifacts()).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+    }
+
+    private async Task TamperManifestOutputHashAsync(TenantScope scope, WaveId wave)
+    {
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+        await using (var context = new SqlCommand("EXEC sys.sp_set_session_context @key = N'tenant_id', @value = @tenant;", connection))
+        {
+            context.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+            await context.ExecuteNonQueryAsync();
+        }
+
+        await using var command = new SqlCommand(
+            """
+            UPDATE m SET m.output_hash = REPLICATE('0', 64)
+            FROM dbo.purview_upload_attempt_manifest_items AS m
+            JOIN dbo.purview_upload_attempts AS a ON a.attempt_id = m.attempt_id
+            JOIN dbo.purview_upload_requests AS r ON r.request_id = a.request_id
+            WHERE r.wave_id = @wave AND r.project_id = @project;
+            """,
+            connection);
+        command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        await command.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
+    public async Task DownloadReturnsTheExactBytesOfTheRequestedVersionAndFailsClosedForAnotherProject()
+    {
+        var (scope, wave, _, _) = await SeedVerifiedSingleEntryWaveAsync("e2e-download.pst", "download@contoso.com");
+        var artifacts = Artifacts();
+        var generated = await GenerateUseCase(artifacts).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+
+        var download = await new DownloadPurviewMappingCsvUseCase(MappingStore(), artifacts)
+            .ExecuteAsync(scope, wave.Id, generated.Version.Version, CancellationToken.None);
+        Assert.Equal(generated.Document.ContentSha256, download.Version.ContentSha256);
+        Assert.Equal(generated.Document.Bytes, download.Bytes);
+
+        var otherProjectScope = new TenantScope(scope.Tenant, new ArchiveBridge.Domain.Projects.ProjectId(Guid.NewGuid()));
+        await Assert.ThrowsAsync<PurviewMappingCsvSourceNotFoundException>(() =>
+            new DownloadPurviewMappingCsvUseCase(MappingStore(), artifacts)
+                .ExecuteAsync(otherProjectScope, wave.Id, generated.Version.Version, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task DownloadFailsClosedWhenTheSqlEvidenceHashDivergesFromThePublishedArtifact()
+    {
+        var (scope, wave, _, _) = await SeedVerifiedSingleEntryWaveAsync("e2e-download-tampered.pst", "tampered@contoso.com");
+        var artifacts = Artifacts();
+        var generated = await GenerateUseCase(artifacts).ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+
+        await TamperContentHashAsync(scope, wave.Id, generated.Version.Version.Value);
+
+        await Assert.ThrowsAsync<PurviewMappingCsvGenerationException>(() =>
+            new DownloadPurviewMappingCsvUseCase(MappingStore(), artifacts)
+                .ExecuteAsync(scope, wave.Id, generated.Version.Version, CancellationToken.None));
+    }
+
+    private async Task TamperContentHashAsync(TenantScope scope, WaveId wave, int version)
+    {
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+        await using (var context = new SqlCommand("EXEC sys.sp_set_session_context @key = N'tenant_id', @value = @tenant;", connection))
+        {
+            context.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+            await context.ExecuteNonQueryAsync();
+        }
+
+        await using var command = new SqlCommand(
+            "UPDATE dbo.purview_mapping_csv_versions SET content_sha256 = REPLICATE('0', 64) " +
+            "WHERE wave_id = @wave AND project_id = @project AND mapping_version = @version;",
+            connection);
+        command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        command.Parameters.Add(new SqlParameter("@version", SqlDbType.Int) { Value = version });
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task<int> CountAsync(TenantScope scope, string sql, params (string Name, object Value)[] parameters)
+    {
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+        await using (var context = new SqlCommand("EXEC sys.sp_set_session_context @key = N'tenant_id', @value = @tenant;", connection))
+        {
+            context.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+            await context.ExecuteNonQueryAsync();
+        }
+
+        await using var command = new SqlCommand(sql, connection);
+        foreach (var (name, value) in parameters)
+        {
+            command.Parameters.AddWithValue(name, value);
+        }
+
+        return (int)(await command.ExecuteScalarAsync())!;
+    }
+}
