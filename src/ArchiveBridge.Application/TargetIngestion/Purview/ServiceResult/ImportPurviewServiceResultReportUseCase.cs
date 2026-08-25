@@ -17,6 +17,10 @@ namespace ArchiveBridge.Application.TargetIngestion.Purview.ServiceResult;
 /// onda (<see cref="PurviewServiceResultCorrelation"/>) — nunca por ordem/posição/nome de arquivo.
 /// Idempotente pelo hash do conteúdo bruto: o MESMO relatório (byte a byte) sempre devolve a MESMA
 /// versão, sem reparsear/recorrelacionar (item 10); conteúdo realmente diferente produz uma nova versão.
+/// A guarda de drift (<see cref="PurviewImportJobEvidenceGuard"/>) é revalidada em TODA chamada, inclusive
+/// no caminho de replay idempotente (AB-I6-003 Blocker 1): reenviar o MESMO relatório byte a byte depois
+/// que a cadeia canônica sofreu drift real (binding/execution/upload/mapping) nunca é aceito como replay
+/// válido — falha fechado igual a uma importação nova.
 /// </summary>
 public sealed class ImportPurviewServiceResultReportUseCase(
     ResolvePurviewMappingEvidenceUseCase evidenceResolver,
@@ -48,18 +52,23 @@ public sealed class ImportPurviewServiceResultReportUseCase(
             ?? throw new PurviewImportJobSourceNotFoundException(
                 "Plano de import job inexistente/fora do escopo autorizado (fail-closed).");
 
+        // AB-I6-003 Blocker 1: a guarda de drift roda SEMPRE, ANTES do atalho de replay idempotente —
+        // nunca depois. Reenviar o mesmo conteúdo depois de drift real na cadeia canônica deve falhar
+        // fechado exatamente como uma importação nova falharia, nunca convergir silenciosamente para a
+        // evidência antiga.
+        var check = await PurviewImportJobEvidenceGuard
+            .ResolveAndVerifyNoDriftAsync(_evidenceResolver, _mappings, scope, waveId, cancellationToken)
+            .ConfigureAwait(false);
+
         var contentHash = DeterministicHash.ComputeBytes(rawReportBytes.Span);
         var existing = await _reports.GetByContentHashAsync(scope, waveId, plannedJobName, contentHash, cancellationToken).ConfigureAwait(false);
         if (existing is not null)
         {
-            // Replay idempotente: o MESMO conteúdo bruto já foi importado — nunca reparseia/recorrelaciona
-            // (item 10), apenas devolve a evidência já persistida.
+            // Replay idempotente: o MESMO conteúdo bruto já foi importado E a cadeia canônica acabou de
+            // ser revalidada sem drift acima — nunca reparseia/recorrelaciona (item 10), apenas devolve a
+            // evidência já persistida.
             return existing;
         }
-
-        var check = await PurviewImportJobEvidenceGuard
-            .ResolveAndVerifyNoDriftAsync(_evidenceResolver, _mappings, scope, waveId, cancellationToken)
-            .ConfigureAwait(false);
 
         var parseResult = PurviewServiceResultReportParser.Parse(rawReportBytes);
         _ = PurviewServiceResultCorrelation.Correlate(check.CanonicalRemoteNames, parseResult.Rows, parseResult.DeclaredTotalRows.HasValue);

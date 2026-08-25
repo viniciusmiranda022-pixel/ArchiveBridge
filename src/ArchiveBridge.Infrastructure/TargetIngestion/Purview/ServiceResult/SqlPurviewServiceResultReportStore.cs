@@ -14,20 +14,31 @@ namespace ArchiveBridge.Infrastructure.TargetIngestion.Purview.ServiceResult;
 
 /// <summary>
 /// Persistência das versões do validation report / service result do Purview e das suas linhas
-/// normalizadas (AB-I6-001 itens 6/9-10). <see cref="PersistAsync"/> aloca a próxima
-/// <c>report_version</c> sob lock e insere, na MESMA transação curta, os metadados de evidência, o
-/// conteúdo bruto (custódia) e as linhas filhas — nunca em transações separadas (nunca existe uma versão
-/// "parcial" visível). <see cref="GetRowsAsync"/> revalida o hash agregado das linhas contra
-/// <c>rows_sha256</c> na leitura (fail-closed sob tampering). RLS por SESSION_CONTEXT.
+/// normalizadas (AB-I6-001 itens 6/9-10). <see cref="PersistAsync"/> locka TODAS as versões existentes do
+/// plano sob a MESMA transação e decide, sob esse lock, tanto a próxima <c>report_version</c> QUANTO se
+/// alguma versão já existente converge pelo MESMO <c>content_sha256</c> — chamadas concorrentes
+/// byte-idênticas sempre convergem para a MESMA versão, nunca alocam versões duplicadas para o mesmo
+/// conteúdo (AB-I6-003 Blocker 3) — e insere, na MESMA transação curta, os metadados de evidência, o
+/// conteúdo bruto (custódia) e as linhas filhas quando não há convergência — nunca em transações separadas
+/// (nunca existe uma versão "parcial" visível). Toda leitura que trata uma versão persistida como evidência
+/// canônica (replay, latest, versão específica) revalida os bytes REALMENTE persistidos de
+/// <c>raw_content</c> contra <c>raw_size_bytes</c>/<c>content_sha256</c> (AB-I6-003 Blocker 2), além do
+/// hash agregado das linhas contra <c>rows_sha256</c> em <see cref="GetRowsAsync"/> (fail-closed sob
+/// tampering). RLS por SESSION_CONTEXT.
 /// </summary>
 public sealed class SqlPurviewServiceResultReportStore(TenantConnectionFactory connectionFactory) : IPurviewServiceResultReportStore
 {
     private const string ResolveAttemptSequenceSql =
         "SELECT attempt_sequence FROM dbo.purview_import_job_plans WHERE wave_id = @wave AND project_id = @project AND planned_job_name = @name;";
 
+    // raw_content é sempre a ÚLTIMA coluna: toda leitura que trata a versão persistida como evidência
+    // canônica (replay por content hash, latest para completeness, versão específica para GetRowsAsync)
+    // revalida os bytes REALMENTE persistidos contra raw_size_bytes/content_sha256 (AB-I6-003 Blocker 2) —
+    // evidence_hash NÃO cobre o conteúdo bruto em si (só o hash dele), então adulterar raw_content sem
+    // tocar content_sha256/raw_size_bytes não seria detectado sem esta revalidação.
     private const string EvidenceColumns =
         "wave_id, attempt_sequence, report_version, tenant_id, project_id, content_sha256, rows_sha256, raw_size_bytes, " +
-        "row_count, declared_total_rows, uploaded_by, created_at_utc, evidence_hash";
+        "row_count, declared_total_rows, uploaded_by, created_at_utc, evidence_hash, raw_content";
 
     private const string GetByContentHashSql =
         $"""
@@ -48,9 +59,19 @@ public sealed class SqlPurviewServiceResultReportStore(TenantConnectionFactory c
         WHERE wave_id = @wave AND attempt_sequence = @attempt AND project_id = @project AND report_version = @version;
         """;
 
-    private const string LockedMaxVersionSql =
-        "SELECT ISNULL(MAX(report_version), 0) FROM dbo.purview_service_result_report_versions WITH (UPDLOCK, HOLDLOCK) " +
-        "WHERE wave_id = @wave AND attempt_sequence = @attempt AND project_id = @project;";
+    // AB-I6-003 Blocker 3: locka TODAS as versões existentes deste plano (mesmo predicado/força de lock da
+    // antiga SELECT MAX) para servir DUAS decisões sob a MESMA seção crítica: (a) a próxima
+    // report_version a alocar SE nenhuma versão convergir, e (b) se alguma versão JÁ existente tem o
+    // MESMO content_sha256 do conteúdo desta chamada — caso em que a chamada converge para ela em vez de
+    // alocar N+1. Sem isso, duas importações concorrentes byte-idênticas que ambas leram
+    // GetByContentHashAsync como "nenhuma versão ainda" fora da transação alocariam duas versões para o
+    // MESMO conteúdo (ou uma delas perderia a corrida no índice único sem convergir).
+    private const string LockedVersionsSql =
+        $"""
+        SELECT {EvidenceColumns} FROM dbo.purview_service_result_report_versions WITH (UPDLOCK, HOLDLOCK)
+        WHERE wave_id = @wave AND attempt_sequence = @attempt AND project_id = @project
+        ORDER BY report_version DESC;
+        """;
 
     private const string InsertVersionSql =
         """
@@ -133,14 +154,38 @@ public sealed class SqlPurviewServiceResultReportStore(TenantConnectionFactory c
                 ?? throw new PurviewImportJobSourceNotFoundException(
                     "Plano de import job inexistente/fora do escopo autorizado (fail-closed).");
 
-            int nextVersion;
-            await using (var command = new SqlCommand(LockedMaxVersionSql, connection.Connection, transaction))
+            int nextVersion = 1;
+            PurviewServiceResultReportEvidence? converged = null;
+            await using (var command = new SqlCommand(LockedVersionsSql, connection.Connection, transaction))
             {
                 command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
                 command.Parameters.Add(new SqlParameter("@attempt", SqlDbType.Int) { Value = attempt });
                 command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
-                var scalar = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-                nextVersion = (scalar is int value ? value : 0) + 1;
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                var first = true;
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    if (first)
+                    {
+                        nextVersion = reader.GetInt32(2) + 1; // ORDER BY report_version DESC: primeira linha = maior versão.
+                        first = false;
+                    }
+
+                    if (converged is null && string.Equals(reader.GetString(5).TrimEnd(), contentSha256.Value, StringComparison.Ordinal))
+                    {
+                        // AB-I6-003 Blocker 3: outra chamada (concorrente ou anterior) já persistiu o MESMO
+                        // conteúdo bruto sob este lock — converge para ela em vez de alocar N+1.
+                        converged = ReadEvidence(reader, plannedJobName);
+                    }
+                }
+            }
+
+            if (converged is not null)
+            {
+                await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(now), cancellationToken)
+                    .ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return converged;
             }
 
             var evidence = PurviewServiceResultReportEvidence.Create(
@@ -283,22 +328,47 @@ public sealed class SqlPurviewServiceResultReportStore(TenantConnectionFactory c
 
     // EvidenceColumns = wave_id(0), attempt_sequence(1), report_version(2), tenant_id(3), project_id(4),
     // content_sha256(5), rows_sha256(6), raw_size_bytes(7), row_count(8), declared_total_rows(9),
-    // uploaded_by(10), created_at_utc(11), evidence_hash(12).
-    private static PurviewServiceResultReportEvidence ReadEvidence(SqlDataReader reader, PurviewImportJobName plannedJobName) =>
-        PurviewServiceResultReportEvidence.Rehydrate(
+    // uploaded_by(10), created_at_utc(11), evidence_hash(12), raw_content(13).
+    private static PurviewServiceResultReportEvidence ReadEvidence(SqlDataReader reader, PurviewImportJobName plannedJobName)
+    {
+        var contentSha256 = new Sha256Hash(reader.GetString(5).TrimEnd());
+        var rawSizeBytes = reader.GetInt64(7);
+        ValidateRawContentIntegrity(reader.GetFieldValue<byte[]>(13), rawSizeBytes, contentSha256);
+
+        return PurviewServiceResultReportEvidence.Rehydrate(
             new TenantId(reader.GetGuid(3)),
             new ProjectId(reader.GetGuid(4)),
             new WaveId(reader.GetGuid(0)),
             plannedJobName,
             reader.GetInt32(2),
-            new Sha256Hash(reader.GetString(5).TrimEnd()),
+            contentSha256,
             new Sha256Hash(reader.GetString(6).TrimEnd()),
-            reader.GetInt64(7),
+            rawSizeBytes,
             reader.GetInt32(8),
             reader.IsDBNull(9) ? null : reader.GetInt32(9),
             reader.GetString(10),
             SqlJobMapping.ReadUtc(reader.GetDateTime(11)),
             new Sha256Hash(reader.GetString(12).TrimEnd()));
+    }
+
+    // Revalida os bytes REALMENTE persistidos (nunca expostos além deste método — item "não exponha
+    // conteúdo bruto desnecessariamente") contra os metadados de custódia lidos na MESMA linha. Cobre
+    // adulteração de raw_content com tamanho preservado (só o hash muda) e com tamanho divergente.
+    private static void ValidateRawContentIntegrity(byte[] rawContent, long expectedSizeBytes, Sha256Hash expectedContentSha256)
+    {
+        if (rawContent.LongLength != expectedSizeBytes)
+        {
+            throw new PurviewServiceResultIntegrityViolationException(
+                "O tamanho do raw_content persistido diverge de raw_size_bytes — possível adulteração (fail-closed).");
+        }
+
+        var recomputed = DeterministicHash.ComputeBytes(rawContent);
+        if (!string.Equals(recomputed.Value, expectedContentSha256.Value, StringComparison.Ordinal))
+        {
+            throw new PurviewServiceResultIntegrityViolationException(
+                "O SHA-256 recomputado do raw_content persistido diverge de content_sha256 — possível adulteração (fail-closed).");
+        }
+    }
 
     // RowColumns = remote_pst_name(0), status(1), imported_item_count(2), imported_size_bytes(3),
     // skipped_item_count(4), corrupted_item_count(5).

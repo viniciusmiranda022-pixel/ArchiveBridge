@@ -266,6 +266,24 @@ public sealed class PurviewImportJobIntegrationTests(SqlServerFixture fixture)
         Assert.NotEqual(first.PlannedJobName, second.PlannedJobName);
     }
 
+    [Fact]
+    public async Task PlanConvergesToTheSameAttemptUnderConcurrentIdenticalCalls()
+    {
+        // AB-I6-003 Blocker 3: 5 chamadas simultâneas com a MESMA evidência canônica devem convergir para
+        // o MESMO plano — nunca alocar tentativas N+1 duplicadas para evidência idêntica sob concorrência.
+        var (scope, wave, _, _) = await SeedPlannableWaveAsync("plan-concurrency.pst", "plan-concurrency@contoso.com");
+
+        var tasks = Enumerable.Range(0, 5).Select(_ => PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None));
+        var plans = await Task.WhenAll(tasks);
+
+        Assert.All(plans, plan => Assert.Equal(plans[0].PlannedJobName, plan.PlannedJobName));
+        Assert.All(plans, plan => Assert.Equal(1, plan.AttemptSequence));
+
+        var count = await CountAsync(
+            scope, "SELECT COUNT(*) FROM dbo.purview_import_job_plans WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+        Assert.Equal(1, count);
+    }
+
     // ---- RegisterPurviewImportJobObservationUseCase ----
 
     [Fact]
@@ -514,6 +532,118 @@ public sealed class PurviewImportJobIntegrationTests(SqlServerFixture fixture)
             Reports().GetRowsAsync(scope, wave.Id, plan.PlannedJobName, evidence.ReportVersion, CancellationToken.None));
     }
 
+    [Fact]
+    public async Task ImportReportReplayFailsClosedWhenCanonicalChainDriftedSinceThePreviousImport()
+    {
+        // AB-I6-003 Blocker 1: reenviar o MESMO conteúdo byte a byte depois de drift real na cadeia
+        // canônica (aqui: precheck mudou SEM o mapping ter sido regenerado/republicado) nunca pode
+        // convergir silenciosamente para a evidência antiga — deve falhar fechado como uma importação nova.
+        var (scope, wave, entry, execution) = await SeedPlannableWaveAsync("report-replay-drift.pst", "report-replay-drift@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None);
+
+        // Drift real na cadeia canônica DEPOIS da importação — SEM regenerar/republicar o mapping.
+        await SeedPrecheckAsync(scope, entry, MailboxArchiveStatus.Disabled);
+
+        await Assert.ThrowsAsync<PurviewImportJobPrerequisiteException>(() =>
+            ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None));
+
+        var count = await CountAsync(
+            scope, "SELECT COUNT(*) FROM dbo.purview_service_result_report_versions WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public async Task ImportReportReplayFailsClosedWhenRawContentIsTamperedWithTheSameSize()
+    {
+        // AB-I6-003 Blocker 2: evidence_hash não cobre o conteúdo bruto em si (só content_sha256/tamanho) —
+        // adulterar raw_content preservando o tamanho não pode ser devolvido como replay válido.
+        var (scope, wave, _, execution) = await SeedPlannableWaveAsync("report-raw-tamper-same.pst", "report-raw-tamper-same@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None);
+
+        var tampered = (byte[])bytes.Clone();
+        tampered[0] ^= 0xFF;
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.purview_service_result_report_versions SET raw_content = @tampered WHERE wave_id = @wave;",
+            ("@tampered", tampered), ("@wave", wave.Id.Value));
+
+        await Assert.ThrowsAsync<PurviewServiceResultIntegrityViolationException>(() =>
+            ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ImportReportReplayFailsClosedWhenRawContentIsTamperedWithADifferentSize()
+    {
+        var (scope, wave, _, execution) = await SeedPlannableWaveAsync("report-raw-tamper-size.pst", "report-raw-tamper-size@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None);
+
+        var tampered = bytes.Concat(new byte[] { (byte)'\n' }).ToArray();
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.purview_service_result_report_versions SET raw_content = @tampered WHERE wave_id = @wave;",
+            ("@tampered", tampered), ("@wave", wave.Id.Value));
+
+        await Assert.ThrowsAsync<PurviewServiceResultIntegrityViolationException>(() =>
+            ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ImportReportConvergesToTheSameVersionUnderConcurrentByteIdenticalImports()
+    {
+        // AB-I6-003 Blocker 3: 5 importações simultâneas do MESMO conteúdo bruto devem convergir para a
+        // MESMA versão — nunca alocar versões N+1 duplicadas nem perder linhas sob concorrência.
+        var (scope, wave, _, execution) = await SeedPlannableWaveAsync("report-concurrency-same.pst", "report-concurrency-same@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+
+        var tasks = Enumerable.Range(0, 5).Select(_ => ImportReportUseCase().ExecuteAsync(
+            scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None));
+        var results = await Task.WhenAll(tasks);
+
+        Assert.All(results, evidence => Assert.Equal(1, evidence.ReportVersion));
+        Assert.All(results, evidence => Assert.Equal(results[0].ContentSha256, evidence.ContentSha256));
+
+        var versionCount = await CountAsync(
+            scope, "SELECT COUNT(*) FROM dbo.purview_service_result_report_versions WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+        Assert.Equal(1, versionCount);
+
+        var rowCount = await CountAsync(
+            scope, "SELECT COUNT(*) FROM dbo.purview_service_result_rows WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+        Assert.Equal(1, rowCount);
+    }
+
+    [Fact]
+    public async Task ImportReportProducesDistinctVersionsForConcurrentGenuinelyDifferentContent()
+    {
+        // AB-I6-003 Blocker 3: conteúdos REALMENTE diferentes concorrentes nunca podem colapsar numa única
+        // versão nem perder uma mudança — cada um converge para sua PRÓPRIA versão distinta.
+        var (scope, wave, _, execution) =
+            await SeedPlannableWaveAsync("report-concurrency-distinct.pst", "report-concurrency-distinct@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+
+        var tasks = Enumerable.Range(1, 3).Select(index => ImportReportUseCase().ExecuteAsync(
+            scope, wave.Id, plan.PlannedJobName, ReportBytes(remoteName, itemCount: index), "operator", CancellationToken.None));
+        var results = await Task.WhenAll(tasks);
+
+        Assert.Equal(3, results.Select(evidence => evidence.ReportVersion).Distinct().Count());
+        Assert.Equal(3, results.Select(evidence => evidence.ContentSha256.Value).Distinct().Count());
+
+        var versionCount = await CountAsync(
+            scope, "SELECT COUNT(*) FROM dbo.purview_service_result_report_versions WHERE wave_id = @wave;", ("@wave", wave.Id.Value));
+        Assert.Equal(3, versionCount);
+    }
+
     // ---- EvaluatePurviewServiceResultCompletenessUseCase ----
 
     [Fact]
@@ -574,6 +704,49 @@ public sealed class PurviewImportJobIntegrationTests(SqlServerFixture fixture)
         var assessment = await CompletenessUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, CancellationToken.None);
 
         Assert.Equal(PurviewServiceResultCompletenessOutcome.Inconclusive, assessment.Outcome);
+    }
+
+    [Fact]
+    public async Task CompletenessFailsClosedWhenRawContentIsTamperedWithTheSameSize()
+    {
+        // AB-I6-003 Blocker 2: GetLatestAsync (usada pela avaliação de completude) também revalida os
+        // bytes REALMENTE persistidos — nunca avalia completude contra raw_content adulterado.
+        var (scope, wave, _, execution) =
+            await SeedPlannableWaveAsync("completeness-raw-tamper-same.pst", "completeness-raw-tamper-same@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None);
+
+        var tampered = (byte[])bytes.Clone();
+        tampered[^1] ^= 0xFF;
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.purview_service_result_report_versions SET raw_content = @tampered WHERE wave_id = @wave;",
+            ("@tampered", tampered), ("@wave", wave.Id.Value));
+
+        await Assert.ThrowsAsync<PurviewServiceResultIntegrityViolationException>(() =>
+            CompletenessUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CompletenessFailsClosedWhenRawContentIsTamperedWithADifferentSize()
+    {
+        var (scope, wave, _, execution) =
+            await SeedPlannableWaveAsync("completeness-raw-tamper-size.pst", "completeness-raw-tamper-size@contoso.com");
+        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
+        var bytes = ReportBytes(remoteName);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, bytes, "operator", CancellationToken.None);
+
+        var tampered = bytes.Take(bytes.Length - 1).ToArray();
+        await ExecuteAdminSqlAsync(
+            scope,
+            "UPDATE dbo.purview_service_result_report_versions SET raw_content = @tampered WHERE wave_id = @wave;",
+            ("@tampered", tampered), ("@wave", wave.Id.Value));
+
+        await Assert.ThrowsAsync<PurviewServiceResultIntegrityViolationException>(() =>
+            CompletenessUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, CancellationToken.None));
     }
 
     private async Task ExecuteAdminSqlAsync(TenantScope scope, string sql, params (string Name, object Value)[] parameters)

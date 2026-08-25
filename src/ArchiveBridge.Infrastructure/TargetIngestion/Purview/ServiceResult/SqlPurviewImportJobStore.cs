@@ -14,11 +14,14 @@ namespace ArchiveBridge.Infrastructure.TargetIngestion.Purview.ServiceResult;
 
 /// <summary>
 /// Persistência dos planos de import job do Purview e das observações do provider (AB-I6-001 itens 4-5,
-/// 9-10). <see cref="CreatePlanAsync"/> aloca a sequência de tentativa N+1 sob lock na MESMA transação que
-/// insere o plano (mesmo padrão de <c>mapping_version</c> em <c>SqlPurviewMappingCsvStore.ReserveAsync</c>).
-/// <see cref="RecordObservationAsync"/> aplica, na MESMA transação curta, tanto a convergência idempotente
-/// de replay quanto a recusa fail-closed de reassociação de provider ID — o vínculo plano→provider é
-/// "amarrado" na tabela <c>purview_import_job_provider_bindings</c>, cujo índice único
+/// 9-10). <see cref="CreatePlanAsync"/> locka TODOS os planos existentes da onda sob a MESMA transação
+/// (mesmo padrão de <c>mapping_version</c> em <c>SqlPurviewMappingCsvStore.ReserveAsync</c>) e decide, sob
+/// esse lock, tanto a próxima sequência de tentativa N+1 QUANTO se algum plano já existente converge pela
+/// MESMA <c>evidence_fingerprint</c> — chamadas concorrentes com evidência canônica idêntica sempre
+/// convergem para o MESMO plano, nunca alocam tentativas duplicadas para a mesma evidência (AB-I6-003
+/// Blocker 3). <see cref="RecordObservationAsync"/> aplica, na MESMA transação curta, tanto a convergência
+/// idempotente de replay quanto a recusa fail-closed de reassociação de provider ID — o vínculo
+/// plano→provider é "amarrado" na tabela <c>purview_import_job_provider_bindings</c>, cujo índice único
 /// <c>(tenant_id, project_id, provider_operation_id)</c> impede, no BANCO, que o MESMO provider ID seja
 /// reivindicado por dois planos diferentes do escopo. RLS por SESSION_CONTEXT.
 /// </summary>
@@ -40,9 +43,19 @@ public sealed class SqlPurviewImportJobStore(TenantConnectionFactory connectionF
     private const string GetPlanByNameSql =
         $"SELECT {PlanColumns} FROM dbo.purview_import_job_plans WHERE wave_id = @wave AND project_id = @project AND planned_job_name = @name;";
 
-    private const string LockedMaxAttemptSequenceSql =
-        "SELECT ISNULL(MAX(attempt_sequence), 0) FROM dbo.purview_import_job_plans WITH (UPDLOCK, HOLDLOCK) " +
-        "WHERE wave_id = @wave AND project_id = @project;";
+    // AB-I6-003 Blocker 3: locka TODOS os planos existentes desta onda (mesmo predicado/força de lock da
+    // antiga SELECT MAX) para servir DUAS decisões sob a MESMA seção crítica: (a) a próxima
+    // attempt_sequence a alocar SE nenhum plano convergir, e (b) se algum plano JÁ existente tem a MESMA
+    // evidence_fingerprint desta chamada — caso em que a chamada converge para ele em vez de alocar N+1.
+    // Sem isso, duas chamadas concorrentes com evidência canônica IDÊNTICA que ambas leram
+    // GetLatestPlanByFingerprintAsync como "nenhum plano ainda" fora da transação alocariam duas
+    // tentativas para a MESMA evidência.
+    private const string LockedPlansSql =
+        $"""
+        SELECT {PlanColumns} FROM dbo.purview_import_job_plans WITH (UPDLOCK, HOLDLOCK)
+        WHERE wave_id = @wave AND project_id = @project
+        ORDER BY attempt_sequence DESC;
+        """;
 
     private const string InsertPlanSql =
         """
@@ -125,13 +138,38 @@ public sealed class SqlPurviewImportJobStore(TenantConnectionFactory connectionF
                 await SqlJobFence.ExecuteGuardedAsync(guard, concurrencyError: -1, "PurviewImportJobPlan", cancellationToken).ConfigureAwait(false);
             }
 
-            int nextAttempt;
-            await using (var command = new SqlCommand(LockedMaxAttemptSequenceSql, connection.Connection, transaction))
+            int nextAttempt = 1;
+            PurviewImportJobPlan? converged = null;
+            await using (var command = new SqlCommand(LockedPlansSql, connection.Connection, transaction))
             {
                 command.Parameters.Add(new SqlParameter("@wave", SqlDbType.UniqueIdentifier) { Value = wave.Value });
                 command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
-                var scalar = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-                nextAttempt = (scalar is int value ? value : 0) + 1;
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                var first = true;
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    var existing = ReadPlan(reader);
+                    if (first)
+                    {
+                        nextAttempt = existing.AttemptSequence + 1; // ORDER BY attempt_sequence DESC: primeira linha = maior tentativa.
+                        first = false;
+                    }
+
+                    if (converged is null && existing.EvidenceFingerprint == fingerprint)
+                    {
+                        // AB-I6-003 Blocker 3: outra chamada (concorrente ou anterior) já planejou a MESMA
+                        // evidência canônica sob este lock — converge para ela em vez de alocar N+1.
+                        converged = existing;
+                    }
+                }
+            }
+
+            if (converged is not null)
+            {
+                await SqlJobFence.RevalidateAsync(connection.Connection, transaction, fence, SqlJobMapping.ToDbUtc(now), cancellationToken)
+                    .ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return converged;
             }
 
             var plannedName = PurviewImportJobName.Compute(scope.Tenant, scope.Project, wave, nextAttempt);
