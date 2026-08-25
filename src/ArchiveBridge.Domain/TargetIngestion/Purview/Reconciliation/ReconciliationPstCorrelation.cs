@@ -78,21 +78,45 @@ public static class ReconciliationPstCorrelation
     }
 
     // Um `Purview ImportCompleted/Complete` isolado não equivale a sucesso da reconciliação ("Regras
-    // mínimas de avaliação" do work order): Matched exige status conclusivo E contadores obrigatórios
-    // presentes; Mismatch exige divergência CONCRETA (Failed/SkippedOrCorrupted), nunca inferida de
-    // ausência.
+    // mínimas de avaliação" do work order): Matched exige status conclusivo E TODOS os contadores
+    // obrigatórios presentes; Mismatch exige divergência CONCRETA (Failed/SkippedOrCorrupted do provider,
+    // ou skipped/corrupted > 0 observado numa linha Succeeded — AB-I6-009 item 2), nunca inferida de
+    // ausência. Precedência fail-closed preservada: BlockedIntegrity > Mismatch > IncompleteEvidence >
+    // MatchedWithinEvidence (AB-I6-009 item 4) — um status que já sinaliza divergência concreta
+    // (Failed/SkippedOrCorrupted) nunca é rebaixado para IncompleteEvidence por um contador acessório
+    // ausente.
     private static ReconciliationDisposition Classify(PurviewServiceResultRow row)
     {
-        if (row.Status == PurviewServiceResultRowStatus.Unknown || row.ImportedItemCount is null || row.ImportedSizeBytes is null)
+        if (row.Status == PurviewServiceResultRowStatus.Unknown)
         {
             return ReconciliationDisposition.IncompleteEvidence;
         }
 
-        return row.Status switch
+        if (row.Status is PurviewServiceResultRowStatus.Failed or PurviewServiceResultRowStatus.SkippedOrCorrupted)
         {
-            PurviewServiceResultRowStatus.Succeeded => ReconciliationDisposition.MatchedWithinEvidence,
-            PurviewServiceResultRowStatus.Failed or PurviewServiceResultRowStatus.SkippedOrCorrupted => ReconciliationDisposition.Mismatch,
-            _ => ReconciliationDisposition.IncompleteEvidence,
-        };
+            return ReconciliationDisposition.Mismatch;
+        }
+
+        if (row.Status != PurviewServiceResultRowStatus.Succeeded)
+        {
+            return ReconciliationDisposition.IncompleteEvidence;
+        }
+
+        // Succeeded só vira MatchedWithinEvidence quando TODOS os contadores relevantes estão presentes e
+        // conclusivos (AB-I6-009 item 2) — qualquer um ausente (inclusive skipped/corrupted, não apenas os
+        // dois já exigidos antes) permanece IncompleteEvidence; skipped/corrupted > 0 é divergência
+        // observável concreta, nunca convertida em match silenciosamente.
+        if (row.ImportedItemCount is null || row.ImportedSizeBytes is null
+            || row.SkippedItemCount is null || row.CorruptedItemCount is null)
+        {
+            return ReconciliationDisposition.IncompleteEvidence;
+        }
+
+        if (row.SkippedItemCount > 0 || row.CorruptedItemCount > 0)
+        {
+            return ReconciliationDisposition.Mismatch;
+        }
+
+        return ReconciliationDisposition.MatchedWithinEvidence;
     }
 }

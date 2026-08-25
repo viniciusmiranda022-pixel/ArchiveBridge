@@ -47,9 +47,14 @@ public static class ReconciliationArchiveCorrelation
             ? afterSize - beforeSize
             : null;
 
+        // Precedência fail-closed: BlockedIntegrity > Mismatch (divergência concreta) > IncompleteEvidence
+        // (qualquer métrica reconciliada ainda Unknown) > MatchedWithinEvidence (AB-I6-009 item 3-4).
+        // MatchedWithinEvidence exige AMBAS as métricas conhecidas e não-negativas — uma métrica conhecida
+        // isolada nunca basta, mesmo que a outra seja Unknown (item 1: antes bastava UMA métrica conhecida
+        // para virar match, mesmo com a outra Unknown).
         var disposition = HasConcreteDecrease(itemCountDelta, sizeDelta)
             ? ReconciliationDisposition.Mismatch
-            : itemCountDelta is null && sizeDelta is null
+            : itemCountDelta is null || sizeDelta is null
                 ? ReconciliationDisposition.IncompleteEvidence
                 : ReconciliationDisposition.MatchedWithinEvidence;
 

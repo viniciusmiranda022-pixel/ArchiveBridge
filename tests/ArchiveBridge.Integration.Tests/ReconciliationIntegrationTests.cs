@@ -179,14 +179,24 @@ public sealed class ReconciliationIntegrationTests(SqlServerFixture fixture)
     private static string RemoteNameFor(PartitionExecutionRecord execution) =>
         PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
 
-    private static byte[] ReportBytes(IReadOnlyList<(string RemoteName, string Status, long? ImportedItems, long? ImportedBytes)> rows)
+    // Contadores skipped/corrupted não fornecidos pelo caller: preenchidos como 0 explícito (AB-I6-009 —
+    // ImportedItemCount/ImportedSizeBytes já cobrem o cenário de contador ausente; ver
+    // <see cref="ReportBytesWithSkippedAndCorrupted"/> para os cenários que precisam variá-los).
+    private static byte[] ReportBytes(IReadOnlyList<(string RemoteName, string Status, long? ImportedItems, long? ImportedBytes)> rows) =>
+        ReportBytesWithSkippedAndCorrupted(
+            [.. rows.Select(row => (row.RemoteName, row.Status, row.ImportedItems, row.ImportedBytes, Skipped: (long?)0, Corrupted: (long?)0))]);
+
+    private static byte[] ReportBytesWithSkippedAndCorrupted(
+        IReadOnlyList<(string RemoteName, string Status, long? ImportedItems, long? ImportedBytes, long? Skipped, long? Corrupted)> rows)
     {
-        var sb = new StringBuilder("RemotePstName,Status,ImportedItemCount,ImportedSizeBytes\n");
-        foreach (var (remoteName, status, importedItems, importedBytes) in rows)
+        var sb = new StringBuilder("RemotePstName,Status,ImportedItemCount,ImportedSizeBytes,SkippedItemCount,CorruptedItemCount\n");
+        foreach (var (remoteName, status, importedItems, importedBytes, skipped, corrupted) in rows)
         {
             sb.Append(remoteName).Append(',').Append(status).Append(',');
             sb.Append(importedItems?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty).Append(',');
-            sb.Append(importedBytes?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty).Append('\n');
+            sb.Append(importedBytes?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty).Append(',');
+            sb.Append(skipped?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty).Append(',');
+            sb.Append(corrupted?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty).Append('\n');
         }
 
         return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(sb.ToString());
@@ -293,6 +303,24 @@ public sealed class ReconciliationIntegrationTests(SqlServerFixture fixture)
 
         await ImportReportUseCase().ExecuteAsync(
             scope, wave.Id, plannedJobName, ReportBytes([(remoteName, status, 0, 0)]), "operator", CancellationToken.None);
+
+        var assessment = await ReconciliationUseCase().ExecuteAsync(scope, wave.Id, plannedJobName, CorrelationId.New(), CancellationToken.None);
+        var item = Assert.Single(await Assessments().GetPstItemsAsync(scope, wave.Id, plannedJobName, assessment.AssessmentVersion, CancellationToken.None));
+
+        Assert.Equal(ReconciliationDisposition.Mismatch, item.Disposition);
+    }
+
+    [Fact]
+    public async Task EvaluateMarksASucceededRowWithSkippedItemsAboveZeroAsMismatchNotMatch()
+    {
+        var (scope, wave, entries, plannedJobName) = await SeedPlannedWaveAsync(("recon-succeeded-skipped.pst", "recon-succeeded-skipped@contoso.com"));
+        var remoteName = RemoteNameFor(entries[0].Execution);
+
+        // AB-I6-009 item 2: uma linha "Succeeded" que ainda assim reporta itens ignorados é divergência
+        // observável CONCRETA — nunca convertida em MatchedWithinEvidence silenciosamente.
+        await ImportReportUseCase().ExecuteAsync(
+            scope, wave.Id, plannedJobName,
+            ReportBytesWithSkippedAndCorrupted([(remoteName, "Succeeded", 10, 2048, 1, 0)]), "operator", CancellationToken.None);
 
         var assessment = await ReconciliationUseCase().ExecuteAsync(scope, wave.Id, plannedJobName, CorrelationId.New(), CancellationToken.None);
         var item = Assert.Single(await Assessments().GetPstItemsAsync(scope, wave.Id, plannedJobName, assessment.AssessmentVersion, CancellationToken.None));

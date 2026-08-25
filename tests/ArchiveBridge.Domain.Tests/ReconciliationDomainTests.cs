@@ -111,6 +111,48 @@ public sealed class ReconciliationDomainTests
         Assert.Equal(ReconciliationDisposition.Mismatch, Assert.Single(items).Disposition);
     }
 
+    // ---- AB-I6-009: skipped/corrupted também são contadores obrigatórios para Matched ----
+
+    [Fact]
+    public void CorrelateNeverConvertsASucceededRowWithAnUnknownSkippedCounterIntoMatch()
+    {
+        var remote = Remote(new string('g', 32));
+        var items = ReconciliationPstCorrelation.Correlate(
+            [remote], [Row(remote, PurviewServiceResultRowStatus.Succeeded, skipped: null)]);
+
+        Assert.Equal(ReconciliationDisposition.IncompleteEvidence, Assert.Single(items).Disposition);
+    }
+
+    [Fact]
+    public void CorrelateNeverConvertsASucceededRowWithAnUnknownCorruptedCounterIntoMatch()
+    {
+        var remote = Remote(new string('h', 32));
+        var items = ReconciliationPstCorrelation.Correlate(
+            [remote], [Row(remote, PurviewServiceResultRowStatus.Succeeded, corrupted: null)]);
+
+        Assert.Equal(ReconciliationDisposition.IncompleteEvidence, Assert.Single(items).Disposition);
+    }
+
+    [Fact]
+    public void CorrelateMarksASucceededRowWithSkippedItemsAboveZeroAsMismatch()
+    {
+        var remote = Remote(new string('i', 32));
+        var items = ReconciliationPstCorrelation.Correlate(
+            [remote], [Row(remote, PurviewServiceResultRowStatus.Succeeded, skipped: 1)]);
+
+        Assert.Equal(ReconciliationDisposition.Mismatch, Assert.Single(items).Disposition);
+    }
+
+    [Fact]
+    public void CorrelateMarksASucceededRowWithCorruptedItemsAboveZeroAsMismatch()
+    {
+        var remote = Remote(new string('j', 32));
+        var items = ReconciliationPstCorrelation.Correlate(
+            [remote], [Row(remote, PurviewServiceResultRowStatus.Succeeded, corrupted: 1)]);
+
+        Assert.Equal(ReconciliationDisposition.Mismatch, Assert.Single(items).Disposition);
+    }
+
     [Fact]
     public void CorrelateFailsClosedWhenObservedRowsContainADuplicateRemoteName()
     {
@@ -219,6 +261,51 @@ public sealed class ReconciliationDomainTests
 
         Assert.Equal(ReconciliationDisposition.IncompleteEvidence, item.Disposition);
         Assert.Null(item.ItemCountDelta);
+        Assert.Null(item.TotalItemSizeBytesDelta);
+    }
+
+    // ---- AB-I6-009: uma métrica conhecida isolada nunca basta para Matched — a outra sendo Unknown
+    // ---- deve permanecer IncompleteEvidence, e uma divergência concreta ainda prevalece sobre ela.
+
+    [Fact]
+    public void ArchiveCorrelateIsIncompleteEvidenceWhenItemCountDeltaIsKnownButSizeDeltaIsUnknown()
+    {
+        var archive = new TargetArchiveId("known-items-unknown-size@contoso.com");
+        var before = Snapshot(archive, ExoStatisticsPhase.BeforeImport, 1, itemCount: 100, sizeBytes: null);
+        var after = Snapshot(archive, ExoStatisticsPhase.AfterImport, 1, itemCount: 110, sizeBytes: null);
+
+        var item = ReconciliationArchiveCorrelation.Correlate(archive, before, after);
+
+        Assert.Equal(ReconciliationDisposition.IncompleteEvidence, item.Disposition);
+        Assert.Equal(10, item.ItemCountDelta);
+        Assert.Null(item.TotalItemSizeBytesDelta);
+    }
+
+    [Fact]
+    public void ArchiveCorrelateIsIncompleteEvidenceWhenSizeDeltaIsKnownButItemCountDeltaIsUnknown()
+    {
+        var archive = new TargetArchiveId("known-size-unknown-items@contoso.com");
+        var before = Snapshot(archive, ExoStatisticsPhase.BeforeImport, 1, itemCount: null, sizeBytes: 10_000);
+        var after = Snapshot(archive, ExoStatisticsPhase.AfterImport, 1, itemCount: null, sizeBytes: 12_000);
+
+        var item = ReconciliationArchiveCorrelation.Correlate(archive, before, after);
+
+        Assert.Equal(ReconciliationDisposition.IncompleteEvidence, item.Disposition);
+        Assert.Null(item.ItemCountDelta);
+        Assert.Equal(2000, item.TotalItemSizeBytesDelta);
+    }
+
+    [Fact]
+    public void ArchiveCorrelateStillMarksMismatchWhenOneMetricIsUnknownAndTheOtherIsConcretelyNegative()
+    {
+        var archive = new TargetArchiveId("unknown-and-negative@contoso.com");
+        var before = Snapshot(archive, ExoStatisticsPhase.BeforeImport, 1, itemCount: 100, sizeBytes: null);
+        var after = Snapshot(archive, ExoStatisticsPhase.AfterImport, 1, itemCount: 90, sizeBytes: null);
+
+        var item = ReconciliationArchiveCorrelation.Correlate(archive, before, after);
+
+        Assert.Equal(ReconciliationDisposition.Mismatch, item.Disposition);
+        Assert.Equal(-10, item.ItemCountDelta);
         Assert.Null(item.TotalItemSizeBytesDelta);
     }
 
