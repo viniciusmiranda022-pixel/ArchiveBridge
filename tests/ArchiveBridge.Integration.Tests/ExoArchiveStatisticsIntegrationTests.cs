@@ -150,9 +150,13 @@ public sealed class ExoArchiveStatisticsIntegrationTests(SqlServerFixture fixtur
         return (scope, wave, entry);
     }
 
-    /// <summary>Onda que atinge <see cref="PurviewServiceResultCompletenessOutcome.CompleteForProviderEvidence"/> — o piso para AfterImport.</summary>
-    private async Task<(TenantScope Scope, MigrationWave Wave, WaveEntry Entry, PurviewImportJobName PlannedJobName)> SeedAfterImportEligibleWaveAsync(
-        string name, string mailbox)
+    /// <summary>
+    /// Onda com plano de import job já criado (bindings/upload verificado/mapping publicado) mas SEM
+    /// nenhum service result report importado ainda — completude permanece <c>Incomplete</c>, o piso
+    /// exato para provar que o gate do AfterImport bloqueia sem sondar o adapter.
+    /// </summary>
+    private async Task<(TenantScope Scope, MigrationWave Wave, WaveEntry Entry, PartitionExecutionRecord Execution, PurviewImportJobName PlannedJobName)>
+        SeedPlannedWaveAsync(string name, string mailbox)
     {
         var scope = SqlServerFixture.NewScope();
         await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
@@ -171,13 +175,30 @@ public sealed class ExoArchiveStatisticsIntegrationTests(SqlServerFixture fixtur
         await GenerateMappingUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
 
         var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+
+        return (scope, wave, entry, execution, plan.PlannedJobName);
+    }
+
+    /// <summary>Onda que atinge <see cref="PurviewServiceResultCompletenessOutcome.CompleteForProviderEvidence"/> — o piso para AfterImport.</summary>
+    private async Task<(TenantScope Scope, MigrationWave Wave, WaveEntry Entry, PurviewImportJobName PlannedJobName)> SeedAfterImportEligibleWaveAsync(
+        string name, string mailbox)
+    {
+        var (scope, wave, entry, execution, plannedJobName) = await SeedPlannedWaveAsync(name, mailbox);
         var remoteName = PurviewRemotePstName.ForPart(execution.Artifact, execution.PartSequence).Value;
         var reportBytes = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(
             $"RemotePstName,Status,ImportedItemCount,ImportedSizeBytes\n{remoteName},Succeeded,10,2048\n");
-        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plan.PlannedJobName, reportBytes, "operator", CancellationToken.None);
+        await ImportReportUseCase().ExecuteAsync(scope, wave.Id, plannedJobName, reportBytes, "operator", CancellationToken.None);
 
-        return (scope, wave, entry, plan.PlannedJobName);
+        return (scope, wave, entry, plannedJobName);
     }
+
+    // Fixos (nunca Guid.NewGuid()/DateTimeOffset.UtcNow por chamada): dois capturas com o mesmo conteúdo
+    // lógico precisam produzir o MESMO ObservationHash para os testes de idempotência/convergência —
+    // um GUID/timestamp fresco a cada chamada quebraria a convergência mesmo com conteúdo "igual".
+    private static readonly Guid FixedExchangeGuid = Guid.Parse("77777777-7777-7777-7777-777777777777");
+    private static readonly Guid FixedArchiveGuid = Guid.Parse("88888888-8888-8888-8888-888888888888");
+    private static readonly DateTimeOffset FixedObservedAt = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    private static readonly DateTimeOffset FixedLastLogon = new(2025, 12, 31, 12, 0, 0, TimeSpan.Zero);
 
     private static ExoArchiveStatisticsObservation Observation(
         long? itemCount = 1000,
@@ -191,10 +212,10 @@ public sealed class ExoArchiveStatisticsIntegrationTests(SqlServerFixture fixtur
         IReadOnlyList<ExoArchiveFolderStatisticObservation>? folders = null,
         DateTimeOffset? observedAt = null) =>
         new(
-            status, Guid.NewGuid(), Guid.NewGuid(), itemCount, totalSizeBytes, deletedSizeBytes,
-            lastLogon ?? DateTimeOffset.UtcNow, retentionHold, litigationHold, autoExpanding,
+            status, FixedExchangeGuid, FixedArchiveGuid, itemCount, totalSizeBytes, deletedSizeBytes,
+            lastLogon ?? FixedLastLogon, retentionHold, litigationHold, autoExpanding,
             folders ?? [new ExoArchiveFolderStatisticObservation("/Top of Information Store/Inbox", "Inbox", 10, 10, 2048, 2048, null, null)],
-            observedAt ?? DateTimeOffset.UtcNow);
+            observedAt ?? FixedObservedAt);
 
     // ---- BeforeImport ----
 
@@ -277,10 +298,15 @@ public sealed class ExoArchiveStatisticsIntegrationTests(SqlServerFixture fixtur
     public async Task BeforeImportPreservesUnknownFieldsAsNullNeverAsZeroOrFalse()
     {
         var (scope, wave, entry) = await SeedResolvedWaveAsync("before-unknown.pst", "before-unknown@contoso.com");
-        var observation = Observation(
-            itemCount: null, totalSizeBytes: null, deletedSizeBytes: null, lastLogon: null, retentionHold: null,
-            litigationHold: null, autoExpanding: null, status: MailboxArchiveStatus.Unknown,
-            folders: [new ExoArchiveFolderStatisticObservation("/Inbox", "Inbox", null, null, null, null, null, null)]);
+        // Construído diretamente (sem o helper Observation()): o helper usa "??" para preencher um
+        // default sensato quando o chamador não personaliza um campo, o que não distingue "omitido" de
+        // "explicitamente null" — aqui o teste exige LastLogonTimeUtc REALMENTE null (Unknown/NotReported).
+        var observation = new ExoArchiveStatisticsObservation(
+            MailboxArchiveStatus.Unknown, ExchangeGuid: null, ArchiveGuid: null, ItemCount: null, TotalItemSizeBytes: null,
+            TotalDeletedItemSizeBytes: null, LastLogonTimeUtc: null, RetentionHoldEnabled: null, LitigationHoldEnabled: null,
+            AutoExpandingArchiveEnabled: null,
+            Folders: [new ExoArchiveFolderStatisticObservation("/Inbox", "Inbox", null, null, null, null, null, null)],
+            ObservedAtUtc: FixedObservedAt);
         var adapter = new FakeExoArchiveStatisticsAdapter(observation);
 
         var snapshot = await CaptureUseCase(adapter).ExecuteBeforeImportAsync(
@@ -344,12 +370,11 @@ public sealed class ExoArchiveStatisticsIntegrationTests(SqlServerFixture fixtur
     [Fact]
     public async Task AfterImportFailsClosedBeforeImportCompletionEvidenceExistsAndNeverProbesTheAdapter()
     {
-        var (scope, wave, entry) = await SeedResolvedWaveAsync("after-no-evidence.pst", "after-no-evidence@contoso.com");
-        var plan = await PlanUseCase().ExecuteAsync(scope, wave.Id, "operator", CancellationToken.None);
+        var (scope, wave, entry, _, plannedJobName) = await SeedPlannedWaveAsync("after-no-evidence.pst", "after-no-evidence@contoso.com");
         var adapter = new FakeExoArchiveStatisticsAdapter(Observation());
 
         await Assert.ThrowsAsync<ExoArchiveStatisticsPrerequisiteException>(() => CaptureUseCase(adapter).ExecuteAfterImportAsync(
-            scope, wave.Id, entry.Archive.Identity, plan.PlannedJobName, CorrelationId.New(), CancellationToken.None));
+            scope, wave.Id, entry.Archive.Identity, plannedJobName, CorrelationId.New(), CancellationToken.None));
         Assert.Equal(0, adapter.ObserveCallCount);
     }
 
