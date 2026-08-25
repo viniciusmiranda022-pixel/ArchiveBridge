@@ -148,4 +148,14 @@ public sealed record WaveSelection
 
         return totals;
     }
+
+    /// <summary>
+    /// Resolve a ÚNICA entrada desta seleção cujo <see cref="WaveEntryId"/> (recomputado, nunca lido de
+    /// um índice) corresponde ao opaco informado; <see langword="null"/> se nenhuma entrada corresponder
+    /// (entrada não-membro da onda — AB-I5-013 item 3, mesmo padrão fail-closed "indistinguível de
+    /// inexistente" usado no restante do sistema, nunca uma exceção específica que vazaria a diferença
+    /// entre "onda errada" e "entrada errada").
+    /// </summary>
+    public WaveEntry? ResolveEntry(WaveId wave, WaveEntryId entryId) =>
+        Entries.FirstOrDefault(entry => WaveEntryId.Derive(wave, entry) == entryId);
 }

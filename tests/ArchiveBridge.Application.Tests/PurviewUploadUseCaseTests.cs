@@ -56,8 +56,9 @@ public sealed class PurviewUploadUseCaseTests
             PartitionExecutionId.New(), Scope.Tenant, Scope.Project, ArtifactId.New(), PartitionPlanId.New(), PartitionPlanPartId.New(),
             planHash, 1, PartitionPlanIdentity.ComputePartKey(planHash, 1), sourceHash, 4096, sourceHash, 4096, Executor,
             CorrelationId.New(), StartedAt, StartedAt.AddSeconds(5));
+        var entry = WaveEntryId.Derive(wave, new WaveEntry("C:\\pst\\mailbox.pst", "mailbox.pst", new ArchiveRef("mailbox@contoso.com"), 4096, 10));
         var binding = WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), Scope.Tenant, Scope.Project, wave, execution, CorrelationId.New(), Now);
+            WavePartitionOutputBindingId.New(), Scope.Tenant, Scope.Project, wave, entry, execution, CorrelationId.New(), Now);
         return (binding, execution);
     }
 

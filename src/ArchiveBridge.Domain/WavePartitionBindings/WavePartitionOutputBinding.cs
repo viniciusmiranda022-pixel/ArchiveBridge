@@ -50,6 +50,7 @@ public sealed record WavePartitionOutputBinding
         TenantId tenant,
         ProjectId project,
         WaveId wave,
+        WaveEntryId entry,
         PartitionPlanId plan,
         PartitionPlanPartId part,
         PartitionExecutionId execution,
@@ -65,6 +66,7 @@ public sealed record WavePartitionOutputBinding
         Tenant = tenant;
         Project = project;
         Wave = wave;
+        Entry = entry;
         Plan = plan;
         Part = part;
         Execution = execution;
@@ -78,10 +80,14 @@ public sealed record WavePartitionOutputBinding
     }
 
     /// <summary>
-    /// Cria um novo vínculo a partir de uma execução de partição JÁ CANÔNICA. <paramref name="tenant"/>/
-    /// <paramref name="project"/> (o escopo autorizado do vínculo) têm de corresponder EXATAMENTE ao
-    /// tenant/projeto do próprio <paramref name="execution"/> — nunca um vínculo cross-scope entre a onda e
-    /// a execução, mesmo que ambos existam sob o mesmo caller.
+    /// Cria um novo vínculo a partir de uma execução de partição JÁ CANÔNICA e de uma
+    /// <see cref="WaveEntryId"/> JÁ VALIDADA pela Application como membro da onda (AB-I5-013 item 3): este
+    /// construtor nunca resolve/valida a associação com <see cref="Waves.WaveSelection"/> sozinho (o
+    /// Domain não conhece stores) — apenas grava o <paramref name="entry"/> opaco fornecido, que é a fonte
+    /// de correlação AUTORITATIVA entre o output físico e o destino planejado (mailbox) que ele serve.
+    /// <paramref name="tenant"/>/<paramref name="project"/> (o escopo autorizado do vínculo) têm de
+    /// corresponder EXATAMENTE ao tenant/projeto do próprio <paramref name="execution"/> — nunca um
+    /// vínculo cross-scope entre a onda e a execução, mesmo que ambos existam sob o mesmo caller.
     /// </summary>
     /// <exception cref="ArgumentException">Invariante estrutural violado (escopo divergente).</exception>
     public static WavePartitionOutputBinding Create(
@@ -89,6 +95,7 @@ public sealed record WavePartitionOutputBinding
         TenantId tenant,
         ProjectId project,
         WaveId wave,
+        WaveEntryId entry,
         PartitionExecutionRecord execution,
         CorrelationId correlation,
         DateTimeOffset nowUtc)
@@ -102,11 +109,11 @@ public sealed record WavePartitionOutputBinding
 
         var canonicalNowUtc = TruncateToMilliseconds(nowUtc);
         var hash = ComputeBindingHash(
-            id, tenant, project, wave, execution.Plan, execution.Part, execution.Id, execution.Artifact,
+            id, tenant, project, wave, entry, execution.Plan, execution.Part, execution.Id, execution.Artifact,
             execution.PartKey, execution.OutputHash, execution.OutputSizeBytes, correlation, canonicalNowUtc);
 
         return new WavePartitionOutputBinding(
-            id, tenant, project, wave, execution.Plan, execution.Part, execution.Id, execution.Artifact,
+            id, tenant, project, wave, entry, execution.Plan, execution.Part, execution.Id, execution.Artifact,
             execution.PartKey, execution.OutputHash, execution.OutputSizeBytes, correlation, canonicalNowUtc, hash);
     }
 
@@ -120,6 +127,7 @@ public sealed record WavePartitionOutputBinding
         TenantId tenant,
         ProjectId project,
         WaveId wave,
+        WaveEntryId entry,
         PartitionPlanId plan,
         PartitionPlanPartId part,
         PartitionExecutionId execution,
@@ -132,7 +140,7 @@ public sealed record WavePartitionOutputBinding
         Sha256Hash persistedBindingHash)
     {
         var recomputed = ComputeBindingHash(
-            id, tenant, project, wave, plan, part, execution, artifact, partKey, outputHash, outputSizeBytes,
+            id, tenant, project, wave, entry, plan, part, execution, artifact, partKey, outputHash, outputSizeBytes,
             correlation, createdAtUtc);
         if (!string.Equals(recomputed.Value, persistedBindingHash.Value, StringComparison.Ordinal))
         {
@@ -142,15 +150,19 @@ public sealed record WavePartitionOutputBinding
         }
 
         return new WavePartitionOutputBinding(
-            id, tenant, project, wave, plan, part, execution, artifact, partKey, outputHash, outputSizeBytes,
+            id, tenant, project, wave, entry, plan, part, execution, artifact, partKey, outputHash, outputSizeBytes,
             correlation, createdAtUtc, persistedBindingHash);
     }
 
     /// <summary>
     /// Verdadeiro quando <paramref name="other"/> representa exatamente o MESMO output canônico para a
-    /// MESMA onda/plano/parte (convergência idempotente, item 4) — compara apenas o CONTEÚDO estável
-    /// (nunca <see cref="Id"/>/<see cref="Correlation"/>/<see cref="CreatedAtUtc"/>, que mudam a cada
-    /// tentativa mesmo sem mudança real).
+    /// MESMA onda/plano/parte E o MESMO destino planejado (convergência idempotente, item 4) — compara
+    /// apenas o CONTEÚDO estável (nunca <see cref="Id"/>/<see cref="Correlation"/>/<see cref="CreatedAtUtc"/>,
+    /// que mudam a cada tentativa mesmo sem mudança real). <see cref="Entry"/> É comparado (AB-I5-013
+    /// item 4): um pedido repetido para a MESMA onda/plano/parte que informe uma <see cref="WaveEntryId"/>
+    /// DIFERENTE nunca converge silenciosamente — é reassignação ambígua do mesmo output físico para um
+    /// destino diferente, sempre recusada fail-closed pelo chamador via
+    /// <see cref="WavePartitionOutputBindingIncompatibleException"/>.
     /// </summary>
     public bool IsSameLogicalOutputAs(WavePartitionOutputBinding other)
     {
@@ -158,6 +170,7 @@ public sealed record WavePartitionOutputBinding
         return Tenant == other.Tenant
             && Project == other.Project
             && Wave == other.Wave
+            && Entry == other.Entry
             && Plan == other.Plan
             && Part == other.Part
             && Execution == other.Execution
@@ -205,6 +218,14 @@ public sealed record WavePartitionOutputBinding
     /// <summary>Onda vinculada.</summary>
     public WaveId Wave { get; }
 
+    /// <summary>
+    /// Identidade opaca (AB-I5-013) da <see cref="Waves.WaveEntry"/> planejada — o destino (mailbox) que
+    /// este output físico serve. Validada pela Application como membro ATUAL da seleção da onda antes da
+    /// criação (<see cref="Waves.WaveSelection.ResolveEntry"/>); o Domain apenas grava o valor já
+    /// resolvido e o protege contra adulteração via <see cref="BindingHash"/>.
+    /// </summary>
+    public WaveEntryId Entry { get; }
+
     /// <summary>Plano de particionamento cuja parte foi materializada.</summary>
     public PartitionPlanId Plan { get; }
 
@@ -236,15 +257,17 @@ public sealed record WavePartitionOutputBinding
     public Sha256Hash BindingHash { get; }
 
     private static Sha256Hash ComputeBindingHash(
-        WavePartitionOutputBindingId id, TenantId tenant, ProjectId project, WaveId wave, PartitionPlanId plan,
-        PartitionPlanPartId part, PartitionExecutionId execution, ArtifactId artifact, Sha256Hash partKey,
-        Sha256Hash outputHash, long outputSizeBytes, CorrelationId correlation, DateTimeOffset createdAtUtc) =>
+        WavePartitionOutputBindingId id, TenantId tenant, ProjectId project, WaveId wave, WaveEntryId entry,
+        PartitionPlanId plan, PartitionPlanPartId part, PartitionExecutionId execution, ArtifactId artifact,
+        Sha256Hash partKey, Sha256Hash outputHash, long outputSizeBytes, CorrelationId correlation,
+        DateTimeOffset createdAtUtc) =>
         DeterministicHash.Compute(
         [
             id.Value.ToString("N"),
             tenant.Value.ToString("N"),
             project.Value.ToString("N"),
             wave.Value.ToString("N"),
+            entry.Value.Value,
             plan.Value.ToString("N"),
             part.Value.ToString("N"),
             execution.Value.ToString("N"),

@@ -137,8 +137,9 @@ public sealed class PurviewUploadDomainTests
             PartitionExecutionId.New(), tenant, project, ArtifactId.New(), PartitionPlanId.New(), PartitionPlanPartId.New(),
             planHash, 1, PartitionPlanIdentity.ComputePartKey(planHash, 1), sourceHash, 4096, sourceHash, 4096, Executor,
             CorrelationId.New(), StartedAt, StartedAt.AddSeconds(5));
+        var entry = WaveEntryId.Derive(wave, new WaveEntry("C:\\pst\\mailbox.pst", "mailbox.pst", new ArchiveRef("mailbox@contoso.com"), 4096, 10));
         return WavePartitionOutputBinding.Create(
-            WavePartitionOutputBindingId.New(), tenant, project, wave, execution, CorrelationId.New(), StartedAt);
+            WavePartitionOutputBindingId.New(), tenant, project, wave, entry, execution, CorrelationId.New(), StartedAt);
     }
 
     [Fact]
