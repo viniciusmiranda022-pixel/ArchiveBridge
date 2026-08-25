@@ -390,3 +390,88 @@ em plaintext/log, Azure Key Vault/Managed Identity como dependência obrigatóri
 entre projetos/waves, qualquer execução contra destino não proveniente do handle SAS canônico da wave.
 Nenhum destes fluxos existe no código deste Passo — não há superfície de ameaça nova a analisar para eles
 aqui.
+
+# Threat model — I5/EPIC-06, Passo 4 (AB-I5-013: correlação WaveEntry↔WavePartitionOutputBinding; AB-I5-012: mapping CSV oficial do Purview Network Upload)
+
+Delta sobre o capítulo imediatamente anterior (mesmo formato). Escopo: (a) AB-I5-013 — correlação IMUTÁVEL
+e opaca (`WaveEntryId`) entre cada `WavePartitionOutputBinding` (Passo 3) e a exata `WaveEntry` planejada
+que ele serve, resolvida server-side e recomputável, nunca inferida por ordem/nome/mailbox/cronologia; (b)
+AB-I5-012 — o builder oficial, determinístico, versionado e auditável do mapping CSV do Purview Network
+Upload, consumindo EXCLUSIVAMENTE evidência canônica de wave/vínculo/execução/mailbox-precheck/upload já
+resolvida server-side pelos Passos 1-3 (runbook §25.7/§25.8). **Sem** criação/validação/início automático
+de import job Purview, automação de portal, ingestão de validation report, `Import data`, Graph/EXO writes,
+Enable-Mailbox/auto-expansion, reconciliação ou edição manual/Excel do CSV (STOP-THE-LINE de
+[`docs/engineering/requests/AB-I5-012.md`](../engineering/requests/AB-I5-012.md)). Nenhum destes fluxos
+existe no código deste Passo.
+
+**Nota de composição**: assim como `CreateWavePartitionOutputBindingUseCase` (Passo 3), nenhum caso de uso
+deste Passo está conectado a um host/composition root de produção (worker ou portal ControlPlane) neste
+repositório — Domain/Application/Infrastructure/SQL estão completos e testados (inclusive sob SQL Server
+real), mas a superfície HTTP autenticada de geração/download (Razor Page) e o disparo operacional (portal
+ou ferramenta) são wiring explicitamente deferido para um Passo de composição futuro, seguindo o mesmo
+padrão já estabelecido pelo Passo 3. Isto NÃO é uma lacuna de segurança: o anti-IDOR, o escopo tenant/
+projeto e a integridade de evidência já estão completamente reforçados na camada de Application/
+Infrastructure, que é onde a superfície HTTP futura terá que chamar através — ela nunca poderá contornar
+essas garantias.
+
+## Ativos adicionais
+
+- **Correlação de entrada** (`wave_partition_output_bindings.entry_id`): `WaveEntryId` opaca e
+  DETERMINÍSTICA (hash SHA-256 de campos imutáveis da `WaveEntry` + a `WaveId`) — nunca um índice/ordinal,
+  nunca uma nova tabela/FK para `wave_entries` (que permanece planejamento, Passo 3). Parte do
+  `binding_hash` (adulterar só esta coluna é detectado no rehydrate).
+- **Evidência de versão do mapping CSV do Purview** (`purview_mapping_csv_versions`): metadados
+  IMUTÁVEIS/versionados — impressão digital da evidência completa, SHA-256 do conteúdo, contagem de linhas,
+  responsável, data, status (Usable/Superseded/PendingArtifact) e referência opaca ao artefato. NUNCA o
+  conteúdo das linhas (Mailbox/FilePath/Name) em SQL — apenas no artefato imutável (item 12 do work order).
+  Distinta de `dbo.mapping_csv_versions`/`mapping_csv_rows` (Slice 2): aquele schema fixa `IsArchive=TRUE`/
+  `ContentCodePage` no CHECK do banco, o que conflita estruturalmente com este Passo (`IsArchive` resolvido
+  por linha a partir do precheck; `ContentCodePage` sempre vazio no caminho Exchange/PST puro) — reutilizar
+  aquelas tabelas exigiria relaxar CHECKs pensados para outro contrato de dados; optou-se por uma tabela
+  nova, reaproveitando integralmente o PADRÃO comprovado (protocolo de duas fases, índice único filtrado,
+  `SqlJobFence`) e a infraestrutura de artefato IMUTÁVEL (`IMappingArtifactStore`/`FileSystemMappingArtifactStore`,
+  reaproveitados sem nenhuma alteração — o contrato já era genérico o bastante).
+- **Artefato mapping.csv do Purview**: bytes do CSV final (Mailbox/FilePath/Name/IsArchive/TargetRootFolder),
+  publicado de forma imutável/versionada sob uma raiz de armazenamento DISTINTA da do mapping genérico do
+  Slice 2 (evita colisão física entre dois esquemas de linha incompatíveis para a mesma onda/versão). Nunca
+  contém segredo/SAS; contém metadado de planejamento (mailbox), por isso a mesma exigência de ACL
+  restritiva do artefato genérico se aplica.
+
+## Classificação de dados
+
+Nenhuma tabela nova deste Passo persiste conteúdo de e-mail. `purview_mapping_csv_versions` persiste apenas
+hashes/contadores/metadados operacionais — nunca Mailbox/FilePath/Name em claro (diferente do módulo
+genérico do Slice 2, que persiste linhas completas em `mapping_csv_rows` para permitir validação de upload
+posterior; este Passo NUNCA precisa disso, pois não há upload/validação de CSV pelo portal Purview neste
+STOP-THE-LINE). O artefato `mapping.csv` (fora do SQL) contém Mailbox — mesma classificação/ACL do artefato
+genérico.
+
+## Ameaças e mitigações (delta)
+
+| Ameaça | Mitigação |
+| --- | --- |
+| Correlação entrada↔output inferida por ordem de criação, nome de arquivo, string de mailbox ou cronologia — o erro que a plataforma existe para prevenir (importar o PST de um usuário para o archive de outro) | `WaveEntryId.Derive(wave, entry)` é uma função PURA e determinística sobre campos imutáveis da própria `WaveEntry` (nunca um índice/ordinal); `CreateWavePartitionOutputBindingUseCase` RESOLVE a entrada informada contra a seleção CORRENTE da onda via `WaveSelection.ResolveEntry` (recomputa e compara, nunca confia em um valor persistido à parte) — uma entrada que não é membro produz o MESMO erro anti-IDOR de onda/execução inexistente. Comprovado por `ResolveEntryFindsTheMatchingEntryRegardlessOfItsPositionInTheSelection`, `ExecuteFailsClosedWhenTheEntryIsNotAMemberOfTheWaveSCurrentSelection`. |
+| O mesmo artefato físico (replanejado) reatribuído silenciosamente a uma entrada de destino DIFERENTE dentro da mesma onda | `CreateWavePartitionOutputBindingUseCase` varre os vínculos já canônicos da onda e recusa fail-closed (`WavePartitionOutputBindingIncompatibleException`) qualquer novo vínculo cujo artefato já esteja canonicamente ligado a uma entrada diferente; um pedido repetido para o MESMO (wave, plano, parte) com uma entrada DIFERENTE da já vinculada também é recusado (`IsSameLogicalOutputAs` agora compara a entrada). Múltiplos vínculos para a MESMA entrada continuam legítimos (PST grande particionado em várias partes físicas). Comprovado por `ExecuteFailsClosedWhenTheSamePhysicalArtifactIsAlreadyCanonicallyBoundToADifferentEntryInTheSameWave`, `ARequestForTheSamePlanAndPartWithADifferentEntryFailsClosedWithoutOverwriting`, `ASecondPhysicalPartOfTheSameOversizedPstMayBindToTheSameEntryAsTheFirstPart`, e sob SQL real `ReassigningTheSamePhysicalArtifactToADifferentEntryInTheSameWaveFailsClosedUnderRealSql`, `MultiplePhysicalPartsForTheSameMailboxAllBindToTheSameEntryWithoutAmbiguity`. |
+| Adulteração da correlação (`entry_id`) diretamente na linha persistida, sem tocar nenhum outro campo | `entry_id` é parte do `binding_hash`; `Rehydrate` recomputa o hash a partir de TODOS os campos carregados (incluindo `entry_id`) e recusa fail-closed qualquer divergência. Comprovado por `RehydrateFailsClosedWhenTheEntryCorrelationWasTamperedEvenIfEveryOtherFieldMatches` e, sob SQL Server real, `GetCanonicalFailsClosedWhenTheEntryIdColumnIsTamperedDirectlyInTheRow`. |
+| Caller escolhe mailbox, PST, `FilePath`, `TargetRootFolder`, `IsArchive`, prefixo de upload ou conteúdo de linha do mapping (acceptance criteria 2) | `GeneratePurviewMappingCsvUseCase` nunca aceita esses valores como parâmetro — recebe apenas `TenantScope`/`WaveId`/`generatedBy`. `ResolvePurviewMappingEvidenceUseCase` resolve TODA a evidência (vínculos, execuções, entradas, precheck, upload verificado) exclusivamente dos stores canônicos; `FilePath`/`Name` derivam de `PurviewRemoteUploadPrefix.ForWave`/`PurviewRemotePstName.ForPart` — as MESMAS funções puras que o upload real usou (Passo 3), nunca de `WaveEntry.FilePath`/`PstName`. |
+| Geração do mapping antes de o PST correspondente estar comprovadamente carregado (acceptance criteria 2, item 3 do work order) | `ResolvePurviewMappingEvidenceUseCase` exige uma tentativa de upload com `Outcome == Uploaded` para a wave (`IPurviewUploadAttemptStore.GetLatestAsync`) e CONFERE que a evidência sanitizada daquela tentativa (prefixo remoto, contagem de arquivos, bytes totais) corresponde EXATAMENTE ao conjunto ATUAL de vínculos canônicos da onda — um vínculo criado DEPOIS do upload verificado (drift) é detectado e recusa fail-closed, exigindo repetir o upload antes de gerar o mapping. Comprovado por `GenerateFailsClosedWhenTheUploadWasNeverRequestedForTheWave` e, sob SQL real, `GenerateFailsClosedWhenTheVerifiedUploadEvidenceHasDriftedFromTheCurrentBindings`. |
+| `IsArchive=TRUE` emitido sem o precheck canônico comprovar o archive ativo/elegível (acceptance criteria 3, runbook §25.8) | `IsArchive` é resolvido POR LINHA a partir de `IMailboxPrecheckStore.GetLatestAsync` — `TRUE` somente quando o snapshot mais recente tem `ArchiveStatus == Active`; qualquer outro estado (incluindo ausência de precheck) produz `FALSE`, nunca inferência heurística nem valor fixo. Comprovado sob SQL real por `IsArchiveIsFalseWhenTheMailboxPrecheckDoesNotComproveAnActiveArchive`, `GenerateProducesAUsableVersionWithTheExpectedRowDerivedFromRealUploadAndPrecheckEvidence`. |
+| Identidade de mailbox não resolvida (`ArchiveRef.IsIdentityResolved == false`) emitida como `Mailbox` do CSV | `ResolvePurviewMappingEvidenceUseCase` recusa fail-closed a geração inteira (nunca uma linha parcial) quando qualquer entrada consumida tem identidade não resolvida — mesmo princípio fail-closed de `MailboxPrecheckSnapshot.Observe`/`WaveSelection.HasUnresolvedArchive`. |
+| Mais de 500 linhas geradas com split silencioso em múltiplos jobs (acceptance criteria 4, STOP-THE-LINE) | `PurviewMappingCsvGenerator.Generate` recusa fail-closed (`PurviewMappingCsvGenerationException`) qualquer conjunto de linhas acima de `MappingSchema.MaxDataRows` (500, reaproveitado do Slice 2) — nunca fragmenta. Backstop independente no banco: `CK_pmcv_rowcount CHECK (row_count BETWEEN 1 AND 500)`. Comprovado por `GenerateAccepts500RowsButRejects501WithoutSilentSplitting`. |
+| Injeção de fórmula CSV via valor textual vindo de diretório (Mailbox) | `PurviewMappingCsvSerializer` reaproveita a MESMA detecção de gatilho de fórmula do Slice 2 (`MappingCsvSerializer.StartsWithFormulaTrigger`) — um valor autorizado que começaria por `= + - @ \t \r` faz a geração INTEIRA falhar (`MappingCsvInjectionException`), nunca reescreve/prefixa o valor. Comprovado por `SerializationFailsClosedWhenAnAuthorizedFieldWouldStartWithAFormulaTrigger`. |
+| Nome de PST duplicado no job (colisão de destino no Purview) | `PurviewMappingCsvGenerator.Generate` recusa fail-closed qualquer nome duplicado — como `Name` deriva deterministicamente de `(ArtifactId, PartSequence)`, uma duplicata só ocorreria por corrupção de dados upstream, e mesmo assim é detectada. Comprovado por `GenerateRejectsADuplicatePstNameEvenAcrossDifferentMailboxes`. |
+| Reaproveitamento idempotente devolve um documento recém-gerado com evidência antiga, ou uma mudança real de evidência (precheck, vínculo, upload) não produz nova versão | `PurviewMappingGenerationFingerprint` incorpora a onda, a pasta de destino, o hash AGREGADO e ordenado do conteúdo de TODAS as linhas (já embutindo vínculo/execução/mailbox/archive resolvidos) e a identidade da tentativa de upload verificada — qualquer mudança real produz impressão diferente. Reaproveitamento devolve o artefato EXATO da versão anterior (`PurviewMappingDocument.FromPersisted`, hash revalidado), nunca um documento recém-serializado. Comprovado por `GenerateIsDeterministicProducingTheSameBytesAndHashForTheSameInput`, `GenerateProducesADifferentFingerprintWhenTheUploadAttemptIdentityDiffersEvenWithIdenticalRows` e, sob SQL real, `ARepeatedGenerationWithNoRealEvidenceChangeReusesTheSameVersionWithoutRegenerating`, `ARealChangeInMailboxPrecheckProducesANewVersionAndSupersedesThePrevious`. |
+| Artefato ausente, adulterado ou divergente da evidência SQL servido no download, ou download expõe o path físico interno (acceptance criteria 6, 8, 9; item 13) | `DownloadPurviewMappingCsvUseCase` resolve a versão por referência OPACA (`WaveId` + `MappingVersion`) exclusivamente dentro do escopo tenant/projeto do caller — versão inexistente OU de outro escopo produzem o MESMO erro anti-IDOR (`PurviewMappingCsvSourceNotFoundException`). O conteúdo é lido do artefato imutável (que já valida o bundle completo — hash do CSV, sidecar sha256, manifesto vs. escopo) e o `ContentSha256` é CRUZADO contra a evidência SQL antes de devolver os bytes; qualquer divergência recusa fail-closed. Nenhum path físico é exposto na API. Comprovado por `DownloadReturnsTheExactBytesOfTheRequestedVersionAndFailsClosedForAnotherProject`, `DownloadFailsClosedWhenTheSqlEvidenceHashDivergesFromThePublishedArtifact`. |
+| Versão substituída (Superseded) apagada ou tornada inacessível, forçando reconstrução da evidência histórica | `purview_mapping_csv_versions` é append-only (só a coluna `status` é atualizável, nunca DELETE); `IPurviewMappingCsvStore.GetByVersionAsync` resolve QUALQUER versão histórica (não apenas a corrente utilizável), preservando o acesso à evidência anterior indefinidamente — nunca regenera implicitamente uma versão passada. Comprovado por `ARealChangeInMailboxPrecheckProducesANewVersionAndSupersedesThePrevious` (a versão anterior permanece `GetByVersionAsync`-acessível e marcada `Superseded`, nunca removida). |
+| Edição manual/Excel do CSV para corrigir um erro do portal Purview (STOP-THE-LINE, runbook §25.9) | Nenhum caminho de código deste Passo lê um CSV externo/editado de volta — `purview_mapping_csv_versions`/o artefato imutável são SEMPRE produzidos por `GeneratePurviewMappingCsvUseCase`, nunca por upload/ingestão de um arquivo do operador. A orientação operacional (nunca editar manualmente; sempre gerar nova versão) já está documentada no runbook §25.9 existente — este Passo não precisou alterá-la. |
+| SQL injection | Todo acesso a dados é parametrizado (`SqlCommand`/`SqlParameter`), sem concatenação de entrada — reaproveita o mesmo padrão dos módulos anteriores. |
+| Dependência vazando de Domain/Application/Contracts para ASP.NET Core/Purview/vendor SDKs | O código deste Passo vive nos MESMOS assemblies (`ArchiveBridge.Domain`/`Application`/`Contracts`/`Infrastructure`) já cobertos por `MappingUploadBoundaryTests`/`VendorBoundaryTests` (reflexão sobre assemblies referenciados) — nenhuma referência nova a pacote de fornecedor foi introduzida; `ArchiveBridge.Architecture.Tests` permanece 100% verde (103/103) com este Passo. |
+
+## Fora de escopo deste Passo (herdado do STOP-THE-LINE)
+
+Criação, validação ou início automático de import job Purview; automação de browser/portal Purview;
+ingestão automática do validation report do Purview; início de `Import data`; Graph/Exchange Online writes;
+`Enable-Mailbox -Archive`, auto-expansion ou alteração de holds/retention; reconciliação pós-import ou
+conclusão de wave/projeto; edição manual/Excel do CSV; fragmentação automática em múltiplos jobs para
+ultrapassar 500 linhas; aceitar PST/mailbox/path/target root arbitrário do caller. Nenhum destes fluxos
+existe no código deste Passo — não há superfície de ameaça nova a analisar para eles aqui.

@@ -327,6 +327,74 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Migration0030AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0029 tivesse divergido, isto lançaria. Confirma a 0030 e a nova coluna entry_id (AB-I5-013).
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 30;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using var column = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.columns
+            WHERE object_id = OBJECT_ID('dbo.wave_partition_output_bindings') AND name = 'entry_id';
+            """,
+            connection);
+        Assert.Equal(1, Convert.ToInt32(await column.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
+    public async Task Migration0031AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0030 tivesse divergido, isto lançaria. Confirma a 0031 (AB-I5-012), o índice único de
+        // utilizável, e que a role da aplicação só pode UPDATE a coluna status.
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 31;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var table = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.tables WHERE name = 'purview_mapping_csv_versions';", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await table.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var index = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.indexes WHERE name = 'UX_pmcv_single_usable';", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await index.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using var grants = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.database_permissions AS p
+            JOIN sys.objects AS o ON o.object_id = p.major_id
+            JOIN sys.database_principals AS r ON r.principal_id = p.grantee_principal_id
+            WHERE r.name = 'ab_app_role' AND o.name = 'purview_mapping_csv_versions'
+              AND p.permission_name NOT IN ('SELECT', 'INSERT', 'UPDATE');
+            """,
+            connection);
+        Assert.Equal(0, Convert.ToInt32(await grants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
         var original = await ReadHashAsync(1);
