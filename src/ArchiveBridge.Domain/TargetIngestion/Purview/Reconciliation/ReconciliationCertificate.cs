@@ -257,9 +257,15 @@ public sealed record ReconciliationCertificate
 
     /// <summary>
     /// Reconstrói um certificate JÁ PERSISTIDO (uso exclusivo da camada de persistência), revalidando
-    /// <see cref="CertificateHash"/> contra os campos REALMENTE carregados (fail-closed).
+    /// <see cref="EvaluationFingerprint"/> e <see cref="CertificateHash"/> contra os campos REALMENTE
+    /// carregados (fail-closed) — inclusive <paramref name="persistedEvaluationFingerprint"/> (AB-I6-015: o
+    /// valor de <c>evaluation_fingerprint</c> REALMENTE persistido na linha, nunca apenas o recomputado em
+    /// memória a partir dos demais campos, para que uma adulteração isolada dessa coluna seja detectada).
     /// </summary>
-    /// <exception cref="ReconciliationCertificateIntegrityViolationException">O hash persistido diverge do recomputado.</exception>
+    /// <exception cref="ReconciliationCertificateIntegrityViolationException">
+    /// O <paramref name="persistedEvaluationFingerprint"/> diverge do recomputado a partir da evidência
+    /// carregada, ou o hash persistido diverge do recomputado.
+    /// </exception>
     public static ReconciliationCertificate Rehydrate(
         TenantId tenant,
         ProjectId project,
@@ -276,6 +282,7 @@ public sealed record ReconciliationCertificate
         Sha256Hash deviationsSha256,
         Sha256Hash decisionsStateFingerprint,
         bool duplicateRiskDetected,
+        Sha256Hash persistedEvaluationFingerprint,
         string issuedBy,
         string issuedByRole,
         CorrelationId correlation,
@@ -283,14 +290,29 @@ public sealed record ReconciliationCertificate
         string schemaVersion,
         Sha256Hash persistedCertificateHash)
     {
-        var evaluationFingerprint = ComputeEvaluationFingerprint(assessmentSourceFingerprint, deviationsSha256, decisionsStateFingerprint, duplicateRiskDetected);
-        var recomputed = ComputeCertificateHash(
+        // AB-I6-015: evaluation_fingerprint é um campo persistido próprio (não apenas derivado em memória) —
+        // recomputado a partir da evidência carregada e comparado fail-closed com o valor REALMENTE lido da
+        // linha ANTES de qualquer outra validação, para que uma adulteração isolada dessa coluna nunca passe
+        // despercebida só porque certificate_hash seria recomputado a partir do valor recalculado em vez do
+        // persistido.
+        var recomputedEvaluationFingerprint = ComputeEvaluationFingerprint(
+            assessmentSourceFingerprint, deviationsSha256, decisionsStateFingerprint, duplicateRiskDetected);
+
+        if (!string.Equals(recomputedEvaluationFingerprint.Value, persistedEvaluationFingerprint.Value, StringComparison.Ordinal))
+        {
+            throw new ReconciliationCertificateIntegrityViolationException(
+                $"O evaluation_fingerprint persistido para a versão {certificateVersion.ToString(CultureInfo.InvariantCulture)} do " +
+                $"certificate de reconciliação do plano {plannedJobName.Value} não corresponde ao fingerprint recomputado a " +
+                "partir dos campos de evidência carregados — certificate possivelmente adulterado ou corrompido.");
+        }
+
+        var recomputedHash = ComputeCertificateHash(
             tenant, project, wave, plannedJobName, certificateVersion, assessmentVersion, assessmentSourceFingerprint,
             mappingFingerprint, result, totalItemCount, incompleteItemCount, deviationCount, deviationsSha256,
-            decisionsStateFingerprint, duplicateRiskDetected, evaluationFingerprint, issuedBy, issuedByRole, correlation,
-            generatedAtUtc, schemaVersion);
+            decisionsStateFingerprint, duplicateRiskDetected, persistedEvaluationFingerprint, issuedBy, issuedByRole,
+            correlation, generatedAtUtc, schemaVersion);
 
-        if (!string.Equals(recomputed.Value, persistedCertificateHash.Value, StringComparison.Ordinal))
+        if (!string.Equals(recomputedHash.Value, persistedCertificateHash.Value, StringComparison.Ordinal))
         {
             throw new ReconciliationCertificateIntegrityViolationException(
                 $"O certificate_hash persistido para a versão {certificateVersion.ToString(CultureInfo.InvariantCulture)} do " +
@@ -301,8 +323,8 @@ public sealed record ReconciliationCertificate
         return new ReconciliationCertificate(
             tenant, project, wave, plannedJobName, certificateVersion, assessmentVersion, assessmentSourceFingerprint,
             mappingFingerprint, result, totalItemCount, incompleteItemCount, deviationCount, deviationsSha256,
-            decisionsStateFingerprint, duplicateRiskDetected, evaluationFingerprint, issuedBy, issuedByRole, correlation,
-            generatedAtUtc, schemaVersion, persistedCertificateHash);
+            decisionsStateFingerprint, duplicateRiskDetected, persistedEvaluationFingerprint, issuedBy, issuedByRole,
+            correlation, generatedAtUtc, schemaVersion, persistedCertificateHash);
     }
 
     /// <summary>

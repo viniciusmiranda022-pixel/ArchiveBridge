@@ -526,6 +526,41 @@ public sealed class ReconciliationCertificateIntegrationTests(SqlServerFixture f
             () => Certificates().GetByVersionAsync(scope, wave, plannedJobName, certificate.CertificateVersion, CancellationToken.None));
     }
 
+    // ---- AB-I6-015: evaluation_fingerprint persistido (coluna própria, distinta de certificate_hash)
+    // revalidado fail-closed contra o recomputado a partir da evidência carregada ----
+
+    [Fact]
+    public async Task GetByVersionFailsClosedWhenTheEvaluationFingerprintIsTamperedDirectlyInSql()
+    {
+        // Adultera SOMENTE evaluation_fingerprint (nenhum outro campo, incl. certificate_hash) — antes da
+        // correção de AB-I6-015 este valor persistido era simplesmente ignorado na leitura (a store pulava o
+        // índice 15) e Rehydrate recomputava um evaluation_fingerprint em memória a partir dos demais campos,
+        // deixando a adulteração isolada dessa coluna passar despercebida.
+        var (scope, wave, plannedJobName, _) = await SeedFullyMatchedAsync();
+        var certificate = await IssueUseCase().ExecuteAsync(Command(scope, wave, plannedJobName), CancellationToken.None);
+
+        await ExecuteAdminSqlAsync(
+            scope, "UPDATE dbo.purview_reconciliation_certificates SET evaluation_fingerprint = @forged WHERE wave_id = @wave;",
+            ("@wave", wave.Value), ("@forged", new string('9', 64)));
+
+        await Assert.ThrowsAsync<ReconciliationCertificateIntegrityViolationException>(
+            () => Certificates().GetByVersionAsync(scope, wave, plannedJobName, certificate.CertificateVersion, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetLatestFailsClosedWhenTheEvaluationFingerprintIsTamperedDirectlyInSql()
+    {
+        var (scope, wave, plannedJobName, _) = await SeedFullyMatchedAsync();
+        await IssueUseCase().ExecuteAsync(Command(scope, wave, plannedJobName), CancellationToken.None);
+
+        await ExecuteAdminSqlAsync(
+            scope, "UPDATE dbo.purview_reconciliation_certificates SET evaluation_fingerprint = @forged WHERE wave_id = @wave;",
+            ("@wave", wave.Value), ("@forged", new string('9', 64)));
+
+        await Assert.ThrowsAsync<ReconciliationCertificateIntegrityViolationException>(
+            () => Certificates().GetLatestAsync(scope, wave, plannedJobName, CancellationToken.None));
+    }
+
     // ---- 15: anti-IDOR cross-tenant/project ----
 
     [Fact]

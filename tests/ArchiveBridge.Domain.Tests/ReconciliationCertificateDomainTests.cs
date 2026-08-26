@@ -225,8 +225,8 @@ public sealed class ReconciliationCertificateDomainTests
             certificate.AssessmentSourceFingerprint, certificate.MappingFingerprint, certificate.Result,
             certificate.TotalItemCount, certificate.IncompleteItemCount, certificate.DeviationCount,
             certificate.DeviationsSha256, certificate.DecisionsStateFingerprint, certificate.DuplicateRiskDetected,
-            certificate.IssuedBy, certificate.IssuedByRole, certificate.Correlation, certificate.GeneratedAtUtc,
-            certificate.SchemaVersion, certificate.CertificateHash);
+            certificate.EvaluationFingerprint, certificate.IssuedBy, certificate.IssuedByRole, certificate.Correlation,
+            certificate.GeneratedAtUtc, certificate.SchemaVersion, certificate.CertificateHash);
 
         Assert.Equal(certificate.CertificateHash, rehydrated.CertificateHash);
         Assert.Equal(certificate.EvaluationFingerprint, rehydrated.EvaluationFingerprint);
@@ -243,8 +243,8 @@ public sealed class ReconciliationCertificateDomainTests
             ReconciliationOutcome.Pass, // tampered: certificate was actually Fail
             certificate.TotalItemCount, certificate.IncompleteItemCount, certificate.DeviationCount,
             certificate.DeviationsSha256, certificate.DecisionsStateFingerprint, certificate.DuplicateRiskDetected,
-            certificate.IssuedBy, certificate.IssuedByRole, certificate.Correlation, certificate.GeneratedAtUtc,
-            certificate.SchemaVersion, certificate.CertificateHash));
+            certificate.EvaluationFingerprint, certificate.IssuedBy, certificate.IssuedByRole, certificate.Correlation,
+            certificate.GeneratedAtUtc, certificate.SchemaVersion, certificate.CertificateHash));
     }
 
     [Fact]
@@ -259,8 +259,28 @@ public sealed class ReconciliationCertificateDomainTests
             certificate.AssessmentSourceFingerprint, certificate.MappingFingerprint, certificate.Result,
             certificate.TotalItemCount, certificate.IncompleteItemCount, certificate.DeviationCount,
             certificate.DeviationsSha256, new Sha256Hash(new string('9', 64)), // tampered
-            certificate.DuplicateRiskDetected, certificate.IssuedBy, certificate.IssuedByRole, certificate.Correlation,
-            certificate.GeneratedAtUtc, certificate.SchemaVersion, certificate.CertificateHash));
+            certificate.DuplicateRiskDetected, certificate.EvaluationFingerprint, certificate.IssuedBy,
+            certificate.IssuedByRole, certificate.Correlation, certificate.GeneratedAtUtc, certificate.SchemaVersion,
+            certificate.CertificateHash));
+    }
+
+    [Fact]
+    public void RehydrateThrowsWhenThePersistedEvaluationFingerprintDivergesFromTheRecomputedOne()
+    {
+        // AB-I6-015: evaluation_fingerprint é uma coluna persistida própria (índice 15 na store), separada do
+        // certificate_hash — adulterá-la isoladamente (todos os demais campos, incl. certificate_hash,
+        // permanecendo os originais) deve ser detectada fail-closed ANTES de qualquer validação de
+        // certificate_hash, nunca silenciosamente ignorada/recalculada por cima do valor persistido adulterado.
+        var certificate = Certificate();
+
+        Assert.Throws<ReconciliationCertificateIntegrityViolationException>(() => ReconciliationCertificate.Rehydrate(
+            Tenant, Project, Wave, PlannedJobName, certificate.CertificateVersion, certificate.AssessmentVersion,
+            certificate.AssessmentSourceFingerprint, certificate.MappingFingerprint, certificate.Result,
+            certificate.TotalItemCount, certificate.IncompleteItemCount, certificate.DeviationCount,
+            certificate.DeviationsSha256, certificate.DecisionsStateFingerprint, certificate.DuplicateRiskDetected,
+            new Sha256Hash(new string('9', 64)), // tampered: evaluation_fingerprint persistido, diverge do recomputado
+            certificate.IssuedBy, certificate.IssuedByRole, certificate.Correlation, certificate.GeneratedAtUtc,
+            certificate.SchemaVersion, certificate.CertificateHash));
     }
 
     [Fact]
