@@ -585,6 +585,55 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Migration0036AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0035 tivesse divergido, isto lançaria. Confirma a 0036 (AB-I6-007): a avaliação de
+        // reconciliação e seus dois itens filhos (PST/archive), todas append-only, e a UNIQUE de
+        // convergência idempotente por source_fingerprint.
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 36;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var tables = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.tables WHERE name IN
+                ('purview_reconciliation_assessments', 'purview_reconciliation_pst_items', 'purview_reconciliation_archive_items');
+            """,
+            connection))
+        {
+            Assert.Equal(3, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var index = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.indexes WHERE name = 'UQ_pra_fingerprint' AND is_unique = 1;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await index.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // Append-only: a aplicação recebe apenas SELECT/INSERT nas três tabelas novas (nenhum UPDATE/DELETE).
+        await using var grants = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.database_permissions AS p
+            JOIN sys.objects AS o ON o.object_id = p.major_id
+            JOIN sys.database_principals AS r ON r.principal_id = p.grantee_principal_id
+            WHERE r.name = 'ab_app_role'
+              AND o.name IN ('purview_reconciliation_assessments', 'purview_reconciliation_pst_items', 'purview_reconciliation_archive_items')
+              AND p.permission_name NOT IN ('SELECT', 'INSERT');
+            """,
+            connection);
+        Assert.Equal(0, Convert.ToInt32(await grants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
         var original = await ReadHashAsync(1);
