@@ -65,21 +65,40 @@ Este é o invariante central do work order §4: nenhuma execução pode converte
 `Enough` por default. Testado exaustivamente em `ScratchCapacityAssessorTests`, incluindo a fronteira exata
 (`available == required` ⇒ `Enough`) e `available == required - 1` ⇒ `Insufficient`.
 
-## 4. Relação com o preflight de produção atual
+## 4. Relação com o preflight de produção atual (AB-I7-004: agora CONECTADO)
 
 O caminho de produção existente, `LocalSinglePartExecutionWriter.EnsurePreflightSpace`
-(`src/ArchiveBridge.Infrastructure/PstProcessing/LocalSinglePartExecutionWriter.cs`), já falha fechado antes
-de qualquer escrita quando o espaço livre do volume de output é insuficiente — mas usa hoje uma checagem
-mais simples (`expectedSize + MinFreeSpaceMarginBytes` configurável, via `DriveInfo.AvailableFreeSpace`),
-não a fórmula multi-termo do runbook (não soma `repairBackupBytes`/`engineTemporaryOverhead`, porque nenhum
-dos dois existe neste caminho hoje, e a margem é um valor de configuração absoluto, não um percentual).
+(`src/ArchiveBridge.Infrastructure/PstProcessing/LocalSinglePartExecutionWriter.cs`), agora usa
+`ScratchCapacityFormula`/`ScratchCapacityAssessor` como autoridade ÚNICA de requisito de espaço — o
+Engineering Reviewer (AB-I7-004, blocker 2) apontou que a versão anterior deste Passo publicava a fórmula
+sem religá-la ao único caminho de produção que já conhece o footprint necessário, deixando duas regras
+concorrentes. Essa lacuna está fechada.
 
-Este Passo **não altera** esse preflight de produção: `ScratchCapacityFormula`/`ScratchCapacityAssessor` são
-a implementação de referência, autoritativa e testada da fórmula do runbook, publicada e pronta para ser
-adotada por um caminho de produção futuro que precise dos termos adicionais (ex.: quando uma engine de
-repair/split for aceita) — mas não estão hoje conectados ao `EnsurePreflightSpace` existente. Documentar
-essa distinção explicitamente, em vez de reivindicar uma integração que não existe, é a aplicação direta do
-princípio "represente lacuna como zero/não aplicável, nunca esconda" do próprio work order (§4).
+Mapeamento dos termos da fórmula para o ÚNICO caso que este writer materializa (`SinglePartWithinTarget`,
+cópia byte-for-byte para o volume de OUTPUT):
+
+| Termo da fórmula | Valor neste caminho | Prova |
+| --- | --- | --- |
+| `sourceCopyBytes` | `0` | A origem permanece intacta no volume de ORIGEM (`PstStorageOptions.RootPath`), nunca tocado por este preflight — só o volume de OUTPUT é checado; não existe uma segunda cópia da origem além da própria parte. |
+| `expectedPartBytes` | `expectedSize` | O único byte realmente escrito no volume de output (o arquivo de staging que se torna a parte final via `Directory.Move`). |
+| `repairBackupBytes` | `0` | Nenhuma engine de repair/split é usada por este writer — o ÚNICO caso autorizado é `SinglePartWithinTarget` (cópia byte-for-byte da origem inteira); nenhuma engine nova introduzida por este Passo. |
+| `engineTemporaryOverhead` | `0` | Os sidecars (`part.sha256` + `manifest.json`) somam poucos bytes/KB — desprezíveis frente à própria margem de 20%; contabilizá-los separadamente inventaria um número que o runbook não fornece. |
+
+A margem fixa historicamente configurada (`PartitionExecutionOutputOptions.MinFreeSpaceMarginBytes`) é
+preservada como um PISO adicional — nunca dupla contagem semântica (representa uma margem operacional
+distinta, sobre o mesmo `expectedSize`), mas o requisito final é o MAIOR entre o valor legado
+(`expectedSize + MinFreeSpaceMarginBytes`) e o valor calculado pela fórmula: esta integração nunca reduz a
+proteção que já existia antes dela. Overflow em qualquer um dos dois cálculos, entrada negativa, ou
+incapacidade de determinar o espaço disponível (raiz de volume irresolvível/drive não pronto — via o seam
+interno `IScratchSpaceProbe`) falham fechado com `PartitionExecutionLimitExceededException("INSUFFICIENT_SPACE")`,
+antes de qualquer diretório de staging ser criado — `Unknown` nunca vira `Enough`. Provado em
+`LocalSinglePartExecutionWriterPreflightCapacityTests`: espaço exatamente suficiente materializa o output
+normalmente, 1 byte abaixo do requisito falha fechado sem nenhum efeito no disco, capacidade indeterminável
+falha fechado, e overflow aritmético na combinação com a margem legada também falha fechado.
+
+Os termos `repairBackupBytes`/`engineTemporaryOverhead` continuam `0` porque nenhum dos dois existe neste
+caminho hoje — quando uma engine de repair/split ou um perfil de worker com overhead temporário real for
+aceito em um Passo futuro, esses termos passam a ser preenchidos com valores reais, nunca inventados agora.
 
 ## 5. ~24 GB/dia/mailbox — referência, nunca SLA
 

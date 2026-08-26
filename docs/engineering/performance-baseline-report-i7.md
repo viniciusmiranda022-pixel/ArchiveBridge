@@ -46,6 +46,16 @@ do work order §1:
 | `PartitionExecution` | `LocalSinglePartExecutionWriter.ExecuteAsync` (único caminho aceito, `SinglePartWithinTarget`) — cópia byte-for-byte real, um plano/parte novo por iteração (nunca mede o atalho de réplay idempotente) | 4 KiB, 256 KiB | Não | `PartitionExecutionBenchmarkTests` |
 | `MappingCsvGeneration` | `PurviewMappingCsvGenerator.Generate` (serviço puro) sobre linhas sintéticas | 10, 100, 500 linhas (500 = `MappingSchema.MaxDataRows`, fronteira) | Não | `MappingCsvGenerationBenchmarkTests` |
 | `PerformanceBenchmarkResultStoreSave` | Latência de `SqlPerformanceBenchmarkResultStore.SaveAsync` contra SQL Server real, mais o round-trip de persistência/replay da própria evidência | 1 medição por execução sintética | **Sim** (container SQL Server do CI) | `PerformanceBenchmarkResultStoreTests.BenchmarkingTheStoresOwnSaveLatencyProducesEvidenceThatCanBePersistedAndReplayed` |
+| `PartitionExecutionStoreSave` (AB-I7-004) | Latência de `SqlPartitionExecutionStore.SaveAsync` contra SQL Server real, com fixture real (custódia → inspeção → plano persistidos via os mesmos casos de uso da Slice 4B, `output == source`) — isola a store, não o writer de filesystem | 1 medição sintética (4 KiB) por iteração, fixture nova a cada iteração | **Sim** | `PartitionExecutionStoreBenchmarkTests` |
+| `PurviewMappingCsvStoreReserveAndFinalize` (AB-I7-004) | Round-trip completo (`ReserveAsync` → publicação do artefato → `FinalizeAsync`) de `SqlPurviewMappingCsvStore` via `GeneratePurviewMappingCsvUseCase.ExecuteAsync` — o caminho de produção real, sobre uma onda plenamente verificada (vínculo, precheck, upload) | 1 entrada por iteração, onda nova a cada iteração | **Sim** | `PurviewMappingCsvStoreBenchmarkTests` |
+| `ReconciliationCertificateStoreIssueOrConverge` (AB-I7-004) | `SqlReconciliationCertificateStore.IssueOrConvergeAsync` via `IssueReconciliationCertificateUseCase.ExecuteAsync` sobre uma onda plenamente reconciliada (evidência 100% completa, zero exceções materiais — o mesmo cenário "happy PASS") — cobre também o item 1.3 do work order (reconciliation/certificate sobre dataset sintético) | 1 PST por iteração, onda nova a cada iteração | **Sim** | `ReconciliationCertificateStoreBenchmarkTests` |
+
+Os três cenários AB-I7-004 acima constroem a fixture completa (cadeia real de FKs) ANTES de
+`harness.RunAsync`, fora da região medida — a medição isola a chamada real à store/caso de uso, não a
+preparação da evidência. Nenhuma constraint é contornada e nenhum SQL inválido é inserido só para o
+benchmark: as fixtures satisfazem de fato as FKs e invariantes reais do schema. Cada um também persiste sua
+evidência via `SqlPerformanceBenchmarkResultStore` (round-trip provado) e confirma isolamento tenant/project
+(um escopo diferente nunca enxerga a evidência de outro).
 
 Todos os datasets são sintéticos e determinísticos (conteúdo derivado apenas da seed, nunca dado real);
 nenhum resultado carrega assunto, corpo, destinatário, anexo, mailbox real ou caminho de arquivo real —
@@ -56,18 +66,6 @@ nenhum resultado carrega assunto, corpo, destinatário, anexo, mailbox real ou c
 
 Marcados assim de propósito — nunca aprovados implicitamente (work order §7/§9, STOP-THE-LINE):
 
-- **Latência SQL das stores mais profundas do pipeline** (`SqlPartitionExecutionStore`,
-  `SqlPurviewMappingCsvStore`, `SqlReconciliationCertificateStore`): cada uma exige uma cadeia de
-  pré-requisitos com FK real (custódia → plano/partes → execução; ou avaliação de reconciliação →
-  disposition → certificate) — persistir um registro isolado violaria a integridade referencial do schema.
-  Medir estas stores exige orquestrar a cadeia completa via os use cases reais (`PlanPstPartitionUseCase`,
-  `ExecutePartitionPlanUseCase` etc.), o que este Passo não fez para manter o escopo desta mudança de
-  hardening contido; a store MAIS SIMPLES do pipeline de benchmark (a própria
-  `SqlPerformanceBenchmarkResultStore`, sem dependência de FK externa) foi medida como evidência de latência
-  SQL representativa (§2). `GateStatus.NotMeasured` — motivo: "cadeia de FK do pipeline fora do escopo deste
-  Passo; ver §3 do performance baseline report".
-- **Reconciliation/certificate em datasets sintéticos:** mesma razão de cadeia de FK acima
-  (`ReconciliationCertificate` exige uma `ReconciliationAssessment` persistida). `GateStatus.NotMeasured`.
 - **PSTs de 100–500+ GB (repair/split, perfil Heavy PST):** nenhuma engine de repair/split está aceita
   (work order STOP-THE-LINE: "não introduzir engines/connectors novos fora do roadmap já aceito"); o
   runbook é explícito que um sparse file sozinho não valida parser PST — simulá-lo aqui produziria uma
@@ -113,7 +111,18 @@ teste e rode:
 ```bash
 export ARCHIVEBRIDGE_TEST_SQL="Server=localhost,11433;User ID=sa;Password=...;TrustServerCertificate=True;Encrypt=False"
 dotnet test tests/ArchiveBridge.Integration.Tests/ArchiveBridge.Integration.Tests.csproj \
-    --filter "FullyQualifiedName~Performance.PerformanceBenchmarkResultStoreTests" -c Release
+    --filter "FullyQualifiedName~Performance.PerformanceBenchmarkResultStoreTests|FullyQualifiedName~Performance.PartitionExecutionStoreBenchmarkTests|FullyQualifiedName~Performance.PurviewMappingCsvStoreBenchmarkTests|FullyQualifiedName~Performance.ReconciliationCertificateStoreBenchmarkTests" \
+    -c Release
+```
+
+O gate de capacidade de scratch integrado ao preflight de produção (AB-I7-004 §4 — ver
+`docs/engineering/capacity-planning-guide-i7.md` §4) é coberto por
+`LocalSinglePartExecutionWriterPreflightCapacityTests`, que NÃO depende de SQL Server (seam interno
+`IScratchSpaceProbe`, roda em qualquer máquina com o SDK):
+
+```bash
+dotnet test tests/ArchiveBridge.Integration.Tests/ArchiveBridge.Integration.Tests.csproj \
+    --filter "FullyQualifiedName~LocalSinglePartExecutionWriterPreflightCapacityTests" -c Release
 ```
 
 Em um host dedicado (ex.: perfil `Inspector`/`Validator` de `docs/engineering/capacity-planning-guide-i7.md`),
