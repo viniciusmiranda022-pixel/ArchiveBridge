@@ -114,7 +114,7 @@ public static class PurviewUploadComposition
 
         var processor = new PurviewUploadCommandProcessor(
             jobStore, leaseManager, uploadRequests, waves, bindings, executions, verifier, sasHandles, sasAcquisition,
-            azcopy, attempts, homologatedCatalog, options.AzCopyProcessTimeout, clock);
+            azcopy, attempts, homologatedCatalog, options.AzCopyProcessTimeout, clock, RetryPolicy.Default);
 
         var requestUseCase = new RequestPurviewUploadUseCase(waves, uploadRequests);
 

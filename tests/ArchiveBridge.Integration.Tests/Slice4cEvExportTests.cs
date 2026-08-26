@@ -438,7 +438,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
 
         var execution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
 
@@ -473,7 +473,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
 
         var execution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
 
@@ -502,7 +502,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspectorAtWriteTime, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
         await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
 
         // O output físico "desaparece" (adulteração/remoção fora da aplicação) antes do replay.
@@ -537,7 +537,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
 
         var firstExecution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
         Assert.NotNull(firstExecution);
@@ -591,7 +591,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
 
         var execution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
 
@@ -626,7 +626,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
 
         var execution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
 

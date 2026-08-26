@@ -1,4 +1,5 @@
 using System.Globalization;
+using ArchiveBridge.Application.Jobs;
 using ArchiveBridge.Application.Planning;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.EnterpriseVault.Connector;
@@ -17,10 +18,14 @@ public enum EvExportCommandOutcome
     /// <summary>Tentativa concluída com sucesso (efeito aplicado ou replay idempotente válido).</summary>
     Completed,
 
-    /// <summary>Erro terminal (capability bloqueada, integridade violada, erro de domínio): Job falhado.</summary>
+    /// <summary>
+    /// Erro terminal (capability bloqueada, integridade violada, erro de domínio) OU orçamento de retry
+    /// esgotado (AB-I7-002: falha transitória/throttle/concorrência que nunca se resolve converge a
+    /// Failed em vez de retry indefinido): Job falhado.
+    /// </summary>
     Failed,
 
-    /// <summary>Erro transitório (falha de processo, throttle, concorrência): nova tentativa agendada.</summary>
+    /// <summary>Erro transitório (falha de processo, throttle, concorrência) COM orçamento de retry disponível: nova tentativa agendada.</summary>
     Retried,
 
     /// <summary>Cercamento perdido: nenhum efeito persistido e a conclusão NÃO é reivindicada.</summary>
@@ -52,13 +57,15 @@ public sealed class EvExportCommandProcessor(
     IEvExportAuditTrail audit,
     EvExportPolicy policy,
     string connectorAuthorizedOutputRoot,
-    IClock clock)
+    IClock clock,
+    RetryPolicy retryPolicy)
 {
     private static readonly TimeSpan RetryBackoff = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan ThrottleBackoff = TimeSpan.FromSeconds(15);
 
     private readonly IEvExportCommandInbox _queue = queue;
     private readonly IJobStore _jobs = jobs;
+    private readonly RetryPolicy _retryPolicy = retryPolicy;
     private readonly PlanningHeartbeat _heartbeat = new(leases);
     private readonly IConnectorRegistry _connectors = connectors;
     private readonly IConnectorCapabilityStore _capabilities = capabilities;
@@ -111,9 +118,10 @@ public sealed class EvExportCommandProcessor(
         }
         catch (ConcurrencyException)
         {
-            var retried = await _jobs.ScheduleRetryAsync(
-                lease, ErrorCode.ConcurrencyLost, _clock.UtcNow + RetryBackoff, cancellationToken).ConfigureAwait(false);
-            return new EvExportCommandExecution(claimed.Job.JobId, claimed.Request, OutcomeFor(retried, EvExportCommandOutcome.Retried), retried);
+            var gate = await JobRetryGate.ScheduleRetryOrFailAsync(
+                _jobs, _clock, _retryPolicy, lease, ErrorCode.ConcurrencyLost, RetryBackoff, cancellationToken).ConfigureAwait(false);
+            var gatedOutcome = gate.RetryScheduled ? EvExportCommandOutcome.Retried : EvExportCommandOutcome.Failed;
+            return new EvExportCommandExecution(claimed.Job.JobId, claimed.Request, OutcomeFor(gate.Outcome, gatedOutcome), gate.Outcome);
         }
 
         return await FinalizeJobAsync(
@@ -160,18 +168,28 @@ public sealed class EvExportCommandProcessor(
                 return new EvExportCommandExecution(jobId, request, OutcomeFor(failed, EvExportCommandOutcome.Failed), failed);
 
             case EvExportAttemptOutcome.Throttled:
-                var throttled = await _jobs.ScheduleRetryAsync(
-                    lease, ErrorCode.ResourceExhaustion, _clock.UtcNow + ThrottleBackoff, cancellationToken).ConfigureAwait(false);
-                await AuditRetryScheduledIfAppliedAsync(
-                    lease.Scope, request, result.Attempt, correlation, throttled, cancellationToken).ConfigureAwait(false);
-                return new EvExportCommandExecution(jobId, request, OutcomeFor(throttled, EvExportCommandOutcome.Retried), throttled);
+                var throttleGate = await JobRetryGate.ScheduleRetryOrFailAsync(
+                    _jobs, _clock, _retryPolicy, lease, ErrorCode.ResourceExhaustion, ThrottleBackoff, cancellationToken).ConfigureAwait(false);
+                if (throttleGate.RetryScheduled)
+                {
+                    await AuditRetryScheduledIfAppliedAsync(
+                        lease.Scope, request, result.Attempt, correlation, throttleGate.Outcome, cancellationToken).ConfigureAwait(false);
+                }
 
-            default: // Failed (falha transitória do processo do exporter): candidata a retry.
-                var retried = await _jobs.ScheduleRetryAsync(
-                    lease, ErrorCode.TransientProvider, _clock.UtcNow + RetryBackoff, cancellationToken).ConfigureAwait(false);
-                await AuditRetryScheduledIfAppliedAsync(
-                    lease.Scope, request, result.Attempt, correlation, retried, cancellationToken).ConfigureAwait(false);
-                return new EvExportCommandExecution(jobId, request, OutcomeFor(retried, EvExportCommandOutcome.Retried), retried);
+                var throttleOutcome = throttleGate.RetryScheduled ? EvExportCommandOutcome.Retried : EvExportCommandOutcome.Failed;
+                return new EvExportCommandExecution(jobId, request, OutcomeFor(throttleGate.Outcome, throttleOutcome), throttleGate.Outcome);
+
+            default: // Failed (falha transitória do processo do exporter): candidata a retry, sob orçamento.
+                var retryGate = await JobRetryGate.ScheduleRetryOrFailAsync(
+                    _jobs, _clock, _retryPolicy, lease, ErrorCode.TransientProvider, RetryBackoff, cancellationToken).ConfigureAwait(false);
+                if (retryGate.RetryScheduled)
+                {
+                    await AuditRetryScheduledIfAppliedAsync(
+                        lease.Scope, request, result.Attempt, correlation, retryGate.Outcome, cancellationToken).ConfigureAwait(false);
+                }
+
+                var retryOutcome = retryGate.RetryScheduled ? EvExportCommandOutcome.Retried : EvExportCommandOutcome.Failed;
+                return new EvExportCommandExecution(jobId, request, OutcomeFor(retryGate.Outcome, retryOutcome), retryGate.Outcome);
         }
     }
 

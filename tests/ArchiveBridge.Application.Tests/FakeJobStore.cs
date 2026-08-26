@@ -17,6 +17,19 @@ internal sealed class FakeJobStore(int attemptCount) : IJobStore
 
     public DateTimeOffset? ScheduledNextAttempt { get; private set; }
 
+    public ErrorCode? LastFailErrorCode { get; private set; }
+
+    public ErrorCode? LastScheduleRetryErrorCode { get; private set; }
+
+    /// <summary>Quantas vezes GetAsync devolveu um snapshot (nulo se nunca chamado) — prova que o
+    /// orçamento é consultado NO MÁXIMO uma vez por decisão (AB-I7-002).</summary>
+    public int GetAsyncCallCount { get; private set; }
+
+    /// <summary>Quando não-nulo, GetAsync devolve <see langword="null"/> (job inexistente/fora de escopo)
+    /// em vez do snapshot sintético — usado para provar o comportamento fail-closed de JobRetryGate
+    /// quando o orçamento não pode ser verificado.</summary>
+    public bool ReturnNullSnapshot { get; set; }
+
     /// <summary>Resultado devolvido por <see cref="RequestManualRetryAsync"/> — configurável pelo teste.</summary>
     public JobRetryRequestOutcome RetryOutcome { get; set; } = JobRetryRequestOutcome.Applied;
 
@@ -32,6 +45,12 @@ internal sealed class FakeJobStore(int attemptCount) : IJobStore
 
     public Task<JobSnapshot?> GetAsync(TenantScope scope, JobId jobId, CancellationToken cancellationToken)
     {
+        GetAsyncCallCount++;
+        if (ReturnNullSnapshot)
+        {
+            return Task.FromResult<JobSnapshot?>(null);
+        }
+
         var snapshot = new JobSnapshot(
             jobId,
             scope.Tenant,
@@ -56,6 +75,7 @@ internal sealed class FakeJobStore(int attemptCount) : IJobStore
     public Task<JobCommandOutcome> FailAsync(LeaseCommand command, ErrorCode errorCode, CancellationToken cancellationToken)
     {
         FailCalled = true;
+        LastFailErrorCode = errorCode;
         return Task.FromResult(JobCommandOutcome.Applied);
     }
 
@@ -67,6 +87,7 @@ internal sealed class FakeJobStore(int attemptCount) : IJobStore
     {
         ScheduleRetryCalled = true;
         ScheduledNextAttempt = nextAttemptAtUtc;
+        LastScheduleRetryErrorCode = errorCode;
         return Task.FromResult(JobCommandOutcome.Applied);
     }
 

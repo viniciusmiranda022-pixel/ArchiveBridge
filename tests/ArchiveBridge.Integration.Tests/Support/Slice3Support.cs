@@ -46,7 +46,8 @@ internal static class Slice3Support
             Slice2Support.ProjectStore(fixture, clock),
             UseCase(fixture, host, clock),
             EvDiscoveryPolicy.Default,
-            clock);
+            clock,
+            RetryPolicy.Default);
 
     public static EvEnvironmentDescriptor NewEnvironment() =>
         new(new EvEnvironmentId(Guid.NewGuid()), "site-a", "dir-a.contoso.local");

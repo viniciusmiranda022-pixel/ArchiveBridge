@@ -1,3 +1,4 @@
+using ArchiveBridge.Application.Jobs;
 using ArchiveBridge.Application.Mapping;
 using ArchiveBridge.Application.Waves;
 using ArchiveBridge.Contracts.Abstractions;
@@ -19,10 +20,14 @@ public enum PlanningCommandOutcome
     /// <summary>Executado e o Job concluído (efeito aplicado ou replay idempotente válido).</summary>
     Completed,
 
-    /// <summary>Erro de domínio / contexto obsoleto: Job falhado de forma terminal.</summary>
+    /// <summary>
+    /// Erro de domínio/contexto obsoleto OU orçamento de retry esgotado (AB-I7-002: concorrência
+    /// persistente que nunca se resolve converge a Failed em vez de retry indefinido): Job falhado de
+    /// forma terminal.
+    /// </summary>
     Failed,
 
-    /// <summary>Erro transitório: nova tentativa agendada (retry).</summary>
+    /// <summary>Erro transitório COM orçamento de retry disponível: nova tentativa agendada (retry).</summary>
     Retried,
 
     /// <summary>
@@ -58,12 +63,14 @@ public sealed class PlanningCommandProcessor(
     GenerateMappingCsvUseCase generateMapping,
     FreezeWaveUseCase freezeWave,
     MappingPolicy policy,
-    IClock clock)
+    IClock clock,
+    RetryPolicy retryPolicy)
 {
     private static readonly TimeSpan RetryBackoff = TimeSpan.FromSeconds(30);
 
     private readonly IPlanningCommandInbox _queue = queue;
     private readonly IJobStore _jobs = jobs;
+    private readonly RetryPolicy _retryPolicy = retryPolicy;
     private readonly PlanningHeartbeat _heartbeat = new(leases);
     private readonly IProjectStore _projects = projects;
     private readonly IWaveStore _waves = waves;
@@ -122,9 +129,10 @@ public sealed class PlanningCommandProcessor(
         }
         catch (ConcurrencyException)
         {
-            var retried = await _jobs.ScheduleRetryAsync(
-                lease, ErrorCode.ConcurrencyLost, _clock.UtcNow + RetryBackoff, cancellationToken).ConfigureAwait(false);
-            return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, OutcomeFor(retried, PlanningCommandOutcome.Retried), retried);
+            var gate = await JobRetryGate.ScheduleRetryOrFailAsync(
+                _jobs, _clock, _retryPolicy, lease, ErrorCode.ConcurrencyLost, RetryBackoff, cancellationToken).ConfigureAwait(false);
+            var gatedOutcome = gate.RetryScheduled ? PlanningCommandOutcome.Retried : PlanningCommandOutcome.Failed;
+            return new PlanningCommandExecution(claimed.Job.JobId, command.Kind, OutcomeFor(gate.Outcome, gatedOutcome), gate.Outcome);
         }
 
         var completed = await _jobs.CompleteAsync(lease, cancellationToken).ConfigureAwait(false);

@@ -187,7 +187,8 @@ public sealed class Slice4aEvWorkerPipelineTests(SqlServerFixture fixture)
             Slice2Support.ProjectStore(_fixture, clock),
             useCase,
             Policy,
-            clock);
+            clock,
+            RetryPolicy.Default);
     }
 
     private static EvDiscoveryCommand BuildCommand(TenantScope scope) =>

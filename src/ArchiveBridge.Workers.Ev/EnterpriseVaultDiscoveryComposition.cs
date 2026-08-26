@@ -109,7 +109,7 @@ public static class EnterpriseVaultDiscoveryComposition
         var discoverUseCase = new DiscoverEvCapabilitiesUseCase(
             discovery, adapters, serializer, discoveryStore, evidenceStore, clock);
         var processor = new EvDiscoveryCommandProcessor(
-            inbox, jobStore, leaseManager, projectStore, discoverUseCase, EvDiscoveryPolicy.Default, clock);
+            inbox, jobStore, leaseManager, projectStore, discoverUseCase, EvDiscoveryPolicy.Default, clock, RetryPolicy.Default);
 
         services.AddSingleton<IEvDiscoveryPendingScopeReader>(scopeReader);
         services.AddSingleton(processor);

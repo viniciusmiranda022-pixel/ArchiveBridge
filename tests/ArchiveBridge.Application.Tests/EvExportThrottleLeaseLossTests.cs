@@ -64,7 +64,7 @@ public sealed class EvExportThrottleLeaseLossTests
         var processor = new EvExportCommandProcessor(
             inbox, jobStore, new AlwaysAppliedJobLeaseManager(), connectors, capabilities, throttle, executor,
             new FakeEvExportOutputInspector([]), attempts, new FakeEvExportAuditTrail(), EvExportPolicy.Default,
-            "C:\\connector-root", stubClock);
+            "C:\\connector-root", stubClock, RetryPolicy.Default);
 
         var processing = processor.ProcessNextAsync(scope, new WorkerId("w"), LeaseDuration, CorrelationId.New(), CancellationToken.None);
 

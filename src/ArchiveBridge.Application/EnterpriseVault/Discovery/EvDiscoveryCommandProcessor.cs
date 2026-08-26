@@ -1,3 +1,4 @@
+using ArchiveBridge.Application.Jobs;
 using ArchiveBridge.Application.Planning;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.EnterpriseVault.Discovery;
@@ -16,10 +17,14 @@ public enum EvDiscoveryCommandOutcome
     /// <summary>Executado e o Job concluído (efeito aplicado ou replay idempotente válido).</summary>
     Completed,
 
-    /// <summary>Erro de domínio/contexto obsoleto: Job falhado de forma terminal.</summary>
+    /// <summary>
+    /// Erro de domínio/contexto obsoleto OU orçamento de retry esgotado (AB-I7-002: falha
+    /// transitória/concorrência que nunca se resolve converge a Failed em vez de retry indefinido):
+    /// Job falhado de forma terminal.
+    /// </summary>
     Failed,
 
-    /// <summary>Erro transitório (sonda/concorrência): nova tentativa agendada.</summary>
+    /// <summary>Erro transitório (sonda/concorrência) COM orçamento de retry disponível: nova tentativa agendada.</summary>
     Retried,
 
     /// <summary>Cercamento perdido: nenhum efeito persistido e a conclusão NÃO é reivindicada.</summary>
@@ -45,12 +50,14 @@ public sealed class EvDiscoveryCommandProcessor(
     IProjectStore projects,
     DiscoverEvCapabilitiesUseCase discover,
     EvDiscoveryPolicy policy,
-    IClock clock)
+    IClock clock,
+    RetryPolicy retryPolicy)
 {
     private static readonly TimeSpan RetryBackoff = TimeSpan.FromSeconds(30);
 
     private readonly IEvDiscoveryCommandInbox _queue = queue;
     private readonly IJobStore _jobs = jobs;
+    private readonly RetryPolicy _retryPolicy = retryPolicy;
     private readonly PlanningHeartbeat _heartbeat = new(leases);
     private readonly IProjectStore _projects = projects;
     private readonly DiscoverEvCapabilitiesUseCase _discover = discover;
@@ -98,15 +105,17 @@ public sealed class EvDiscoveryCommandProcessor(
         }
         catch (ConcurrencyException)
         {
-            var retried = await _jobs.ScheduleRetryAsync(
-                lease, ErrorCode.ConcurrencyLost, _clock.UtcNow + RetryBackoff, cancellationToken).ConfigureAwait(false);
-            return new EvDiscoveryCommandExecution(claimed.Job.JobId, OutcomeFor(retried, EvDiscoveryCommandOutcome.Retried), retried);
+            var gate = await JobRetryGate.ScheduleRetryOrFailAsync(
+                _jobs, _clock, _retryPolicy, lease, ErrorCode.ConcurrencyLost, RetryBackoff, cancellationToken).ConfigureAwait(false);
+            var gatedOutcome = gate.RetryScheduled ? EvDiscoveryCommandOutcome.Retried : EvDiscoveryCommandOutcome.Failed;
+            return new EvDiscoveryCommandExecution(claimed.Job.JobId, OutcomeFor(gate.Outcome, gatedOutcome), gate.Outcome);
         }
         catch (EvDiscoveryProbeException)
         {
-            var retried = await _jobs.ScheduleRetryAsync(
-                lease, ErrorCode.TransientProvider, _clock.UtcNow + RetryBackoff, cancellationToken).ConfigureAwait(false);
-            return new EvDiscoveryCommandExecution(claimed.Job.JobId, OutcomeFor(retried, EvDiscoveryCommandOutcome.Retried), retried);
+            var gate = await JobRetryGate.ScheduleRetryOrFailAsync(
+                _jobs, _clock, _retryPolicy, lease, ErrorCode.TransientProvider, RetryBackoff, cancellationToken).ConfigureAwait(false);
+            var gatedOutcome = gate.RetryScheduled ? EvDiscoveryCommandOutcome.Retried : EvDiscoveryCommandOutcome.Failed;
+            return new EvDiscoveryCommandExecution(claimed.Job.JobId, OutcomeFor(gate.Outcome, gatedOutcome), gate.Outcome);
         }
 
         var completed = await _jobs.CompleteAsync(lease, cancellationToken).ConfigureAwait(false);

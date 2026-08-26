@@ -54,14 +54,17 @@ processo falhou por qualquer outro motivo APÓS a leitura do segredo). O sistema
 já lido nem tenta AzCopy de novo sem um SAS válido — cada nova tentativa é negada fail-closed
 (`PurviewSasAcquisitionDeniedException` → `SasDenied`).
 
-**Recuperação automática:** nenhuma — este é o achado documentado em
-[`chaos-failure-mode-matrix.md`](chaos-failure-mode-matrix.md): sem uma nova geração de SAS, o job pode
-retry indefinidamente sem nunca convergir a `Failed`.
+**Recuperação automática:** cada tentativa negada passa por `JobRetryGate.ScheduleRetryOrFailAsync`
+(AB-I7-002 — ver [`chaos-failure-mode-matrix.md`](chaos-failure-mode-matrix.md)), que consulta o MESMO
+orçamento (`RetryPolicy.ShouldRetry`/`AttemptCount`) já usado pelo reaper do §1. Sem uma nova geração de
+SAS, o job retenta enquanto houver orçamento e então converge automaticamente para `Failed`
+(`ErrorCode.ResourceExhaustion`) — nunca fica preso retentando indefinidamente.
 
-**Ação humana:** emitir um NOVO SAS para a wave (novo `Intake` — `PurviewSasUploadHandle.Intake` versiona
-e supera a geração anterior, mantendo a anterior como `Destroyed`/histórico) e, se o job estiver preso em
-retry sem nunca reconhecer o novo handle, cancelar (`Job.Cancel`) e reabrir a solicitação de upload através
-do fluxo normal (`RequestPurviewUploadUseCase`, idempotente por wave).
+**Ação humana:** revisar o job `Failed` por `ResourceExhaustion` (mesmo sinal do §1); emitir um NOVO SAS
+para a wave (novo `Intake` — `PurviewSasUploadHandle.Intake` versiona e supera a geração anterior, mantendo
+a anterior como `Destroyed`/histórico) e reabrir a solicitação de upload através do fluxo normal
+(`RequestPurviewUploadUseCase`, idempotente por wave) — um Job já `Failed` nunca é reivindicado de novo
+pelo mesmo pedido; a reabertura cria um novo ciclo.
 
 ## 4. Output tampered / manifesto divergente (PST partition, EV export, mapping)
 
