@@ -148,7 +148,7 @@ public sealed class PurviewUploadUseCaseTests
 
         var processor = new PurviewUploadCommandProcessor(
             jobs, leases, requests, waves, bindings, executions, verifier, sasHandles, sasAcquisition, azcopy, attempts,
-            catalog, TimeSpan.FromMinutes(30), new FixedClock(Now));
+            catalog, TimeSpan.FromMinutes(30), new FixedClock(Now), RetryPolicy.Default);
 
         return new Fixture(jobs, leases, requests, waves, bindings, executions, verifier, sasHandles, secrets, azcopy, attempts, processor);
     }
@@ -237,6 +237,29 @@ public sealed class PurviewUploadUseCaseTests
     }
 
     [Fact]
+    public async Task ASasThatCannotBeAcquiredOnceTheRetryBudgetIsExhaustedFailsTheJobInsteadOfRetryingForever()
+    {
+        // AB-I7-002: sem JobRetryGate, uma causa de SasDenied que NUNCA se resolve (SAS permanentemente
+        // indisponível/consumido) faria o Job oscilar Processing/RetryScheduled para sempre — nunca
+        // convergindo. Com o gate, a MESMA tentativa que esgota o orçamento (AttemptCount ==
+        // RetryPolicy.Default.MaxAttempts) converge o Job a Failed, sem NUNCA invocar AzCopy.
+        var wave = ApprovedWave();
+        var part = NewBinding(wave.Id);
+        var binary = new AzCopyBinaryIdentity("10.25.0", Hash("bin"));
+        var fixture = BuildFixture(wave, [part], binary, sasHandle: null); // Sem SAS custodiado ⇒ SasDenied.
+        fixture.Jobs.AttemptNumber = 5; // RetryPolicy.Default.MaxAttempts == 5 ⇒ orçamento esgotado.
+
+        var result = await fixture.Processor.ProcessNextAsync(
+            Scope, new WorkerId("w"), TimeSpan.FromMinutes(5), CorrelationId.New(), CancellationToken.None);
+
+        Assert.Equal(PurviewUploadCommandOutcome.Failed, result!.Outcome);
+        Assert.True(fixture.Jobs.FailCalled);
+        Assert.False(fixture.Jobs.RetryCalled);
+        Assert.Equal(PurviewUploadAttemptOutcome.SasDenied, fixture.Attempts.Appended[0].Outcome);
+        Assert.Equal(0, fixture.AzCopy.UploadCallCount); // AzCopy nunca é invocado sem SAS, orçamento esgotado ou não.
+    }
+
+    [Fact]
     public async Task AProcessFailureIsRetriedAndNeverProducesUploaded()
     {
         var wave = ApprovedWave();
@@ -251,6 +274,64 @@ public sealed class PurviewUploadUseCaseTests
         Assert.Equal(PurviewUploadCommandOutcome.Retried, result!.Outcome);
         Assert.Equal(PurviewUploadAttemptOutcome.ProcessFailed, fixture.Attempts.Appended[0].Outcome);
         Assert.NotEqual(PurviewUploadAttemptOutcome.Uploaded, fixture.Attempts.Appended[0].Outcome);
+    }
+
+    [Fact]
+    public async Task AProcessResultThatTimesOutDespiteAZeroExitCodeIsTreatedAsFailureNeverAsUploaded()
+    {
+        // AB-I7-001 chaos case 173/#10 (provider retornando resultado ambíguo): um exit code 0, isolado,
+        // sugeriria sucesso — mas o processo também estourou o timeout configurado. A ambiguidade nunca é
+        // resolvida a favor do sucesso: TimedOut sozinho já basta para tratar a tentativa como falha.
+        var wave = ApprovedWave();
+        var part = NewBinding(wave.Id);
+        var binary = new AzCopyBinaryIdentity("10.25.0", Hash("bin"));
+        var fixture = BuildFixture(wave, [part], binary, AvailableSasHandle(wave.Id, Now.AddHours(2)));
+        fixture.AzCopy.NextResult = new AzCopyUploadFileResult(ExitCode: 0, TimedOut: true, OutputLimitExceeded: false);
+
+        var result = await fixture.Processor.ProcessNextAsync(
+            Scope, new WorkerId("w"), TimeSpan.FromMinutes(5), CorrelationId.New(), CancellationToken.None);
+
+        Assert.Equal(PurviewUploadCommandOutcome.Retried, result!.Outcome);
+        Assert.Equal(PurviewUploadAttemptOutcome.ProcessFailed, fixture.Attempts.Appended[0].Outcome);
+        Assert.Equal("PROCESS_TIMEOUT", fixture.Attempts.Appended[0].BlockingReason);
+        Assert.NotEqual(PurviewUploadAttemptOutcome.Uploaded, fixture.Attempts.Appended[0].Outcome);
+    }
+
+    [Fact]
+    public async Task ASasConsumedByAFailedAttemptIsNeverReacquiredByARetryAndTheJobNeverFalselyCompletes()
+    {
+        // AB-I7-001 chaos case 169/#8 (SAS expirando durante o upload) + item 3 (ambiguidade externa nunca
+        // dispara retry cego): o SAS é de uso único — uma vez consumido por uma tentativa cujo TRANSPORTE
+        // falhou depois disso (ex.: o SAS expirou durante o próprio upload do AzCopy), uma segunda tentativa
+        // (o mesmo Job re-reivindicado após o backoff) NUNCA reutiliza o segredo já lido nem invoca AzCopy de
+        // novo — é negada fail-closed (SasDenied) e agendada para nova tentativa, nunca marcada Uploaded.
+        var wave = ApprovedWave();
+        var part = NewBinding(wave.Id);
+        var binary = new AzCopyBinaryIdentity("10.25.0", Hash("bin"));
+        var fixture = BuildFixture(wave, [part], binary, AvailableSasHandle(wave.Id, Now.AddHours(2)));
+        fixture.AzCopy.NextResult = new AzCopyUploadFileResult(ExitCode: 1, TimedOut: false, OutputLimitExceeded: false);
+
+        var first = await fixture.Processor.ProcessNextAsync(
+            Scope, new WorkerId("w"), TimeSpan.FromMinutes(5), CorrelationId.New(), CancellationToken.None);
+        Assert.Equal(PurviewUploadCommandOutcome.Retried, first!.Outcome);
+        Assert.Equal(PurviewUploadAttemptOutcome.ProcessFailed, fixture.Attempts.Appended[0].Outcome);
+        Assert.Equal(1, fixture.Secrets.AcquireCallCount);
+        Assert.Equal(1, fixture.AzCopy.UploadCallCount);
+
+        // Re-reivindicação do MESMO Job (mesmo padrão de "worker pega de novo após o backoff") — o handle
+        // SAS já está Consumed (terminal, nunca retorna a Available/Claimed pelo próprio desenho de
+        // AcquireSasForUploadUseCase).
+        fixture.Jobs.HasWork = true;
+        fixture.Jobs.AttemptNumber = 2;
+        var second = await fixture.Processor.ProcessNextAsync(
+            Scope, new WorkerId("w"), TimeSpan.FromMinutes(5), CorrelationId.New(), CancellationToken.None);
+
+        Assert.Equal(PurviewUploadCommandOutcome.Retried, second!.Outcome);
+        Assert.Equal(PurviewUploadAttemptOutcome.SasDenied, fixture.Attempts.Appended[1].Outcome);
+        Assert.Equal(1, fixture.Secrets.AcquireCallCount); // o secret store nunca é lido de novo.
+        Assert.Equal(1, fixture.AzCopy.UploadCallCount); // AzCopy nunca é invocado sem um SAS válido em mãos.
+        Assert.DoesNotContain(fixture.Attempts.Appended, attempt => attempt.Outcome == PurviewUploadAttemptOutcome.Uploaded);
+        Assert.False(fixture.Jobs.CompleteCalled);
     }
 
     [Fact]
@@ -379,8 +460,13 @@ public sealed class PurviewUploadUseCaseTests
             return Task.FromResult<ClaimedJob?>(new ClaimedJob(jobId, new LeaseEpoch(1), DateTimeOffset.UtcNow.AddMinutes(5), AttemptNumber));
         }
 
+        // AttemptCount espelha AttemptNumber (o mesmo valor que TryClaimNextAsync já devolveu no claim) —
+        // usado por JobRetryGate (AB-I7-002) para decidir orçamento de retry antes de ScheduleRetryAsync.
         public Task<JobSnapshot?> GetAsync(TenantScope scope, JobId jobId, CancellationToken cancellationToken) =>
-            throw new NotSupportedException();
+            Task.FromResult<JobSnapshot?>(new JobSnapshot(
+                jobId, scope.Tenant, scope.Project, Workload.Upload, JobPriority.Normal, JobState.Processing,
+                new WorkerId("w"), new LeaseEpoch(1), DateTimeOffset.UtcNow.AddMinutes(5), AttemptNumber, null, null,
+                DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch));
 
         public Task<JobCommandOutcome> CompleteAsync(LeaseCommand command, CancellationToken cancellationToken)
         {

@@ -1,3 +1,4 @@
+using ArchiveBridge.Application.Jobs;
 using ArchiveBridge.Application.Planning;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
@@ -23,10 +24,14 @@ public enum PurviewUploadCommandOutcome
     /// <summary>Tentativa concluída com sucesso (transporte comprovado ou réplay idempotente válido).</summary>
     Completed,
 
-    /// <summary>Erro terminal (fonte adulterada, binário não homologado): Job falhado.</summary>
+    /// <summary>
+    /// Erro terminal (fonte adulterada, binário não homologado) OU orçamento de retry esgotado
+    /// (AB-I7-002: uma causa transitória que nunca se resolve — ex.: SAS permanentemente consumido —
+    /// converge a Failed em vez de retry indefinido): Job falhado.
+    /// </summary>
     Failed,
 
-    /// <summary>Erro transitório (SAS contenção, falha de processo): nova tentativa agendada.</summary>
+    /// <summary>Erro transitório (SAS contenção, falha de processo) COM orçamento de retry disponível: nova tentativa agendada.</summary>
     Retried,
 
     /// <summary>Cercamento perdido: nenhum efeito persistido e a conclusão NÃO é reivindicada.</summary>
@@ -60,11 +65,13 @@ public sealed class PurviewUploadCommandProcessor(
     IPurviewUploadAttemptStore attempts,
     AzCopyHomologationCatalog homologatedBinaries,
     TimeSpan azCopyTimeout,
-    IClock clock)
+    IClock clock,
+    RetryPolicy retryPolicy)
 {
     private static readonly TimeSpan RetryBackoff = TimeSpan.FromSeconds(30);
 
     private readonly IJobStore _jobs = jobs;
+    private readonly RetryPolicy _retryPolicy = retryPolicy;
     private readonly PlanningHeartbeat _heartbeat = new(leases);
     private readonly IPurviewUploadRequestStore _requests = requests;
     private readonly IWaveStore _waves = waves;
@@ -126,10 +133,11 @@ public sealed class PurviewUploadCommandProcessor(
         }
         catch (ConcurrencyException)
         {
-            var retried = await _jobs
-                .ScheduleRetryAsync(lease, ErrorCode.ConcurrencyLost, _clock.UtcNow + RetryBackoff, cancellationToken)
+            var gate = await JobRetryGate
+                .ScheduleRetryOrFailAsync(_jobs, _clock, _retryPolicy, lease, ErrorCode.ConcurrencyLost, RetryBackoff, cancellationToken)
                 .ConfigureAwait(false);
-            return new PurviewUploadCommandExecution(claimedJob.JobId, requestId, OutcomeFor(retried, PurviewUploadCommandOutcome.Retried), retried);
+            var gatedOutcome = gate.RetryScheduled ? PurviewUploadCommandOutcome.Retried : PurviewUploadCommandOutcome.Failed;
+            return new PurviewUploadCommandExecution(claimedJob.JobId, requestId, OutcomeFor(gate.Outcome, gatedOutcome), gate.Outcome);
         }
 
         return await FinalizeJobAsync(claimedJob.JobId, requestId, lease, result!, cancellationToken).ConfigureAwait(false);
@@ -153,10 +161,11 @@ public sealed class PurviewUploadCommandProcessor(
                 return new PurviewUploadCommandExecution(jobId, requestId, OutcomeFor(failed, PurviewUploadCommandOutcome.Failed), failed);
 
             default: // SasDenied (contenção de claim/lease), ProcessFailed (falha transitória do processo AzCopy).
-                var retried = await _jobs
-                    .ScheduleRetryAsync(lease, ErrorCode.TransientProvider, _clock.UtcNow + RetryBackoff, cancellationToken)
+                var gate = await JobRetryGate
+                    .ScheduleRetryOrFailAsync(_jobs, _clock, _retryPolicy, lease, ErrorCode.TransientProvider, RetryBackoff, cancellationToken)
                     .ConfigureAwait(false);
-                return new PurviewUploadCommandExecution(jobId, requestId, OutcomeFor(retried, PurviewUploadCommandOutcome.Retried), retried);
+                var gatedOutcome = gate.RetryScheduled ? PurviewUploadCommandOutcome.Retried : PurviewUploadCommandOutcome.Failed;
+                return new PurviewUploadCommandExecution(jobId, requestId, OutcomeFor(gate.Outcome, gatedOutcome), gate.Outcome);
         }
     }
 

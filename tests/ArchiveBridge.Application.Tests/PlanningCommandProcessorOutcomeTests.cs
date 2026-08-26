@@ -56,7 +56,8 @@ public sealed class PlanningCommandProcessorOutcomeTests
             new GenerateMappingCsvUseCase(waves, new UnusedMappingStore(), new UnusedArtifactStore(), clock),
             new FreezeWaveUseCase(waves),
             MappingPolicy.Default,
-            clock);
+            clock,
+            RetryPolicy.Default);
     }
 
     [Fact]
@@ -122,7 +123,14 @@ public sealed class PlanningCommandProcessorOutcomeTests
 
         public Task<ClaimedJob?> TryClaimNextAsync(ClaimRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
 
-        public Task<JobSnapshot?> GetAsync(TenantScope scope, JobId jobId, CancellationToken cancellationToken) => throw new NotSupportedException();
+        // Sempre dentro do orçamento (AttemptCount=1 < RetryPolicy.Default.MaxAttempts) — este duplo testa a
+        // distinção Applied/Fenced de JobRetryGate (AB-I7-002), não o esgotamento de orçamento em si (coberto
+        // separadamente por JobRetryGateTests).
+        public Task<JobSnapshot?> GetAsync(TenantScope scope, JobId jobId, CancellationToken cancellationToken) =>
+            Task.FromResult<JobSnapshot?>(new JobSnapshot(
+                jobId, scope.Tenant, scope.Project, Workload.Control, JobPriority.Normal, JobState.Processing,
+                new WorkerId("w"), new LeaseEpoch(1), DateTimeOffset.UtcNow.AddMinutes(5), 1, null, null,
+                DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch));
 
         public Task<JobCommandOutcome> CompleteAsync(LeaseCommand command, CancellationToken cancellationToken) =>
             Task.FromResult(JobCommandOutcome.Applied);

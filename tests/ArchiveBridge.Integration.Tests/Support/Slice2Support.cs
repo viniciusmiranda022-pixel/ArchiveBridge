@@ -82,7 +82,8 @@ internal static class Slice2Support
             GenerateMapping(fixture, clock),
             new FreezeWaveUseCase(WaveStore(fixture, clock)),
             MappingPolicy.Default,
-            clock);
+            clock,
+            RetryPolicy.Default);
 
     public static Sha256Hash ConfigHash() =>
         new ProjectConfiguration(new TargetTenant("contoso.onmicrosoft.com"), TargetArchivePolicy.OnlineArchive)

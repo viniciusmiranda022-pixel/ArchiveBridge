@@ -81,7 +81,7 @@ public static class EnterpriseVaultExportComposition
 
         var processor = new EvExportCommandProcessor(
             inbox, jobStore, leaseManager, connectors, capabilities, throttle, executor, inspector, attempts, audit,
-            exportPolicy, options.OutputRoot, clock);
+            exportPolicy, options.OutputRoot, clock, RetryPolicy.Default);
 
         services.AddSingleton<IEvExportPendingScopeReader>(scopeReader);
         services.AddSingleton(processor);

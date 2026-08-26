@@ -438,7 +438,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
 
         var execution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
 
@@ -473,7 +473,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
 
         var execution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
 
@@ -502,7 +502,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspectorAtWriteTime, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
         await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
 
         // O output físico "desaparece" (adulteração/remoção fora da aplicação) antes do replay.
@@ -537,7 +537,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
 
         var firstExecution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
         Assert.NotNull(firstExecution);
@@ -591,7 +591,7 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
         var processor = new EvExportCommandProcessor(
             Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
             Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
-            EvExportPolicy.Default, Path.GetTempPath(), clock);
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
 
         var execution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
 
@@ -604,6 +604,38 @@ public sealed class Slice4cEvExportTests(SqlServerFixture fixture)
 
         var events = await new SqlEvExportAuditReader(fixture.Factory).GetEventsAsync(scope, requested.RequestId, CancellationToken.None);
         Assert.Single(events, e => e.EventCode == EvExportAuditEventCode.RetryScheduled);
+    }
+
+    [Fact]
+    public async Task AProcessResultThatTimesOutDespiteAZeroExitCodeIsNeverTreatedAsCompleted()
+    {
+        // AB-I7-001 chaos case 173/#10 (provider retornando resultado ambíguo): um exit code 0, isolado,
+        // sugeriria sucesso — mas o processo do exporter também estourou o timeout configurado. A
+        // ambiguidade nunca é resolvida a favor do sucesso: o mesmo tratamento de
+        // PurviewUploadCommandProcessor (ver PurviewUploadUseCaseTests) se aplica aqui.
+        var scope = SqlServerFixture.NewScope();
+        var clock = new MutableClock(Now);
+        var identity = await RegisterExportCapableConnectorAsync(scope, clock);
+
+        var requestUseCase = new RequestEvExportUseCase(Connectors, Capabilities, Inbox(clock), Audit, EvExportPolicy.Default, clock);
+        var requested = await requestUseCase.ExecuteAsync(
+            new RequestEvExport(scope, identity.Id, "arch-1", null, null, "operator", CorrelationId.New()), CancellationToken.None);
+
+        var executor = new FakeExecutor(new EvExportProcessResult(0, true, false, "15.0", "1.0.0", [], "PROCESS_TIMEOUT"));
+        var inspector = new FakeInspector([]);
+        var processor = new EvExportCommandProcessor(
+            Inbox(clock), fixture.Store(clock), fixture.LeaseManager(clock, RetryPolicy.Default, Slice2Support.Lease),
+            Connectors, Capabilities, Throttle(clock), executor, inspector, Attempts(clock), Audit,
+            EvExportPolicy.Default, Path.GetTempPath(), clock, RetryPolicy.Default);
+
+        var execution = await processor.ProcessNextAsync(scope, Worker, Slice2Support.Lease, CorrelationId.New(), CancellationToken.None);
+
+        Assert.NotNull(execution);
+        Assert.NotEqual(EvExportCommandOutcome.Completed, execution!.Outcome);
+        Assert.Equal(EvExportCommandOutcome.Retried, execution.Outcome);
+
+        var latest = await Attempts(clock).GetLatestAsync(scope, requested.RequestId, CancellationToken.None);
+        Assert.NotEqual(EvExportAttemptOutcome.Completed, latest!.Outcome);
     }
 
     private sealed class FakeExecutor(EvExportProcessResult result) : IEvArchiveExportExecutor
