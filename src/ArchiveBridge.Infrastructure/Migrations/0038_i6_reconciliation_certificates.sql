@@ -11,6 +11,13 @@
 -- Aditiva, append-only e não destrutiva: cria DUAS tabelas novas. Nenhum DROP, nenhum UPDATE de dados,
 -- nenhuma redefinição de 0001-0037 — os arquivos das migrations anteriores permanecem byte-for-byte
 -- intactos.
+--
+-- AB-I6-014 (revisão pré-merge deste PR): decisions_state_fingerprint materializa no schema o fingerprint
+-- das dispositions vigentes (ReconciliationExceptionDecisionsStateHash) que antes só existia como valor de
+-- fencing efêmero na store — agora participa de certificate_hash/evaluation_fingerprint (v2), então uma
+-- disposition alterada que preserve a mesma classificação de desvio ainda assim invalida replay/convergência
+-- e marca o certificate anterior stale. Ajuste seguro porque este PR ainda não foi mergeado (0038 nunca
+-- existiu em produção).
 
 -- Append-only, versionado por (onda, plano de import job): a MESMA impressão digital de avaliação
 -- (evaluation_fingerprint, item 16) converge para a MESMA certificate_version (replay idempotente); uma
@@ -33,6 +40,7 @@ CREATE TABLE dbo.purview_reconciliation_certificates
     incomplete_item_count          INT              NOT NULL,
     deviation_count                INT              NOT NULL,
     deviations_sha256              CHAR(64)         NOT NULL,
+    decisions_state_fingerprint    CHAR(64)         NOT NULL,
     duplicate_risk_detected        BIT              NOT NULL,
     evaluation_fingerprint         CHAR(64)         NOT NULL,
     issued_by                      NVARCHAR(200)    NOT NULL,

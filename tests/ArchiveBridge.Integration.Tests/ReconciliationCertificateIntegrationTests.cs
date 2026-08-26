@@ -510,6 +510,22 @@ public sealed class ReconciliationCertificateIntegrationTests(SqlServerFixture f
             () => Certificates().GetByVersionAsync(scope, wave, plannedJobName, certificate.CertificateVersion, CancellationToken.None));
     }
 
+    // ---- AB-I6-014: decisions_state_fingerprint materializado/coberto por certificate_hash ----
+
+    [Fact]
+    public async Task GetByVersionFailsClosedWhenTheDecisionsStateFingerprintIsTamperedDirectlyInSql()
+    {
+        var (scope, wave, plannedJobName, _) = await SeedFullyMatchedAsync();
+        var certificate = await IssueUseCase().ExecuteAsync(Command(scope, wave, plannedJobName), CancellationToken.None);
+
+        await ExecuteAdminSqlAsync(
+            scope, "UPDATE dbo.purview_reconciliation_certificates SET decisions_state_fingerprint = @forged WHERE wave_id = @wave;",
+            ("@wave", wave.Value), ("@forged", new string('9', 64)));
+
+        await Assert.ThrowsAsync<ReconciliationCertificateIntegrityViolationException>(
+            () => Certificates().GetByVersionAsync(scope, wave, plannedJobName, certificate.CertificateVersion, CancellationToken.None));
+    }
+
     // ---- 15: anti-IDOR cross-tenant/project ----
 
     [Fact]
@@ -589,6 +605,78 @@ public sealed class ReconciliationCertificateIntegrationTests(SqlServerFixture f
         var history = await Certificates().GetHistoryAsync(scope, wave, plannedJobName, CancellationToken.None);
         Assert.Single(history);
         Assert.Equal(first.CertificateHash, history[0].CertificateHash);
+    }
+
+    // ---- AB-I6-014: uma disposition vigente ALTERADA que preserva a MESMA classificação de desvio resumida
+    // (deviationsSha256 igual) ainda assim deve tornar o certificate anterior stale/superseded e produzir uma
+    // versão NOVA em vez de convergir — o bug que motivou a correção. ----
+
+    [Fact]
+    public async Task GetIdentifiesACertificateAsSupersededWhenOnlyTheDecisionsStateFingerprintChangesEvenWithTheSameDeviationClassification()
+    {
+        var (scope, wave, plannedJobName, remoteName) = await SeedMismatchAsync();
+        var assessment = await ReconciliationUseCase().ExecuteAsync(scope, wave, plannedJobName, CorrelationId.New(), CancellationToken.None);
+        await DisposeUseCase().ExecuteAsync(
+            new DisposeReconciliationExceptionCommand(
+                scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
+                ReconciliationExceptionDecisionStatus.AcceptedException, ReconciliationExceptionReasonCode.ToleratedByOperationalPolicy,
+                ExpectedCurrentDecisionVersion: 0, Comment: null, CorrelationId.New()),
+            CancellationToken.None);
+
+        var first = await IssueUseCase().ExecuteAsync(Command(scope, wave, plannedJobName), CancellationToken.None);
+        Assert.Equal(ReconciliationOutcome.PassWithExplainedExceptions, first.Result);
+
+        var beforeChange = await GetUseCase().ExecuteAsync(scope, wave, plannedJobName, CorrelationId.New(), CancellationToken.None);
+        Assert.NotNull(beforeChange);
+        Assert.False(beforeChange!.IsSuperseded);
+
+        // Nova decisão vigente (versão 1 -> 2): MESMO status AcceptedException, motivo DIFERENTE — preserva a
+        // MESMA classificação de desvio (ExplainedException), mas é uma cadeia decisória REAL diferente.
+        await DisposeUseCase().ExecuteAsync(
+            new DisposeReconciliationExceptionCommand(
+                scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
+                ReconciliationExceptionDecisionStatus.AcceptedException, ReconciliationExceptionReasonCode.KnownNonBlockingProviderQuirk,
+                ExpectedCurrentDecisionVersion: 1, Comment: null, CorrelationId.New()),
+            CancellationToken.None);
+
+        var afterChange = await GetUseCase().ExecuteAsync(scope, wave, plannedJobName, CorrelationId.New(), CancellationToken.None);
+        Assert.NotNull(afterChange);
+        Assert.True(afterChange!.IsSuperseded);
+        Assert.Equal(first.CertificateVersion, afterChange.Certificate.CertificateVersion); // histórico preservado, nunca apagado
+    }
+
+    [Fact]
+    public async Task IssueCreatesANewVersionInsteadOfConvergingWhenOnlyTheDecisionsStateFingerprintChanges()
+    {
+        var (scope, wave, plannedJobName, remoteName) = await SeedMismatchAsync();
+        var assessment = await ReconciliationUseCase().ExecuteAsync(scope, wave, plannedJobName, CorrelationId.New(), CancellationToken.None);
+        await DisposeUseCase().ExecuteAsync(
+            new DisposeReconciliationExceptionCommand(
+                scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
+                ReconciliationExceptionDecisionStatus.AcceptedException, ReconciliationExceptionReasonCode.ToleratedByOperationalPolicy,
+                ExpectedCurrentDecisionVersion: 0, Comment: null, CorrelationId.New()),
+            CancellationToken.None);
+
+        var first = await IssueUseCase().ExecuteAsync(Command(scope, wave, plannedJobName), CancellationToken.None);
+
+        await DisposeUseCase().ExecuteAsync(
+            new DisposeReconciliationExceptionCommand(
+                scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
+                ReconciliationExceptionDecisionStatus.AcceptedException, ReconciliationExceptionReasonCode.KnownNonBlockingProviderQuirk,
+                ExpectedCurrentDecisionVersion: 1, Comment: null, CorrelationId.New()),
+            CancellationToken.None);
+
+        var second = await IssueUseCase().ExecuteAsync(Command(scope, wave, plannedJobName), CancellationToken.None);
+
+        Assert.Equal(ReconciliationOutcome.PassWithExplainedExceptions, first.Result);
+        Assert.Equal(ReconciliationOutcome.PassWithExplainedExceptions, second.Result); // mesma classificação técnica
+        Assert.Equal(first.DeviationsSha256, second.DeviationsSha256); // resumo de desvios igual — não é isso que distingue
+        Assert.NotEqual(first.DecisionsStateFingerprint, second.DecisionsStateFingerprint);
+        Assert.NotEqual(first.EvaluationFingerprint, second.EvaluationFingerprint);
+        Assert.Equal(first.CertificateVersion + 1, second.CertificateVersion); // versão NOVA, nunca convergência
+
+        var count = await CountAsync(scope, "SELECT COUNT(*) FROM dbo.purview_reconciliation_certificates WHERE wave_id = @wave;", ("@wave", wave.Value));
+        Assert.Equal(2, count);
     }
 
     // ---- 19: STOP-THE-LINE — a emissão nunca altera o status da wave ----

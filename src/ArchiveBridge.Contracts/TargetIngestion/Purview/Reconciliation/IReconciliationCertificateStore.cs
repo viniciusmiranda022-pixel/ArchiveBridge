@@ -33,6 +33,12 @@ public interface IReconciliationCertificateStore
     /// <see cref="ReconciliationCertificateStaleChainException"/> em vez de persistir um certificate baseado
     /// em snapshot misto (item 17/49).
     /// </para>
+    /// <para>
+    /// AB-I6-014: o fingerprint das dispositions REALMENTE vigentes sob o lock (não o valor esperado
+    /// pré-lock) é materializado no certificate emitido (<see cref="ReconciliationCertificate.DecisionsStateFingerprint"/>)
+    /// e participa de <see cref="ReconciliationCertificate.EvaluationFingerprint"/> — nunca apenas um valor
+    /// efêmero de fencing.
+    /// </para>
     /// </summary>
     /// <exception cref="PurviewImportJobSourceNotFoundException">Onda/plano inexistente ou fora do escopo (anti-IDOR).</exception>
     /// <exception cref="ReconciliationCertificateStaleChainException">A avaliação ou as dispositions vigentes mudaram sob o lock desde a resolução do candidato.</exception>

@@ -32,7 +32,13 @@ namespace ArchiveBridge.Domain.TargetIngestion.Purview.Reconciliation;
 public sealed record ReconciliationCertificate
 {
     /// <summary>Prefixo versionado do schema/engine do certificate (item 10) — gravado em toda versão nova, nunca reescrito.</summary>
-    public const string CurrentSchemaVersion = "archivebridge.purview.reconciliation-certificate.v1";
+    /// <summary>
+    /// AB-I6-014 bumpou para v2: <see cref="DecisionsStateFingerprint"/> passou a ser um campo persistido do
+    /// certificate (antes só existia como fencing efêmero na store) — muda o conjunto de campos cobertos por
+    /// <see cref="CertificateHash"/>. Como este PR ainda não foi mergeado (nenhum certificate v1 real existe),
+    /// não há necessidade de suporte a leitura de um schema anterior.
+    /// </summary>
+    public const string CurrentSchemaVersion = "archivebridge.purview.reconciliation-certificate.v2";
 
     private ReconciliationCertificate(
         TenantId tenant,
@@ -48,6 +54,7 @@ public sealed record ReconciliationCertificate
         int incompleteItemCount,
         int deviationCount,
         Sha256Hash deviationsSha256,
+        Sha256Hash decisionsStateFingerprint,
         bool duplicateRiskDetected,
         Sha256Hash evaluationFingerprint,
         string issuedBy,
@@ -70,6 +77,7 @@ public sealed record ReconciliationCertificate
         IncompleteItemCount = incompleteItemCount;
         DeviationCount = deviationCount;
         DeviationsSha256 = deviationsSha256;
+        DecisionsStateFingerprint = decisionsStateFingerprint;
         DuplicateRiskDetected = duplicateRiskDetected;
         EvaluationFingerprint = evaluationFingerprint;
         IssuedBy = issuedBy;
@@ -134,6 +142,18 @@ public sealed record ReconciliationCertificate
     public Sha256Hash DeviationsSha256 { get; }
 
     /// <summary>
+    /// <see cref="ReconciliationExceptionDecisionsStateHash"/> das dispositions VIGENTES (uma por item) da
+    /// avaliação certificada, materializado como campo persistido próprio do certificate (AB-I6-014 — antes
+    /// desta correção, este fingerprint só existia como valor efêmero de fencing na store, nunca como parte
+    /// do documento em si). Cobre a cadeia decisória completa (status/motivo/comentário/ator de CADA decisão
+    /// vigente via <see cref="ReconciliationExceptionDecision.DecisionFingerprint"/>) — estritamente mais
+    /// granular que <see cref="DeviationsSha256"/> (que só cobre o código de desvio classificado), então uma
+    /// disposition nova/alterada que preserve a MESMA classificação (ex.: outra <c>AcceptedException</c> com
+    /// motivo/comentário/ator diferentes) ainda assim muda este campo.
+    /// </summary>
+    public Sha256Hash DecisionsStateFingerprint { get; }
+
+    /// <summary>
     /// Verdadeiro quando a evidência de mapping/root desta tentativa diverge da evidência de mapping/root de
     /// uma tentativa anterior JÁ CERTIFICADA da MESMA onda — tem precedência bloqueadora sobre qualquer
     /// sucesso (item 63).
@@ -142,9 +162,11 @@ public sealed record ReconciliationCertificate
 
     /// <summary>
     /// Impressão digital determinística do CONJUNTO DE EVIDÊNCIA usado para computar este certificate (item
-    /// 16) — chave de convergência idempotente: a MESMA avaliação + MESMAS dispositions vigentes + MESMO
-    /// sinal de duplicidade produzem a MESMA versão, independentemente de quantas vezes a emissão for
-    /// reenviada (replay idêntico nunca duplica efeito).
+    /// 16) — chave de convergência idempotente: a MESMA avaliação + MESMAS dispositions vigentes (item
+    /// <see cref="DecisionsStateFingerprint"/>, não apenas sua classificação resumida) + MESMO sinal de
+    /// duplicidade produzem a MESMA versão, independentemente de quantas vezes a emissão for reenviada
+    /// (replay idêntico nunca duplica efeito); QUALQUER mudança real na cadeia decisória — mesmo quando
+    /// preserva a mesma classificação de desvio — produz uma versão nova em vez de convergir (AB-I6-014).
     /// </summary>
     public Sha256Hash EvaluationFingerprint { get; }
 
@@ -183,6 +205,7 @@ public sealed record ReconciliationCertificate
         int incompleteItemCount,
         int deviationCount,
         Sha256Hash deviationsSha256,
+        Sha256Hash decisionsStateFingerprint,
         bool duplicateRiskDetected,
         string issuedBy,
         string issuedByRole,
@@ -218,18 +241,18 @@ public sealed record ReconciliationCertificate
         var normalizedIssuedByRole = TextValue.Require(issuedByRole, nameof(issuedByRole), maxLength: 50);
 
         var canonicalGeneratedAt = TruncateToMilliseconds(generatedAtUtc);
-        var evaluationFingerprint = ComputeEvaluationFingerprint(assessmentSourceFingerprint, deviationsSha256, duplicateRiskDetected);
+        var evaluationFingerprint = ComputeEvaluationFingerprint(assessmentSourceFingerprint, deviationsSha256, decisionsStateFingerprint, duplicateRiskDetected);
         var hash = ComputeCertificateHash(
             tenant, project, wave, plannedJobName, certificateVersion, assessmentVersion, assessmentSourceFingerprint,
             mappingFingerprint, result, totalItemCount, incompleteItemCount, deviationCount, deviationsSha256,
-            duplicateRiskDetected, evaluationFingerprint, normalizedIssuedBy, normalizedIssuedByRole, correlation,
-            canonicalGeneratedAt, CurrentSchemaVersion);
+            decisionsStateFingerprint, duplicateRiskDetected, evaluationFingerprint, normalizedIssuedBy, normalizedIssuedByRole,
+            correlation, canonicalGeneratedAt, CurrentSchemaVersion);
 
         return new ReconciliationCertificate(
             tenant, project, wave, plannedJobName, certificateVersion, assessmentVersion, assessmentSourceFingerprint,
             mappingFingerprint, result, totalItemCount, incompleteItemCount, deviationCount, deviationsSha256,
-            duplicateRiskDetected, evaluationFingerprint, normalizedIssuedBy, normalizedIssuedByRole, correlation,
-            canonicalGeneratedAt, CurrentSchemaVersion, hash);
+            decisionsStateFingerprint, duplicateRiskDetected, evaluationFingerprint, normalizedIssuedBy, normalizedIssuedByRole,
+            correlation, canonicalGeneratedAt, CurrentSchemaVersion, hash);
     }
 
     /// <summary>
@@ -251,6 +274,7 @@ public sealed record ReconciliationCertificate
         int incompleteItemCount,
         int deviationCount,
         Sha256Hash deviationsSha256,
+        Sha256Hash decisionsStateFingerprint,
         bool duplicateRiskDetected,
         string issuedBy,
         string issuedByRole,
@@ -259,11 +283,12 @@ public sealed record ReconciliationCertificate
         string schemaVersion,
         Sha256Hash persistedCertificateHash)
     {
-        var evaluationFingerprint = ComputeEvaluationFingerprint(assessmentSourceFingerprint, deviationsSha256, duplicateRiskDetected);
+        var evaluationFingerprint = ComputeEvaluationFingerprint(assessmentSourceFingerprint, deviationsSha256, decisionsStateFingerprint, duplicateRiskDetected);
         var recomputed = ComputeCertificateHash(
             tenant, project, wave, plannedJobName, certificateVersion, assessmentVersion, assessmentSourceFingerprint,
             mappingFingerprint, result, totalItemCount, incompleteItemCount, deviationCount, deviationsSha256,
-            duplicateRiskDetected, evaluationFingerprint, issuedBy, issuedByRole, correlation, generatedAtUtc, schemaVersion);
+            decisionsStateFingerprint, duplicateRiskDetected, evaluationFingerprint, issuedBy, issuedByRole, correlation,
+            generatedAtUtc, schemaVersion);
 
         if (!string.Equals(recomputed.Value, persistedCertificateHash.Value, StringComparison.Ordinal))
         {
@@ -276,8 +301,8 @@ public sealed record ReconciliationCertificate
         return new ReconciliationCertificate(
             tenant, project, wave, plannedJobName, certificateVersion, assessmentVersion, assessmentSourceFingerprint,
             mappingFingerprint, result, totalItemCount, incompleteItemCount, deviationCount, deviationsSha256,
-            duplicateRiskDetected, evaluationFingerprint, issuedBy, issuedByRole, correlation, generatedAtUtc,
-            schemaVersion, persistedCertificateHash);
+            decisionsStateFingerprint, duplicateRiskDetected, evaluationFingerprint, issuedBy, issuedByRole, correlation,
+            generatedAtUtc, schemaVersion, persistedCertificateHash);
     }
 
     /// <summary>
@@ -287,12 +312,14 @@ public sealed record ReconciliationCertificate
     /// resumo de desvios/dispositions vigentes e o sinal de duplicidade — NUNCA a versão/timestamp/ator do
     /// próprio certificate (para que uma emissão concorrente idêntica convirja para a MESMA versão).
     /// </summary>
-    public static Sha256Hash ComputeEvaluationFingerprint(Sha256Hash assessmentSourceFingerprint, Sha256Hash deviationsSha256, bool duplicateRiskDetected) =>
+    public static Sha256Hash ComputeEvaluationFingerprint(
+        Sha256Hash assessmentSourceFingerprint, Sha256Hash deviationsSha256, Sha256Hash decisionsStateFingerprint, bool duplicateRiskDetected) =>
         DeterministicHash.Compute(
         [
-            "archivebridge.purview.reconciliation-certificate-evaluation-fingerprint.v1",
+            "archivebridge.purview.reconciliation-certificate-evaluation-fingerprint.v2",
             assessmentSourceFingerprint.Value,
             deviationsSha256.Value,
+            decisionsStateFingerprint.Value,
             duplicateRiskDetected ? "1" : "0",
         ]);
 
@@ -310,6 +337,7 @@ public sealed record ReconciliationCertificate
         int incompleteItemCount,
         int deviationCount,
         Sha256Hash deviationsSha256,
+        Sha256Hash decisionsStateFingerprint,
         bool duplicateRiskDetected,
         Sha256Hash evaluationFingerprint,
         string issuedBy,
@@ -334,6 +362,7 @@ public sealed record ReconciliationCertificate
             incompleteItemCount.ToString(CultureInfo.InvariantCulture),
             deviationCount.ToString(CultureInfo.InvariantCulture),
             deviationsSha256.Value,
+            decisionsStateFingerprint.Value,
             duplicateRiskDetected ? "1" : "0",
             evaluationFingerprint.Value,
             issuedBy,

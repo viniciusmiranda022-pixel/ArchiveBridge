@@ -107,7 +107,17 @@ public sealed class GetReconciliationCertificateUseCase(
         var backlog = ReconciliationExceptionWaveBacklog.From(certificate.AssessmentVersion, pstItems, archiveItems, currentDecisions);
         var deviations = ReconciliationCertificateRules.BuildDeviationSummary(backlog);
         var freshDeviationsSha256 = ReconciliationCertificateDeviationsHash.Compute(deviations);
+        if (!string.Equals(freshDeviationsSha256.Value, certificate.DeviationsSha256.Value, StringComparison.Ordinal))
+        {
+            return true;
+        }
 
-        return !string.Equals(freshDeviationsSha256.Value, certificate.DeviationsSha256.Value, StringComparison.Ordinal);
+        // AB-I6-014: deviationsSha256 só cobre a CLASSIFICAÇÃO resumida do desvio (ex.: ExplainedException) —
+        // uma disposition vigente diferente (outro reason_code/comment/actor/versão) que preserve a MESMA
+        // classificação não muda esse hash. Recomputa o fingerprint das dispositions REALMENTE vigentes agora
+        // e compara diretamente contra o materializado no certificate para não apresentar como vigente um
+        // certificate cuja cadeia decisória real já mudou.
+        var freshDecisionsStateFingerprint = ReconciliationExceptionDecisionsStateHash.Compute(currentDecisions);
+        return !string.Equals(freshDecisionsStateFingerprint.Value, certificate.DecisionsStateFingerprint.Value, StringComparison.Ordinal);
     }
 }

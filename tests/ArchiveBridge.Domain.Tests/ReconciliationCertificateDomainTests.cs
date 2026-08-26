@@ -27,6 +27,7 @@ public sealed class ReconciliationCertificateDomainTests
     private static readonly Sha256Hash AssessmentFingerprint = new(new string('a', 64));
     private static readonly Sha256Hash MappingFingerprint = new(new string('b', 64));
     private static readonly Sha256Hash DeviationsSha256 = new(new string('c', 64));
+    private static readonly Sha256Hash DecisionsStateFingerprint = new(new string('d', 64));
     private static readonly DateTimeOffset GeneratedAt = new(2026, 8, 26, 9, 0, 0, TimeSpan.Zero);
 
     // ---- ReconciliationCertificateRules.DetermineResult ----
@@ -223,9 +224,9 @@ public sealed class ReconciliationCertificateDomainTests
             Tenant, Project, Wave, PlannedJobName, certificate.CertificateVersion, certificate.AssessmentVersion,
             certificate.AssessmentSourceFingerprint, certificate.MappingFingerprint, certificate.Result,
             certificate.TotalItemCount, certificate.IncompleteItemCount, certificate.DeviationCount,
-            certificate.DeviationsSha256, certificate.DuplicateRiskDetected, certificate.IssuedBy,
-            certificate.IssuedByRole, certificate.Correlation, certificate.GeneratedAtUtc, certificate.SchemaVersion,
-            certificate.CertificateHash);
+            certificate.DeviationsSha256, certificate.DecisionsStateFingerprint, certificate.DuplicateRiskDetected,
+            certificate.IssuedBy, certificate.IssuedByRole, certificate.Correlation, certificate.GeneratedAtUtc,
+            certificate.SchemaVersion, certificate.CertificateHash);
 
         Assert.Equal(certificate.CertificateHash, rehydrated.CertificateHash);
         Assert.Equal(certificate.EvaluationFingerprint, rehydrated.EvaluationFingerprint);
@@ -241,9 +242,25 @@ public sealed class ReconciliationCertificateDomainTests
             certificate.AssessmentSourceFingerprint, certificate.MappingFingerprint,
             ReconciliationOutcome.Pass, // tampered: certificate was actually Fail
             certificate.TotalItemCount, certificate.IncompleteItemCount, certificate.DeviationCount,
-            certificate.DeviationsSha256, certificate.DuplicateRiskDetected, certificate.IssuedBy,
-            certificate.IssuedByRole, certificate.Correlation, certificate.GeneratedAtUtc, certificate.SchemaVersion,
-            certificate.CertificateHash));
+            certificate.DeviationsSha256, certificate.DecisionsStateFingerprint, certificate.DuplicateRiskDetected,
+            certificate.IssuedBy, certificate.IssuedByRole, certificate.Correlation, certificate.GeneratedAtUtc,
+            certificate.SchemaVersion, certificate.CertificateHash));
+    }
+
+    [Fact]
+    public void RehydrateThrowsWhenTheDecisionsStateFingerprintWasTamperedWith()
+    {
+        // AB-I6-014: decisions_state_fingerprint agora é um campo persistido coberto por certificate_hash —
+        // adulterá-lo isoladamente (sem tocar em nenhum outro campo) deve ser detectado fail-closed.
+        var certificate = Certificate();
+
+        Assert.Throws<ReconciliationCertificateIntegrityViolationException>(() => ReconciliationCertificate.Rehydrate(
+            Tenant, Project, Wave, PlannedJobName, certificate.CertificateVersion, certificate.AssessmentVersion,
+            certificate.AssessmentSourceFingerprint, certificate.MappingFingerprint, certificate.Result,
+            certificate.TotalItemCount, certificate.IncompleteItemCount, certificate.DeviationCount,
+            certificate.DeviationsSha256, new Sha256Hash(new string('9', 64)), // tampered
+            certificate.DuplicateRiskDetected, certificate.IssuedBy, certificate.IssuedByRole, certificate.Correlation,
+            certificate.GeneratedAtUtc, certificate.SchemaVersion, certificate.CertificateHash));
     }
 
     [Fact]
@@ -263,6 +280,21 @@ public sealed class ReconciliationCertificateDomainTests
         var withRisk = Certificate(duplicateRiskDetected: true);
 
         Assert.NotEqual(withoutRisk.EvaluationFingerprint, withRisk.EvaluationFingerprint);
+    }
+
+    [Fact]
+    public void EvaluationFingerprintChangesWhenTheDecisionsStateFingerprintDiffersEvenWithTheSameDeviationsSha256()
+    {
+        // AB-I6-014 (o bug reportado): duas dispositions vigentes DIFERENTES (ex.: outro reason_code/comment/
+        // actor) podem preservar a MESMA classificação de desvio resumida (deviationsSha256 igual) — o
+        // certificate NUNCA pode tratar isso como replay idêntico; EvaluationFingerprint deve mudar.
+        var first = Certificate(decisionsStateFingerprint: new Sha256Hash(new string('d', 64)));
+        var second = Certificate(decisionsStateFingerprint: new Sha256Hash(new string('e', 64)));
+
+        Assert.Equal(first.DeviationsSha256, second.DeviationsSha256);
+        Assert.NotEqual(first.DecisionsStateFingerprint, second.DecisionsStateFingerprint);
+        Assert.NotEqual(first.EvaluationFingerprint, second.EvaluationFingerprint);
+        Assert.NotEqual(first.CertificateHash, second.CertificateHash);
     }
 
     [Fact]
@@ -327,9 +359,11 @@ public sealed class ReconciliationCertificateDomainTests
         ReconciliationOutcome result = ReconciliationOutcome.Fail,
         bool duplicateRiskDetected = false,
         string issuedBy = "admin@contoso.com",
-        DateTimeOffset? generatedAtUtc = null) =>
+        DateTimeOffset? generatedAtUtc = null,
+        Sha256Hash? decisionsStateFingerprint = null) =>
         ReconciliationCertificate.Create(
             Tenant, Project, Wave, PlannedJobName, certificateVersion, assessmentVersion: 1, AssessmentFingerprint,
             MappingFingerprint, result, totalItemCount: 10, incompleteItemCount: 0, deviationCount: 1, DeviationsSha256,
-            duplicateRiskDetected, issuedBy, "Administrator", Correlation, generatedAtUtc ?? GeneratedAt);
+            decisionsStateFingerprint ?? DecisionsStateFingerprint, duplicateRiskDetected, issuedBy, "Administrator",
+            Correlation, generatedAtUtc ?? GeneratedAt);
 }

@@ -44,13 +44,13 @@ public sealed class SqlReconciliationCertificateStore(TenantConnectionFactory co
     // Colunas = wave_id(0), attempt_sequence(1), certificate_version(2), tenant_id(3), project_id(4),
     // assessment_version(5), assessment_source_fingerprint(6), mapping_fingerprint(7), result(8),
     // total_item_count(9), incomplete_item_count(10), deviation_count(11), deviations_sha256(12),
-    // duplicate_risk_detected(13), evaluation_fingerprint(14), issued_by(15), issued_by_role(16),
-    // correlation_id(17), generated_at_utc(18), schema_version(19), certificate_hash(20).
+    // decisions_state_fingerprint(13), duplicate_risk_detected(14), evaluation_fingerprint(15), issued_by(16),
+    // issued_by_role(17), correlation_id(18), generated_at_utc(19), schema_version(20), certificate_hash(21).
     private const string Columns =
         "wave_id, attempt_sequence, certificate_version, tenant_id, project_id, assessment_version, " +
         "assessment_source_fingerprint, mapping_fingerprint, result, total_item_count, incomplete_item_count, " +
-        "deviation_count, deviations_sha256, duplicate_risk_detected, evaluation_fingerprint, issued_by, " +
-        "issued_by_role, correlation_id, generated_at_utc, schema_version, certificate_hash";
+        "deviation_count, deviations_sha256, decisions_state_fingerprint, duplicate_risk_detected, " +
+        "evaluation_fingerprint, issued_by, issued_by_role, correlation_id, generated_at_utc, schema_version, certificate_hash";
 
     private const string LockedCertificatesSql =
         $"""
@@ -114,8 +114,8 @@ public sealed class SqlReconciliationCertificateStore(TenantConnectionFactory co
         VALUES
             (@wave, @attempt, @version, @tenant, @project, @assessmentVersion, @assessmentFingerprint,
              @mappingFingerprint, @result, @totalItemCount, @incompleteItemCount, @deviationCount,
-             @deviationsSha256, @duplicateRisk, @evaluationFingerprint, @issuedBy, @issuedByRole, @correlation,
-             @generatedAt, @schemaVersion, @hash);
+             @deviationsSha256, @decisionsStateFingerprint, @duplicateRisk, @evaluationFingerprint, @issuedBy,
+             @issuedByRole, @correlation, @generatedAt, @schemaVersion, @hash);
         """;
 
     private const string InsertAuditEventSql =
@@ -151,8 +151,6 @@ public sealed class SqlReconciliationCertificateStore(TenantConnectionFactory co
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
-        var candidateFingerprint = ReconciliationCertificate.ComputeEvaluationFingerprint(assessmentSourceFingerprint, deviationsSha256, duplicateRiskDetected);
-
         await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqlTransaction)await connection.Connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -195,6 +193,13 @@ public sealed class SqlReconciliationCertificateStore(TenantConnectionFactory co
                     "e a emissão — a emissão sobre o snapshot antigo é recusada (fail-closed).");
             }
 
+            // AB-I6-014: computado SOB O LOCK, a partir do fingerprint das dispositions REALMENTE vigentes
+            // (já revalidado linha acima contra o snapshot da Application) — nunca do valor pré-lock — para
+            // que uma disposition alterada que preserve a mesma classificação de desvio (mesmo
+            // deviationsSha256) ainda assim produza uma versão nova em vez de convergir para a anterior.
+            var candidateFingerprint = ReconciliationCertificate.ComputeEvaluationFingerprint(
+                assessmentSourceFingerprint, deviationsSha256, actualDecisionsStateFingerprint, duplicateRiskDetected);
+
             var currentVersion = 0;
             ReconciliationCertificate? current = null;
             await using (var command = new SqlCommand(LockedCertificatesSql, connection.Connection, transaction))
@@ -225,7 +230,7 @@ public sealed class SqlReconciliationCertificateStore(TenantConnectionFactory co
             var certificate = ReconciliationCertificate.Create(
                 scope.Tenant, scope.Project, wave, plannedJobName, nextVersion, assessmentVersion, assessmentSourceFingerprint,
                 mappingFingerprint, result, totalItemCount, incompleteItemCount, deviationCount, deviationsSha256,
-                duplicateRiskDetected, issuedBy, issuedByRole, correlation, now);
+                actualDecisionsStateFingerprint, duplicateRiskDetected, issuedBy, issuedByRole, correlation, now);
 
             await using (var command = new SqlCommand(InsertCertificateSql, connection.Connection, transaction))
             {
@@ -240,6 +245,7 @@ public sealed class SqlReconciliationCertificateStore(TenantConnectionFactory co
                 command.Parameters.Add(new SqlParameter("@incompleteItemCount", SqlDbType.Int) { Value = certificate.IncompleteItemCount });
                 command.Parameters.Add(new SqlParameter("@deviationCount", SqlDbType.Int) { Value = certificate.DeviationCount });
                 command.Parameters.Add(new SqlParameter("@deviationsSha256", SqlDbType.Char, 64) { Value = certificate.DeviationsSha256.Value });
+                command.Parameters.Add(new SqlParameter("@decisionsStateFingerprint", SqlDbType.Char, 64) { Value = certificate.DecisionsStateFingerprint.Value });
                 command.Parameters.Add(new SqlParameter("@duplicateRisk", SqlDbType.Bit) { Value = certificate.DuplicateRiskDetected });
                 command.Parameters.Add(new SqlParameter("@evaluationFingerprint", SqlDbType.Char, 64) { Value = certificate.EvaluationFingerprint.Value });
                 command.Parameters.Add(new SqlParameter("@issuedBy", SqlDbType.NVarChar, 200) { Value = certificate.IssuedBy });
@@ -485,6 +491,7 @@ public sealed class SqlReconciliationCertificateStore(TenantConnectionFactory co
         int IncompleteItemCount,
         int DeviationCount,
         string DeviationsSha256,
+        string DecisionsStateFingerprint,
         bool DuplicateRiskDetected,
         string IssuedBy,
         string IssuedByRole,
@@ -508,13 +515,14 @@ public sealed class SqlReconciliationCertificateStore(TenantConnectionFactory co
             reader.GetInt32(10),
             reader.GetInt32(11),
             reader.GetString(12).TrimEnd(),
-            reader.GetBoolean(13),
-            reader.GetString(15).TrimEnd(),
+            reader.GetString(13).TrimEnd(),
+            reader.GetBoolean(14),
             reader.GetString(16).TrimEnd(),
-            reader.GetGuid(17),
-            reader.GetDateTime(18),
-            reader.GetString(19).TrimEnd(),
-            reader.GetString(20).TrimEnd());
+            reader.GetString(17).TrimEnd(),
+            reader.GetGuid(18),
+            reader.GetDateTime(19),
+            reader.GetString(20).TrimEnd(),
+            reader.GetString(21).TrimEnd());
 
     private static ReconciliationCertificate FromRaw(RawCertificateRow row, PurviewImportJobName plannedJobName) =>
         ReconciliationCertificate.Rehydrate(
@@ -531,6 +539,7 @@ public sealed class SqlReconciliationCertificateStore(TenantConnectionFactory co
             row.IncompleteItemCount,
             row.DeviationCount,
             new Sha256Hash(row.DeviationsSha256),
+            new Sha256Hash(row.DecisionsStateFingerprint),
             row.DuplicateRiskDetected,
             row.IssuedBy,
             row.IssuedByRole,
