@@ -17,6 +17,10 @@ namespace ArchiveBridge.Application.TargetIngestion.Purview.Reconciliation;
 /// staleness — item 8); <paramref name="ExpectedCurrentDecisionVersion"/> é a versão de decisão que o
 /// caller acredita ser a vigente (0 = nenhuma decisão ainda esperada) — usada para detectar decisões
 /// conflitantes concorrentes (item 10).
+///
+/// AB-I6-012: este comando NUNCA carrega ator/papel — um payload controlado pelo chamador nunca pode ser
+/// autoridade de RBAC ou de auditoria. Identidade e papéis efetivos são sempre resolvidos server-side pelo
+/// use case a partir de <see cref="IAuthenticatedActorAccessor"/>.
 /// </summary>
 public sealed record DisposeReconciliationExceptionCommand(
     TenantScope Scope,
@@ -29,8 +33,6 @@ public sealed record DisposeReconciliationExceptionCommand(
     ReconciliationExceptionReasonCode ReasonCode,
     int ExpectedCurrentDecisionVersion,
     string? Comment,
-    string ActorId,
-    string ActorRole,
     CorrelationId Correlation);
 
 /// <summary>
@@ -44,17 +46,31 @@ internal static class ReconciliationExceptionDispositionAuthorization
 {
     // Approver/Administrator: mesmo par que já decide projetos/ondas (Contracts.ControlPlane.PortalRoles) —
     // disposition de exceções é uma decisão de aprovação, nunca uma ação operacional de rotina.
-    private static readonly HashSet<string> WriteRoles = new(StringComparer.Ordinal) { PortalRoles.Approver, PortalRoles.Administrator };
+    // Administrator vem primeiro: quando o ator autenticado possui os dois papéis, a transição elevada
+    // (item 12) deve ser avaliada contra Administrator, nunca contra Approver.
+    private static readonly string[] WriteRolesByPrecedence = [PortalRoles.Administrator, PortalRoles.Approver];
 
-    /// <summary>Exige um papel de escrita conhecido — sem verificar ainda a transição específica.</summary>
-    /// <exception cref="ReconciliationExceptionAuthorizationException">Papel desconhecido ou fora do conjunto autorizado.</exception>
-    public static void EnsureCanWrite(string role)
+    /// <summary>
+    /// Exige que os papéis EFETIVOS do ator autenticado (resolvidos server-side — AB-I6-012, nunca alegados
+    /// pelo payload do chamador) contenham ao menos um papel de escrita conhecido, e retorna o mais
+    /// privilegiado deles — sem verificar ainda a transição específica.
+    /// </summary>
+    /// <exception cref="ReconciliationExceptionAuthorizationException">Nenhum papel efetivo do ator está no conjunto autorizado.</exception>
+    public static string EnsureCanWrite(IReadOnlyCollection<string> effectiveRoles)
     {
-        if (string.IsNullOrWhiteSpace(role) || !PortalRoles.IsKnown(role) || !WriteRoles.Contains(role))
+        if (effectiveRoles is { Count: > 0 })
         {
-            throw new ReconciliationExceptionAuthorizationException(
-                "Papel não autorizado a criar/alterar disposition de exceções de reconciliação (fail-closed).");
+            foreach (var candidate in WriteRolesByPrecedence)
+            {
+                if (effectiveRoles.Contains(candidate, StringComparer.Ordinal))
+                {
+                    return candidate;
+                }
+            }
         }
+
+        throw new ReconciliationExceptionAuthorizationException(
+            "Papel não autorizado a criar/alterar disposition de exceções de reconciliação (fail-closed).");
     }
 
     /// <summary>
@@ -90,22 +106,26 @@ internal static class ReconciliationExceptionDispositionAuthorization
 /// Registra uma decisão humana/auditável sobre UMA exceção técnica de reconciliação (AB-I6-010). A
 /// exceção-fonte (resultado técnico, avaliação vigente) é SEMPRE resolvida server-side a partir da
 /// avaliação canônica mais recente (Passo 3) — nunca a partir de dados fornecidos pelo caller além dos
-/// identificadores opacos. Nunca escreve em EXO/Graph/Purview/EV, nunca emite certificate, nunca fecha
-/// wave/projeto (STOP-THE-LINE).
+/// identificadores opacos. Identidade e papéis do ator também são SEMPRE resolvidos server-side, a partir
+/// de <see cref="IAuthenticatedActorAccessor"/> — nunca do payload do chamador (AB-I6-012). Nunca escreve
+/// em EXO/Graph/Purview/EV, nunca emite certificate, nunca fecha wave/projeto (STOP-THE-LINE).
 /// </summary>
 public sealed class DisposeReconciliationExceptionUseCase(
     IReconciliationAssessmentStore assessments,
     IReconciliationExceptionDispositionStore dispositions,
-    IClock clock)
+    IClock clock,
+    IAuthenticatedActorAccessor actorAccessor)
 {
     private const int MaxItemKeyLength = 320;
 
     private readonly IReconciliationAssessmentStore _assessments = assessments;
     private readonly IReconciliationExceptionDispositionStore _dispositions = dispositions;
     private readonly IClock _clock = clock;
+    private readonly IAuthenticatedActorAccessor _actorAccessor = actorAccessor;
 
     /// <exception cref="ReconciliationExceptionDispositionValidationException">Entrada estruturalmente inválida (status/motivo/comentário/ItemKey).</exception>
-    /// <exception cref="ReconciliationExceptionAuthorizationException">Ator anônimo ou papel não autorizado para a transição.</exception>
+    /// <exception cref="ReconciliationExceptionAuthorizationException">Ator anônimo ou nenhum papel efetivo autorizado para a transição.</exception>
+    /// <exception cref="InvalidOperationException">Nenhum principal autenticado válido no contexto atual (ver <see cref="IAuthenticatedActorAccessor"/>).</exception>
     /// <exception cref="PurviewImportJobSourceNotFoundException">Onda/plano inexistente/fora de escopo, ou nenhuma avaliação ainda computada (anti-IDOR).</exception>
     /// <exception cref="ReconciliationExceptionStaleAssessmentException">A avaliação referenciada não é mais a vigente.</exception>
     /// <exception cref="ReconciliationExceptionNotFoundException">O item referenciado não existe na avaliação vigente (anti-IDOR).</exception>
@@ -120,9 +140,15 @@ public sealed class DisposeReconciliationExceptionUseCase(
         // pertencente a um escopo — um ator sem papel de escrita recebe exatamente a mesma recusa
         // independentemente de a exceção referenciada existir ou pertencer a outro tenant/projeto/onda
         // (item 6: nunca revela existência cross-scope).
+        //
+        // AB-I6-012: identidade/papéis vêm EXCLUSIVAMENTE de IAuthenticatedActorAccessor — nunca de campos
+        // do comando. Um caller que alcance este use case não pode alegar Administrator (nem qualquer outro
+        // papel) via payload; o accessor lança fail-closed quando não há principal autenticado, antes de
+        // qualquer leitura de dado de escopo.
         ReconciliationExceptionDispositionRules.EnsureStatusIsExplicitlyDecidable(command.RequestedStatus);
-        ReconciliationExceptionDispositionAuthorization.EnsureCanWrite(command.ActorRole);
-        var actor = ReconciliationExceptionDispositionAuthorization.RequireActor(command.ActorId);
+        var authenticatedActor = _actorAccessor.Current;
+        var actor = ReconciliationExceptionDispositionAuthorization.RequireActor(authenticatedActor.ActorId);
+        var resolvedRole = ReconciliationExceptionDispositionAuthorization.EnsureCanWrite(authenticatedActor.Roles);
         var itemKey = RequireItemKey(command.ItemKey);
 
         var latest = await _assessments.GetLatestAsync(command.Scope, command.Wave, command.PlannedJobName, cancellationToken).ConfigureAwait(false)
@@ -146,7 +172,7 @@ public sealed class DisposeReconciliationExceptionUseCase(
         };
 
         ReconciliationExceptionDispositionRules.EnsureDispositionable(technicalDisposition);
-        ReconciliationExceptionDispositionAuthorization.EnsureElevatedIfRequired(command.ActorRole, technicalDisposition, command.RequestedStatus);
+        ReconciliationExceptionDispositionAuthorization.EnsureElevatedIfRequired(resolvedRole, technicalDisposition, command.RequestedStatus);
         ReconciliationExceptionDispositionRules.EnsureReasonCodeAllowed(
             technicalDisposition, command.RequestedStatus, command.ReasonCode, ReconciliationExceptionReasonCodeCatalog.CurrentVersion);
 
@@ -165,7 +191,7 @@ public sealed class DisposeReconciliationExceptionUseCase(
             ReconciliationExceptionReasonCodeCatalog.CurrentVersion,
             command.Comment,
             actor,
-            command.ActorRole,
+            resolvedRole,
             command.Correlation,
             _clock.UtcNow,
             cancellationToken).ConfigureAwait(false);

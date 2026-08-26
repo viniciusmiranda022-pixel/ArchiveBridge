@@ -5,6 +5,7 @@ using ArchiveBridge.Application.TargetIngestion.Purview.MappingCsv;
 using ArchiveBridge.Application.TargetIngestion.Purview.Reconciliation;
 using ArchiveBridge.Application.TargetIngestion.Purview.ServiceResult;
 using ArchiveBridge.Application.WavePartitionBindings;
+using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.PstProcessing;
@@ -92,7 +93,28 @@ public sealed class ReconciliationExceptionDispositionIntegrationTests(SqlServer
     private EvaluateReconciliationUseCase ReconciliationUseCase() =>
         new(EvidenceResolver(), MappingStore(), Jobs(), Reports(), Snapshots(), Assessments(), Clock);
 
-    private DisposeReconciliationExceptionUseCase DisposeUseCase() => new(Assessments(), Dispositions(), Clock);
+    private static readonly IAuthenticatedActorAccessor DefaultApproverActor =
+        new FakeAuthenticatedActorAccessor("approver-1@contoso.com", PortalRoles.Approver);
+
+    private DisposeReconciliationExceptionUseCase DisposeUseCase(IAuthenticatedActorAccessor? actorAccessor = null) =>
+        new(Assessments(), Dispositions(), Clock, actorAccessor ?? DefaultApproverActor);
+
+    /// <summary>
+    /// Ator autenticado de teste (AB-I6-012): substitui, no contexto de teste, o mecanismo real do portal
+    /// (<c>PortalAuthenticatedActorAccessor</c>) que resolveria identidade/papéis a partir do
+    /// <see cref="System.Security.Claims.ClaimsPrincipal"/> autenticado — nunca do payload do chamador.
+    /// </summary>
+    private sealed class FakeAuthenticatedActorAccessor(string actorId, params string[] roles) : IAuthenticatedActorAccessor
+    {
+        public AuthenticatedActor Current { get; } = new(actorId, roles);
+    }
+
+    /// <summary>Simula a ausência de um principal autenticado — o accessor real lança fail-closed neste caso.</summary>
+    private sealed class UnauthenticatedActorAccessor : IAuthenticatedActorAccessor
+    {
+        public AuthenticatedActor Current => throw new InvalidOperationException(
+            "Nenhum principal autenticado no contexto atual (fail-closed).");
+    }
 
     private GetReconciliationExceptionBacklogUseCase BacklogUseCase() => new(Assessments(), Dispositions());
 
@@ -261,10 +283,8 @@ public sealed class ReconciliationExceptionDispositionIntegrationTests(SqlServer
         ReconciliationExceptionDecisionStatus status,
         ReconciliationExceptionReasonCode reason,
         int expectedVersion = 0,
-        string? comment = null,
-        string actor = "approver-1@contoso.com",
-        string role = PortalRoles.Approver) =>
-        new(scope, wave, plannedJobName, assessmentVersion, kind, itemKey, status, reason, expectedVersion, comment, actor, role, CorrelationId.New());
+        string? comment = null) =>
+        new(scope, wave, plannedJobName, assessmentVersion, kind, itemKey, status, reason, expectedVersion, comment, CorrelationId.New());
 
     // ---- 1-2: happy path sobre Mismatch ----
 
@@ -304,10 +324,12 @@ public sealed class ReconciliationExceptionDispositionIntegrationTests(SqlServer
     {
         var (scope, wave, plannedJobName, assessment, remoteName) = await SeedIncompleteEvidenceAsync();
 
+        // Ator autenticado real é Approver (mesmo quando o payload nada alega) — a transição elevada exige
+        // Administrator server-side.
         await Assert.ThrowsAsync<ReconciliationExceptionAuthorizationException>(() => DisposeUseCase().ExecuteAsync(
             Command(scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
                 ReconciliationExceptionDecisionStatus.AcceptedException,
-                ReconciliationExceptionReasonCode.IncompleteEvidenceAcceptedByExplicitOperationalPolicy, role: PortalRoles.Approver),
+                ReconciliationExceptionReasonCode.IncompleteEvidenceAcceptedByExplicitOperationalPolicy),
             CancellationToken.None));
     }
 
@@ -315,11 +337,12 @@ public sealed class ReconciliationExceptionDispositionIntegrationTests(SqlServer
     public async Task DisposeAcceptsIncompleteEvidenceOnlyWithTheAdministratorRoleAndTheDedicatedReasonCode()
     {
         var (scope, wave, plannedJobName, assessment, remoteName) = await SeedIncompleteEvidenceAsync();
+        var administrator = new FakeAuthenticatedActorAccessor("admin-1@contoso.com", PortalRoles.Administrator);
 
-        var decision = await DisposeUseCase().ExecuteAsync(
+        var decision = await DisposeUseCase(administrator).ExecuteAsync(
             Command(scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
                 ReconciliationExceptionDecisionStatus.AcceptedException,
-                ReconciliationExceptionReasonCode.IncompleteEvidenceAcceptedByExplicitOperationalPolicy, role: PortalRoles.Administrator),
+                ReconciliationExceptionReasonCode.IncompleteEvidenceAcceptedByExplicitOperationalPolicy),
             CancellationToken.None);
 
         Assert.Equal(ReconciliationExceptionDecisionStatus.AcceptedException, decision.Status);
@@ -354,20 +377,76 @@ public sealed class ReconciliationExceptionDispositionIntegrationTests(SqlServer
     public async Task DisposeRejectsAnUnauthorizedRoleIdenticallyRegardlessOfWhetherTheItemExists()
     {
         var (scope, wave, plannedJobName, assessment, remoteName) = await SeedMismatchAsync();
+        var operatorActor = new FakeAuthenticatedActorAccessor("operator-1@contoso.com", PortalRoles.Operator);
 
-        var forMissingItem = await Assert.ThrowsAsync<ReconciliationExceptionAuthorizationException>(() => DisposeUseCase().ExecuteAsync(
+        var forMissingItem = await Assert.ThrowsAsync<ReconciliationExceptionAuthorizationException>(() => DisposeUseCase(operatorActor).ExecuteAsync(
             Command(scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, "does-not-exist.pst",
-                ReconciliationExceptionDecisionStatus.RemediationRequired, ReconciliationExceptionReasonCode.RemediationScheduledReimportRequired,
-                role: PortalRoles.Operator),
+                ReconciliationExceptionDecisionStatus.RemediationRequired, ReconciliationExceptionReasonCode.RemediationScheduledReimportRequired),
             CancellationToken.None));
 
-        var forRealItem = await Assert.ThrowsAsync<ReconciliationExceptionAuthorizationException>(() => DisposeUseCase().ExecuteAsync(
+        var forRealItem = await Assert.ThrowsAsync<ReconciliationExceptionAuthorizationException>(() => DisposeUseCase(operatorActor).ExecuteAsync(
             Command(scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
-                ReconciliationExceptionDecisionStatus.RemediationRequired, ReconciliationExceptionReasonCode.RemediationScheduledReimportRequired,
-                role: PortalRoles.Operator),
+                ReconciliationExceptionDecisionStatus.RemediationRequired, ReconciliationExceptionReasonCode.RemediationScheduledReimportRequired),
             CancellationToken.None));
 
         Assert.Equal(forMissingItem.Message, forRealItem.Message);
+    }
+
+    // ---- AB-I6-012: RBAC server-side — ator/papel nunca vêm do payload do chamador ----
+
+    [Fact]
+    public async Task DisposeIgnoresAnyClaimOfAdministratorNotBackedByTheAuthenticatedPrincipal()
+    {
+        // O comando (AB-I6-012) não possui mais campos de ator/papel — não há "payload" algum a forjar. Este
+        // teste prova o invariante pelo lado do principal real: um ator autenticado real como Approver (o
+        // único papel de escrita que ele de fato possui) NUNCA consegue a transição elevada de
+        // IncompleteEvidence, mesmo pedindo exatamente a mesma decisão que um Administrator pediria.
+        var (scope, wave, plannedJobName, assessment, remoteName) = await SeedIncompleteEvidenceAsync();
+        var realApprover = new FakeAuthenticatedActorAccessor("approver-forger@contoso.com", PortalRoles.Approver);
+
+        await Assert.ThrowsAsync<ReconciliationExceptionAuthorizationException>(() => DisposeUseCase(realApprover).ExecuteAsync(
+            Command(scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
+                ReconciliationExceptionDecisionStatus.AcceptedException,
+                ReconciliationExceptionReasonCode.IncompleteEvidenceAcceptedByExplicitOperationalPolicy),
+            CancellationToken.None));
+
+        var count = await CountAsync(
+            scope, "SELECT COUNT(*) FROM dbo.purview_reconciliation_exception_dispositions WHERE wave_id = @wave;", ("@wave", wave.Value));
+        Assert.Equal(0, count);
+    }
+
+    [Fact]
+    public async Task DisposePersistsTheServerSidePrincipalAsDecidedByNeverAValueFromTheCommand()
+    {
+        // O comando não carrega ator algum (AB-I6-012): a identidade persistida/auditada só pode vir do
+        // principal autenticado server-side — este teste prova que ela realmente chega ao registro
+        // persistido, com o valor exato resolvido pelo accessor.
+        var (scope, wave, plannedJobName, assessment, remoteName) = await SeedMismatchAsync();
+        var administrator = new FakeAuthenticatedActorAccessor("server-side-admin@contoso.com", PortalRoles.Administrator);
+
+        var decision = await DisposeUseCase(administrator).ExecuteAsync(
+            Command(scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
+                ReconciliationExceptionDecisionStatus.RemediationRequired, ReconciliationExceptionReasonCode.RemediationScheduledReimportRequired),
+            CancellationToken.None);
+
+        Assert.Equal("server-side-admin@contoso.com", decision.DecidedBy);
+        Assert.Equal(PortalRoles.Administrator, decision.DecidedByRole);
+    }
+
+    [Fact]
+    public async Task DisposeFailsClosedBeforeAnyScopedReadWhenThereIsNoAuthenticatedPrincipal()
+    {
+        var (scope, wave, plannedJobName, assessment, remoteName) = await SeedMismatchAsync();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => DisposeUseCase(new UnauthenticatedActorAccessor()).ExecuteAsync(
+            Command(scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
+                ReconciliationExceptionDecisionStatus.RemediationRequired, ReconciliationExceptionReasonCode.RemediationScheduledReimportRequired),
+            CancellationToken.None));
+
+        // Nenhuma escrita ocorreu — a falha aconteceu antes de qualquer acesso a dado do escopo.
+        var count = await CountAsync(
+            scope, "SELECT COUNT(*) FROM dbo.purview_reconciliation_exception_dispositions WHERE wave_id = @wave;", ("@wave", wave.Value));
+        Assert.Equal(0, count);
     }
 
     // ---- 7: anti-IDOR cross-tenant/project ----
@@ -477,11 +556,12 @@ public sealed class ReconciliationExceptionDispositionIntegrationTests(SqlServer
         Assert.Equal(1, count);
     }
 
-    private async Task<(ReconciliationExceptionDecision? Decision, Exception? Failure)> RunDisposeAsync(DisposeReconciliationExceptionCommand command)
+    private async Task<(ReconciliationExceptionDecision? Decision, Exception? Failure)> RunDisposeAsync(
+        DisposeReconciliationExceptionCommand command, IAuthenticatedActorAccessor actorAccessor)
     {
         try
         {
-            var decision = await DisposeUseCase().ExecuteAsync(command, CancellationToken.None).ConfigureAwait(false);
+            var decision = await DisposeUseCase(actorAccessor).ExecuteAsync(command, CancellationToken.None).ConfigureAwait(false);
             return (decision, null);
         }
         catch (Exception exception)
@@ -494,15 +574,15 @@ public sealed class ReconciliationExceptionDispositionIntegrationTests(SqlServer
     public async Task DisposeDetectsConflictingConcurrentDecisionsInsteadOfLastWriteWins()
     {
         var (scope, wave, plannedJobName, assessment, remoteName) = await SeedMismatchAsync();
+        var approverA = new FakeAuthenticatedActorAccessor("approver-a@contoso.com", PortalRoles.Approver);
+        var approverB = new FakeAuthenticatedActorAccessor("approver-b@contoso.com", PortalRoles.Approver);
 
         var commandA = Command(scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
-            ReconciliationExceptionDecisionStatus.RemediationRequired, ReconciliationExceptionReasonCode.RemediationScheduledReimportRequired,
-            actor: "approver-a@contoso.com");
+            ReconciliationExceptionDecisionStatus.RemediationRequired, ReconciliationExceptionReasonCode.RemediationScheduledReimportRequired);
         var commandB = Command(scope, wave, plannedJobName, assessment.AssessmentVersion, ReconciliationExceptionItemKind.Pst, remoteName,
-            ReconciliationExceptionDecisionStatus.AcceptedException, ReconciliationExceptionReasonCode.ToleratedByOperationalPolicy,
-            actor: "approver-b@contoso.com");
+            ReconciliationExceptionDecisionStatus.AcceptedException, ReconciliationExceptionReasonCode.ToleratedByOperationalPolicy);
 
-        var results = await Task.WhenAll(RunDisposeAsync(commandA), RunDisposeAsync(commandB));
+        var results = await Task.WhenAll(RunDisposeAsync(commandA, approverA), RunDisposeAsync(commandB, approverB));
 
         // Exatamente uma das duas decisões conflitantes deve ter sucedido (versão 1); a outra é recusada com
         // ConcurrencyException — nunca ambas sucedendo silenciosamente (last-write-wins) nem ambas falhando.
