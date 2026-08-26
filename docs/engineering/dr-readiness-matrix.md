@@ -1,0 +1,36 @@
+<!-- Evidência executável do work order AB-I7-005 (I7 — Hardening — Passo 3). Este documento NÃO declara
+Production Ready, HA comprovada, I8/canário/go-live nem pen-test institucional (ver STOP-THE-LINE do work
+order). Cada linha liga um critério de aceite/escopo obrigatório do work order a: o mecanismo real
+exercitado, o desfecho (`RecoveryReadinessStatus`) e o(s) teste(s) automatizado(s) que provam o
+comportamento. -->
+
+# Matriz de recovery readiness — I7 Passo 3 (AB-I7-005)
+
+**Estado:** evidência de hardening deste Passo. Ver [`recovery-runbook-i7.md`](recovery-runbook-i7.md) §7
+para o runbook operacional completo.
+
+| # | Critério (acceptance criteria do work order) | Mecanismo real exercitado | Desfecho | Evidência (testes) |
+| --- | --- | --- | --- | --- |
+| 1 | Restore drill reproduzível que restaura/reidrata estado canônico em SQL-real de teste e comprova invariantes de integridade | `RestoreDrillHarness` (banco efêmero dedicado, `BACKUP`/`RESTORE DATABASE` nativos) | `Pass` (identidade/estado preservados; estado pós-backup descartado) | `RecoveryReadinessIntegrationTests.ARestoreDrillPreservesCanonicalStateWrittenBeforeTheBackupAndDiscardsStateWrittenAfter` |
+| 2 | Pending work reconstruído deterministicamente do estado canônico, sem duplicar efeitos concluídos, replay concorrente idempotente | `SqlPendingWorkRebuildQuery` (mesmo predicado de elegibilidade de `SqlJobStore.ClaimSql`) + `IJobStore.TryClaimNextAsync` (claim atômico já existente) | Leitura pura comprovadamente idempotente; claim concorrente converge a um único vencedor | `PendingWorkRebuildIntegrationTests.RebuildIsAPureReadThatNeverMutatesStateAndConcurrentClaimAfterItNeverDuplicatesTheEffect` |
+| 3 | Artifact/evidence ausente ou adulterado após restore bloqueia readiness de recovery | Self-hash recomputado e revalidado fail-closed em toda leitura (`RecoveryReadinessRecord.Rehydrate`, mesmo padrão de `ReconciliationCertificate.Rehydrate`) | Exceção fail-closed (`RecoveryReadinessIntegrityViolationException`) — nunca sucesso silencioso | `RecoveryReadinessIntegrationTests.ARecordTamperedDirectlyInTheDatabaseIsRejectedFailClosedOnReadNeverSilentlyReturned`; `RecoveryReadinessRecordTests.RehydrateOfARecordWithATamperedHashIsRejectedFailClosed` / `...TamperedEvidenceFingerprint...` |
+| 4 | RTO/RPO só passam quando medidos; ausência de medição permanece fail-closed | `RecoveryReadinessRecord.Pass` exige `RecoveryObjectiveMeasurement` não-anulável e recusa quando a medição excede o alvo documentado | `NotMeasured` por default; `Pass` só com medição real dentro do alvo | `RecoveryReadinessRecordTests.PassWithinTheObjectiveThresholdSucceeds` / `PassThatExceedsTheObjectiveThresholdIsRejected` / `PassRequiresARealMeasurement` |
+| 5 | HA não comprovada é explicitamente `Blocked`, com failure domain documentado | `RecoveryReadinessRecord.Pass` recusa incondicionalmente `ExerciseType == HaFailover` (domínio) + `CK_rre_ha_never_pass` (schema, defesa em profundidade) | `Blocked` estrutural — nenhum caminho de código produz `Pass` para HA | `RecoveryReadinessRecordTests.HaFailoverCanNeverResultInPass` / `HaFailoverIsExplicitlyBlockedWithADocumentedFailureDomain`; `RecoveryReadinessIntegrationTests.TheDatabaseItselfRejectsAnHaFailoverRowMarkedPassAsDefenseInDepthBeyondTheDomainGuard` |
+| 6 | Estados interrompidos/retry/lease stale convergem com fencing e budgets já aceitos | Reuso direto do reaper/fencing já provados em I7 Passo 1 (`IJobLeaseManager.RecoverExpiredLeasesAsync`, `SqlJobFence`) — a reconstrução de pending work NUNCA ressuscita um lease por si só | Job `Processing` com lease expirado permanece invisível à reconstrução até o reaper convergir | `PendingWorkRebuildIntegrationTests.AJobStuckInProcessingWithAnExpiredLeaseIsInvisibleToRebuildUntilTheReaperConvergesIt` |
+| 7 | Cross-tenant/project recovery é negado sem revelar existência | RLS por `SESSION_CONTEXT('tenant_id')` (`rls.tenant_isolation_policy`) sobre `dbo.recovery_readiness_evidence` e `dbo.jobs`, mesmo mecanismo já aceito | `null`/lista vazia — nunca uma exceção que revele existência cross-tenant | `RecoveryReadinessIntegrationTests.ARecoveryReadinessRecordFromOneTenantIsInvisibleToAnotherTenantsScope`; `PendingWorkRebuildIntegrationTests.RebuildIsScopedByTenantAndProjectAndNeverLeaksAnotherTenantsPendingWork` |
+| 8 | Nenhum segredo ou PII é introduzido nos snapshots/evidence de DR | `RecoveryReadinessRecord.Notes`/`FailureDomain` são metadados técnicos livres de segredo/PII por convenção do domínio (mesmo princípio de `purview_reconciliation_certificate_audit_events`); `EvidenceFingerprint` é sempre um digest SHA-256, nunca o conteúdo original | Nenhum campo do schema (`0040_i7_recovery_readiness_evidence.sql`) carrega segredo/credencial/conteúdo de mailbox | Revisão do schema (colunas: apenas ids, enums, timestamps, hashes, texto técnico limitado); gitleaks/secret scanning do CI |
+| 9 | Migrations históricas permanecem intactas; migration nova passa pelos gates existentes | `MigrationRunner` — hash SHA-256 de cada migration revalidado a cada `ApplyAsync`, migration nova (`0040`) aditiva/append-only | Nenhum DROP/UPDATE de dado histórico; `0001`-`0039` byte-for-byte intactos | `MigrationHashTests` (reaplica TODAS as migrations, incl. as 39 anteriores, a cada teste de integração — qualquer divergência de hash lançaria) |
+| 10 | CI oficial completo permanece 100% verde | `.github/workflows/ci.yml` (restore locked-mode, build Release warnings-as-errors, suíte completa SQL-real, format, SCA/SBOM, gitleaks) | Ver relato de execução no PR (`CLAUDE_DONE`) | Execução do CI oficial no HEAD deste PR |
+
+## Limitações conhecidas deste Passo (não fabricadas, documentadas explicitamente)
+
+- O restore drill mede backup/restore de um banco de teste pequeno — a duração real observada em CI é
+  ordens de grandeza menor que o alvo documentado de 4h; isto prova o MECANISMO (backup/restore nativo,
+  medição real, gate fail-closed), não a escala de um banco de produção. Extrapolar para volume de produção
+  exigiria um exercício de capacidade dedicado, fora do escopo deste Passo.
+- `RecoveryObjective.ControlPlaneRpo`/`EvidenceLogicalRpo` são exercitáveis pelo MESMO modelo
+  (`RecoveryReadinessRecord`), mas este Passo não fabricou um cenário sintético de "perda de evidência" só
+  para preencher a métrica — nenhum teste afirma medir RPO real além do que o restore drill (RTO) já prova
+  diretamente; um exercício de RPO dedicado (ex.: gap entre dois checkpoints de evidência) fica para um
+  incremento futuro quando houver um caminho real de evidência contínua a medir.
+- HA permanece, e deve permanecer, `Blocked` — este Passo não introduz nenhum mecanismo de failover.
