@@ -5,6 +5,7 @@ using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.PstProcessing;
 using ArchiveBridge.Domain.Common;
+using ArchiveBridge.Domain.Performance;
 using ArchiveBridge.Domain.PstProcessing;
 using ArchiveBridge.Infrastructure.Mapping;
 
@@ -46,10 +47,11 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
     private readonly PartitionExecutionOutputOptions _outputOptions;
     private readonly IClock _clock;
     private readonly IPstArtifactStreamFactory _sourceStreamFactory;
+    private readonly IScratchSpaceProbe _scratchSpaceProbe;
 
     /// <summary>Constrói o writer com a factory física padrão de stream de origem (uso normal em produção/composition root).</summary>
     public LocalSinglePartExecutionWriter(PstStorageOptions sourceOptions, PartitionExecutionOutputOptions outputOptions, IClock clock)
-        : this(sourceOptions, outputOptions, clock, PhysicalPstArtifactStreamFactory.Instance)
+        : this(sourceOptions, outputOptions, clock, PhysicalPstArtifactStreamFactory.Instance, PhysicalScratchSpaceProbe.Instance)
     {
     }
 
@@ -63,11 +65,26 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
     internal LocalSinglePartExecutionWriter(
         PstStorageOptions sourceOptions, PartitionExecutionOutputOptions outputOptions, IClock clock,
         IPstArtifactStreamFactory sourceStreamFactory)
+        : this(sourceOptions, outputOptions, clock, sourceStreamFactory, PhysicalScratchSpaceProbe.Instance)
+    {
+    }
+
+    /// <summary>
+    /// Construtor com seam ADICIONAL de <see cref="IScratchSpaceProbe"/> (AB-I7-004 blocker 2) — visível
+    /// apenas dentro do assembly, usado SOMENTE por testes que precisam provar deterministicamente os
+    /// vereditos de <see cref="EnsurePreflightSpace"/> (espaço exatamente suficiente, 1 byte abaixo,
+    /// indeterminável) sem depender do espaço livre REAL do disco onde os testes rodam. Nunca usado pelo
+    /// composition root.
+    /// </summary>
+    internal LocalSinglePartExecutionWriter(
+        PstStorageOptions sourceOptions, PartitionExecutionOutputOptions outputOptions, IClock clock,
+        IPstArtifactStreamFactory sourceStreamFactory, IScratchSpaceProbe scratchSpaceProbe)
     {
         _sourceOptions = sourceOptions;
         _outputOptions = outputOptions;
         _clock = clock;
         _sourceStreamFactory = sourceStreamFactory;
+        _scratchSpaceProbe = scratchSpaceProbe;
     }
 
     /// <inheritdoc />
@@ -221,32 +238,68 @@ public sealed class LocalSinglePartExecutionWriter : IPartitionPartWriter
         }
     }
 
+    /// <summary>
+    /// Gate de capacidade de scratch ANTES de qualquer escrita (AB-I7-004 blocker 2): a fórmula do runbook
+    /// (<see cref="ScratchCapacityFormula"/>/<see cref="ScratchCapacityAssessor"/>, Domain.Performance) é
+    /// agora a autoridade ÚNICA de requisito de espaço deste caminho de produção — não há mais duas regras
+    /// concorrentes (a fórmula multi-termo desconectada da checagem antiga). Termos mapeados para o ÚNICO
+    /// caso que este writer materializa (<c>SinglePartWithinTarget</c>, cópia byte-for-byte para o volume de
+    /// OUTPUT):
+    /// <list type="bullet">
+    /// <item><c>SourceCopyBytes = 0</c>: a origem permanece intacta no volume de ORIGEM
+    /// (<see cref="PstStorageOptions.RootPath"/>, nunca tocado por este preflight — só o volume de OUTPUT é
+    /// checado) — não existe uma segunda cópia da origem no volume de output além da própria parte.</item>
+    /// <item><c>ExpectedPartBytes = expectedSize</c>: o único byte realmente escrito no volume de output (o
+    /// arquivo de staging que se torna a parte final via <see cref="Directory.Move(string, string)"/>).</item>
+    /// <item><c>RepairBackupBytes = 0</c>: nenhuma engine de repair/split é usada por este writer — prova:
+    /// o ÚNICO caso autorizado é <c>SinglePartWithinTarget</c> (cópia byte-for-byte da origem inteira),
+    /// reforçado tanto aqui (linha 91) quanto no Domain; nenhuma engine nova introduzida por este Passo.</item>
+    /// <item><c>EngineTemporaryOverheadBytes = 0</c>: os sidecars (<c>part.sha256</c> + <c>manifest.json</c>)
+    /// somam poucos bytes/KB — desprezíveis frente à própria margem de 20% aplicada sobre
+    /// <paramref name="expectedSize"/>; contabilizá-los separadamente inventaria um número que o runbook não
+    /// fornece.</item>
+    /// </list>
+    /// A margem fixa historicamente configurada (<see cref="PartitionExecutionOutputOptions.MinFreeSpaceMarginBytes"/>)
+    /// é preservada como um PISO adicional — nunca dupla contagem semântica (representa uma margem
+    /// operacional distinta, sobre o mesmo <paramref name="expectedSize"/>), mas o MAIOR dos dois requisitos
+    /// sempre vence: esta integração nunca reduz a proteção que já existia antes dela. Overflow em qualquer um
+    /// dos dois cálculos, entrada negativa, ou incapacidade de determinar o espaço disponível (raiz de volume
+    /// irresolvível/drive não pronto) falham fechado — <see cref="CapacityBudgetOutcome.Unknown"/> nunca vira
+    /// <see cref="CapacityBudgetOutcome.Enough"/> por default. Lança ANTES de qualquer diretório de staging
+    /// ser criado — uma falha aqui nunca deixa efeito parcial no disco.
+    /// </summary>
     private void EnsurePreflightSpace(long expectedSize)
     {
-        var root = Path.GetPathRoot(Path.GetFullPath(_outputOptions.RootPath));
-        if (string.IsNullOrEmpty(root))
+        var formulaInputs = new ScratchCapacityInputs(
+            SourceCopyBytes: 0, ExpectedPartBytes: expectedSize, RepairBackupBytes: 0, EngineTemporaryOverheadBytes: 0);
+        if (!ScratchCapacityFormula.TryCompute(formulaInputs, out var formulaRequiredBytes, out _))
         {
-            return; // Sem raiz de volume resolvível (ex.: caminho relativo malformado) — deixa a escrita real revelar o erro.
+            // Overflow/entrada negativa: a fórmula recusa calcular um requisito confiável — fail-closed,
+            // nunca interpretado como "sem limite"/"suficiente".
+            throw new PartitionExecutionLimitExceededException("INSUFFICIENT_SPACE");
         }
 
-        DriveInfo drive;
+        long legacyRequiredBytes;
         try
         {
-            drive = new DriveInfo(root);
+            checked
+            {
+                legacyRequiredBytes = expectedSize + _outputOptions.MinFreeSpaceMarginBytes;
+            }
         }
-        catch (ArgumentException)
+        catch (OverflowException)
         {
-            return;
-        }
-
-        if (!drive.IsReady)
-        {
-            return;
+            throw new PartitionExecutionLimitExceededException("INSUFFICIENT_SPACE");
         }
 
-        var required = expectedSize + _outputOptions.MinFreeSpaceMarginBytes;
-        if (drive.AvailableFreeSpace < required)
+        var requiredScratchBytes = Math.Max(formulaRequiredBytes, legacyRequiredBytes);
+        var availableScratchBytes = _scratchSpaceProbe.AvailableFreeSpaceBytes(_outputOptions.RootPath);
+
+        var assessment = ScratchCapacityAssessor.Assess(requiredScratchBytes, availableScratchBytes);
+        if (assessment.Outcome != CapacityBudgetOutcome.Enough)
         {
+            // Unknown (raiz/volume não determinável) e Insufficient falham fechado igualmente — nenhuma
+            // execução converte "não sei" em "pode prosseguir" (AB-I7-003/004 §4).
             throw new PartitionExecutionLimitExceededException("INSUFFICIENT_SPACE");
         }
     }
