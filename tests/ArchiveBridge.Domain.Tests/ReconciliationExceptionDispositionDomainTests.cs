@@ -281,7 +281,7 @@ public sealed class ReconciliationExceptionDispositionDomainTests
 
     [Theory]
     [InlineData("SharedAccessSignature=sv=2020-08-04&ss=b&sig=abc123")]
-    [InlineData("AccountKey=abcdefgh1234567890==")]
+    [InlineData("AccountKey=isto-nao-e-um-segredo-real-apenas-fixture-de-teste")]
     [InlineData("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9")]
     public void CreateRejectsACommentThatLooksLikeASecretOrToken(string suspectedSecret)
     {

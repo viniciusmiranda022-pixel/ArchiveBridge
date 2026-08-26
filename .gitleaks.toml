@@ -11,9 +11,21 @@ Credencial efêmera do container SQL Server usado APENAS nos testes de integraç
 O container é criado e destruído dentro do job, não é acessível externamente e não protege
 nenhum dado real. Não é um segredo de produção. A conexão de teste real vem sempre da variável
 de ambiente ARCHIVEBRIDGE_TEST_SQL (nunca versionada).
+
+Achado AB-I6-011 (CI run 32920990543, regra generic-api-key, arquivo
+tests/ArchiveBridge.Domain.Tests/ReconciliationExceptionDispositionDomainTests.cs, linha 284,
+commit 78204f4d84bae80b870fd9b5c8301b63e858db6a): valor de fixture puramente sintético usado em
+CreateRejectsACommentThatLooksLikeASecretOrToken para exercitar a heurística fail-closed de
+ReconciliationExceptionCommentText.SuspectedSecretPattern (que reage ao prefixo case-insensitive
+"accountkey=", não ao valor). Nunca foi uma credencial real nem se refere a nenhum recurso vivo;
+falso positivo demonstrável do gitleaks pela entropia/formato do sufixo. O commit atual (HEAD)
+já substituiu o valor por um sintético inequivocamente não-secreto — esta entrada existe apenas
+porque o gitleaks reavalia todo o histórico de commits do PR, incluindo o commit histórico já
+substituído, a cada execução.
 """
 regexes = [
   '''Slice1_CI_Ephemeral!9''',
+  '''abcdefgh1234567890==''',
 ]
 paths = [
   '''\.gitleaks\.toml''',
