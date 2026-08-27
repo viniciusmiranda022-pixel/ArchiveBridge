@@ -33,6 +33,11 @@ public sealed class PendingWorkRebuildIntegrationTests(SqlServerFixture fixture)
         var dueJobId = await store.CreateAsync(
             new CreateJobCommand(scope, Workload.Pst, JobPriority.Normal, CorrelationId.New()), CancellationToken.None);
 
+        // Avança o relógio entre as criações: com a MESMA prioridade, o desempate de aging por
+        // created_at_utc só é determinístico quando os instantes são estritamente distintos (mesmo padrão
+        // de AntiStarvationTests) — dois Jobs com created_at_utc idêntico não têm ordem de claim garantida.
+        clock.Advance(TimeSpan.FromSeconds(1));
+
         // Um segundo Job é criado e imediatamente reivindicado/agendado para retry no FUTURO — não deve
         // aparecer na reconstrução no instante "Start".
         var futureJobId = await store.CreateAsync(
@@ -44,7 +49,9 @@ public sealed class PendingWorkRebuildIntegrationTests(SqlServerFixture fixture)
             new LeaseCommand(scope, dueJobId, new WorkerId("w1"), claimed.Epoch, CorrelationId.New()), ErrorCode.TransientProvider,
             Start + TimeSpan.FromHours(2), CancellationToken.None);
 
-        var eligible = await Rebuild().RebuildEligibleWorkAsync(scope, Workload.Pst, Start, CancellationToken.None);
+        // asOf = clock.UtcNow (Start + 1s, o instante em que futureJobId foi criado) — não o "Start"
+        // original, que agora antecede o próprio created_at_utc/next_attempt_at_utc de futureJobId.
+        var eligible = await Rebuild().RebuildEligibleWorkAsync(scope, Workload.Pst, clock.UtcNow, CancellationToken.None);
 
         Assert.Single(eligible);
         Assert.Equal(futureJobId, eligible[0].Id);
@@ -73,6 +80,12 @@ public sealed class PendingWorkRebuildIntegrationTests(SqlServerFixture fixture)
 
         var recovered = await leases.RecoverExpiredLeasesAsync(10, CancellationToken.None);
         Assert.True(recovered >= 1);
+
+        // O reaper agenda o retry com o MESMO backoff de RetryPolicy.Default (1ª tentativa: BaseDelay) —
+        // o Job só fica elegível para reconstrução quando next_attempt_at_utc chega, exatamente como o
+        // primeiro teste desta classe prova para um Job agendado no futuro; a reconstrução nunca
+        // antecipa o instante que o próprio reaper agendou.
+        clock.Advance(RetryPolicy.Default.BaseDelay);
 
         var afterReaper = await Rebuild().RebuildEligibleWorkAsync(scope, Workload.Upload, clock.UtcNow, CancellationToken.None);
         Assert.Contains(afterReaper, snapshot => snapshot.Id == jobId && snapshot.State == JobState.RetryScheduled);

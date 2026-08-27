@@ -87,9 +87,11 @@ public sealed class RecoveryReadinessIntegrationTests(SqlServerFixture fixture)
         var measurement = new RecoveryObjectiveMeasurement(Start, Start + TimeSpan.FromMinutes(30));
         var evidence = DeterministicHash.Compute(["replay-test"]);
 
+        // O alvo objetivo precisa comportar a duração medida (30 min) para que Pass seja um resultado
+        // válido — RecoveryReadinessRecord.Pass recusa (fail-closed) qualquer medição que exceda o alvo.
         Task<RecoveryReadinessRecord> Record() => readiness.RecordExerciseAsync(
             scope, RecoveryExerciseType.PendingWorkRebuild, RecoveryReadinessStatus.Pass, RecoveryObjective.ControlPlaneRpo,
-            TimeSpan.FromMinutes(5), measurement, evidence, failureDomain: string.Empty, notes: "rebuild ok.",
+            TimeSpan.FromHours(1), measurement, evidence, failureDomain: string.Empty, notes: "rebuild ok.",
             executedBy: "integration-tests", executedByRole: "ServiceAccount", CorrelationId.New(), Start, CancellationToken.None);
 
         var first = await Record();
@@ -150,12 +152,26 @@ public sealed class RecoveryReadinessIntegrationTests(SqlServerFixture fixture)
         await using (var connection = new SqlConnection(fixture.AdminConnectionString))
         {
             await connection.OpenAsync();
+
+            // dbo.recovery_readiness_evidence tem FILTER PREDICATE de RLS por SESSION_CONTEXT('tenant_id')
+            // (migration 0040): sem esse contexto definido, a linha do tenant do escopo fica invisível
+            // para esta conexão crua e o UPDATE abaixo afetaria silenciosamente zero linhas (nenhum erro,
+            // nenhuma adulteração real) — mesmo padrão de
+            // ReconciliationCertificateIntegrationTests.ExecuteAdminSqlAsync.
+            await using (var context = new SqlCommand(
+                "EXEC sys.sp_set_session_context @key = N'tenant_id', @value = @tenant;", connection))
+            {
+                context.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+                await context.ExecuteNonQueryAsync();
+            }
+
             await using var command = new SqlCommand(
                 "UPDATE dbo.recovery_readiness_evidence SET notes = 'ADULTERADO' WHERE tenant_id = @tenant AND project_id = @project AND exercise_type = 0;",
                 connection);
             command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
             command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
-            await command.ExecuteNonQueryAsync();
+            var rowsUpdated = await command.ExecuteNonQueryAsync();
+            Assert.Equal(1, rowsUpdated);
         }
 
         await Assert.ThrowsAsync<RecoveryReadinessIntegrityViolationException>(
@@ -189,6 +205,18 @@ public sealed class RecoveryReadinessIntegrationTests(SqlServerFixture fixture)
         await using (var connection = new SqlConnection(fixture.AdminConnectionString))
         {
             await connection.OpenAsync();
+
+            // dbo.projects e dbo.recovery_readiness_evidence têm BLOCK PREDICATE de RLS por
+            // SESSION_CONTEXT('tenant_id') (migrations 0003/0040): uma conexão crua sem esse
+            // contexto definido é bloqueada mesmo para o tenant do próprio escopo do teste — mesmo
+            // padrão já usado por ReconciliationCertificateIntegrationTests.ExecuteAdminSqlAsync.
+            await using (var context = new SqlCommand(
+                "EXEC sys.sp_set_session_context @key = N'tenant_id', @value = @tenant;", connection))
+            {
+                context.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+                await context.ExecuteNonQueryAsync();
+            }
+
             await using var seedProject = new SqlCommand(
                 "IF NOT EXISTS (SELECT 1 FROM dbo.projects WHERE project_id = @project) " +
                 "INSERT INTO dbo.projects (project_id, tenant_id) VALUES (@project, @tenant);", connection);

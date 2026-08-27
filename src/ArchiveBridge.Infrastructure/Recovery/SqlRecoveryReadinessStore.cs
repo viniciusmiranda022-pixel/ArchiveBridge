@@ -51,8 +51,19 @@ public sealed class SqlRecoveryReadinessStore(TenantConnectionFactory connection
         ORDER BY exercise_version ASC;
         """;
 
+    // FK_rre_project exige que (tenant_id, project_id) já exista em dbo.projects. dbo.projects hoje só é
+    // provisionado de forma preguiçosa pela criação de Jobs (SqlJobStore.CreateSql) — um exercício de
+    // recovery readiness pode ser o PRIMEIRO evento já registrado para um projeto (ex.: um restore drill
+    // ou uma avaliação de HA rodada antes de qualquer Job existir), então a linha de projeto não pode ser
+    // presumida. Mesmo padrão IF NOT EXISTS...INSERT já usado por SqlJobStore.CreateSql,
+    // SqlPlanningCommandInbox, SqlEvDiscoveryCommandInbox e SqlPortalOperationalAudit; @tenant/@project
+    // aqui vêm sempre do TenantScope do chamador, nunca de um recurso não verificado.
     private const string InsertSql =
         $"""
+        SET NOCOUNT ON;
+        IF NOT EXISTS (SELECT 1 FROM dbo.projects WHERE tenant_id = @tenant AND project_id = @project)
+            INSERT INTO dbo.projects (project_id, tenant_id, created_at_utc) VALUES (@project, @tenant, @executedAt);
+
         INSERT INTO dbo.recovery_readiness_evidence ({Columns})
         VALUES
             (@tenant, @project, @type, @version, @status, @objective, @thresholdTicks, @measurementStart,
