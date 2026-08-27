@@ -89,8 +89,10 @@ public sealed class RecoveryReadinessIntegrationTests(SqlServerFixture fixture)
 
         // O alvo objetivo precisa comportar a duração medida (30 min) para que Pass seja um resultado
         // válido — RecoveryReadinessRecord.Pass recusa (fail-closed) qualquer medição que exceda o alvo.
+        // ControlPlaneRto (não ControlPlaneRpo — AB-I7-007 item 2: RPO nunca é Pass nesta baseline, ver
+        // RecoveryReadinessRecordTests.RpoObjectivesCanNeverResultInPassUntilAFailureBoundaryDrillExists).
         Task<RecoveryReadinessRecord> Record() => readiness.RecordExerciseAsync(
-            scope, RecoveryExerciseType.PendingWorkRebuild, RecoveryReadinessStatus.Pass, RecoveryObjective.ControlPlaneRpo,
+            scope, RecoveryExerciseType.PendingWorkRebuild, RecoveryReadinessStatus.Pass, RecoveryObjective.ControlPlaneRto,
             TimeSpan.FromHours(1), measurement, evidence, failureDomain: string.Empty, notes: "rebuild ok.",
             executedBy: "integration-tests", executedByRole: "ServiceAccount", CorrelationId.New(), Start, CancellationToken.None);
 

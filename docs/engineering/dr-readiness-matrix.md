@@ -21,6 +21,9 @@ para o runbook operacional completo.
 | 8 | Nenhum segredo ou PII é introduzido nos snapshots/evidence de DR | `RecoveryReadinessRecord.Notes`/`FailureDomain` são metadados técnicos livres de segredo/PII por convenção do domínio (mesmo princípio de `purview_reconciliation_certificate_audit_events`); `EvidenceFingerprint` é sempre um digest SHA-256, nunca o conteúdo original | Nenhum campo do schema (`0040_i7_recovery_readiness_evidence.sql`) carrega segredo/credencial/conteúdo de mailbox | Revisão do schema (colunas: apenas ids, enums, timestamps, hashes, texto técnico limitado); gitleaks/secret scanning do CI |
 | 9 | Migrations históricas permanecem intactas; migration nova passa pelos gates existentes | `MigrationRunner` — hash SHA-256 de cada migration revalidado a cada `ApplyAsync`, migration nova (`0040`) aditiva/append-only | Nenhum DROP/UPDATE de dado histórico; `0001`-`0039` byte-for-byte intactos | `MigrationHashTests` (reaplica TODAS as migrations, incl. as 39 anteriores, a cada teste de integração — qualquer divergência de hash lançaria) |
 | 10 | CI oficial completo permanece 100% verde | `.github/workflows/ci.yml` (restore locked-mode, build Release warnings-as-errors, suíte completa SQL-real, format, SCA/SBOM, gitleaks) | Ver relato de execução no PR (`CLAUDE_DONE`) | Execução do CI oficial no HEAD deste PR |
+| 11 | Item 8 do work order: upload com efeito externo (transporte AzCopy) já concluído, mas a conclusão do Job nunca chega a ser persistida (crash entre a evidência e o `CompleteAsync`) | `IPurviewUploadAttemptStore.GetLatestAsync` (réplay idempotente PRECOCE, mesmo caminho de `PurviewUploadCommandProcessor.DispatchAsync`) + reaper de lease (`IJobLeaseManager.RecoverExpiredLeasesAsync`) | `Pass` — a recovery converge da evidência JÁ persistida; nenhum segundo transporte/efeito é produzido (uma única tentativa `Uploaded` na história completa) | `RecoveryReadinessInterruptedStateIntegrationTests.AnUploadWhoseEvidenceIsPersistedButWhoseJobCompletionNeverPersistsRecoversFromTheExistingEvidenceWithoutRepeatingTheTransport` |
+| 12 | Item 8 do work order: reconciliation/certificate ainda não terminal (evidência incompleta) | `IssueReconciliationCertificateUseCase`/`GetReconciliationCertificateUseCase` derivam SEMPRE da cadeia canônica persistida (avaliação + dispositions vigentes) | Nunca `Pass`/terminal indevido — permanece `Inconclusive`, mesmo sob 5 tentativas concorrentes de recovery, convergindo para uma única versão | `ReconciliationCertificateIntegrationTests.RecoveryNeverEmitsATerminalPassCertificateWhileTheEvidenceChainRemainsIncompleteEvenUnderConcurrentRecoveryAttempts` |
+| 13 | Item 8 do work order: secret/SAS já consumido (uso único) — recovery não pode reemitir/reconstruir o segredo | `AcquireSasForUploadUseCase` recusa fail-closed qualquer aquisição sobre `SasHandleState.Consumed` ANTES de tocar `ISecretStore` (nenhuma segunda leitura do segredo) | `Blocked` — nenhuma recovery automática; exige novo `Intake` explícito (`recovery-runbook-i7.md` §3) | `RecoveryReadinessInterruptedStateIntegrationTests.RecoveryNeverReacquiresOrReconstructsASasSecretOnceTheHandleIsConsumedAndConvergesToAnExplicitDenial` |
 
 ## Limitações conhecidas deste Passo (não fabricadas, documentadas explicitamente)
 
@@ -28,9 +31,13 @@ para o runbook operacional completo.
   ordens de grandeza menor que o alvo documentado de 4h; isto prova o MECANISMO (backup/restore nativo,
   medição real, gate fail-closed), não a escala de um banco de produção. Extrapolar para volume de produção
   exigiria um exercício de capacidade dedicado, fora do escopo deste Passo.
-- `RecoveryObjective.ControlPlaneRpo`/`EvidenceLogicalRpo` são exercitáveis pelo MESMO modelo
-  (`RecoveryReadinessRecord`), mas este Passo não fabricou um cenário sintético de "perda de evidência" só
-  para preencher a métrica — nenhum teste afirma medir RPO real além do que o restore drill (RTO) já prova
-  diretamente; um exercício de RPO dedicado (ex.: gap entre dois checkpoints de evidência) fica para um
-  incremento futuro quando houver um caminho real de evidência contínua a medir.
+- **RPO (AB-I7-007 item 2 — correção de Blocker 2):** `RecoveryObjective.ControlPlaneRpo`/`EvidenceLogicalRpo`
+  NUNCA resultam em `Pass` nesta baseline — bloqueio estrutural em `RecoveryReadinessRecord.Pass`, mesmo
+  padrão de `HaFailover`. A versão anterior deste Passo (AB-I7-005) media `ControlPlaneRpo` como "duração
+  real entre exercícios de rebuild/evidência consecutivos" — essa NÃO é a definição de RPO (a janela de
+  perda de dados entre o último estado confirmado antes de uma falha real e o último estado recuperável
+  depois dela) e foi removida (`recovery-runbook-i7.md` §7.5). Nenhum drill que provoque um failure-boundary
+  real existe hoje; ambos os objetivos de RPO permanecem explicitamente `NotMeasured`/`Blocked` até um
+  incremento futuro introduzir esse drill dedicado — provado estruturalmente por
+  `RecoveryReadinessRecordTests.RpoObjectivesCanNeverResultInPassUntilAFailureBoundaryDrillExists`.
 - HA permanece, e deve permanecer, `Blocked` — este Passo não introduz nenhum mecanismo de failover.

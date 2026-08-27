@@ -20,7 +20,11 @@ namespace ArchiveBridge.Domain.Recovery;
 /// <see cref="RecoveryObjectiveMeasurement"/> REAL e, quando há um alvo objetivo documentado
 /// (<see cref="RecoveryObjective"/> != <see cref="RecoveryObjective.None"/>), que a duração medida não o
 /// exceda — nunca é possível declarar sucesso por configuração/alegação sem execução (invariante do work
-/// order: "Unknown/NotMeasured nunca vira Ready/Pass").
+/// order: "Unknown/NotMeasured nunca vira Ready/Pass"). <see cref="RecoveryObjective.ControlPlaneRpo"/> e
+/// <see cref="RecoveryObjective.EvidenceLogicalRpo"/> nunca resultam em <see cref="RecoveryReadinessStatus.Pass"/>
+/// nesta baseline (AB-I7-007 item 2) — RPO exige um drill de failure-boundary real (falha provocada +
+/// confronto entre o último estado confirmado antes dela e o último recuperável depois), que ainda não
+/// existe; permanecem explicitamente <see cref="RecoveryReadinessStatus.Blocked"/>/<see cref="RecoveryReadinessStatus.NotMeasured"/>.
 /// </para>
 /// <para>
 /// A persistência é fronteira NÃO CONFIÁVEL: <see cref="Rehydrate"/> recomputa <see cref="RecordHash"/> a
@@ -184,6 +188,24 @@ public sealed record RecoveryReadinessRecord
             throw new RecoveryReadinessObjectiveNotMetException(
                 "HaFailover não pode resultar em Pass nesta baseline — nenhum mecanismo de failover aprovado " +
                 "existe hoje; o desfecho permanece explicitamente Blocked (item 9/10 e STOP-THE-LINE do work order).");
+        }
+
+        if (objective is RecoveryObjective.ControlPlaneRpo or RecoveryObjective.EvidenceLogicalRpo)
+        {
+            // AB-I7-007 item 2 (Blocker 2 da revisão independente): RPO é a janela de perda de dados entre
+            // o último estado CONFIRMADO antes de uma falha real e o último estado RECUPERÁVEL depois dela
+            // — nunca a duração entre dois exercícios consecutivos (o Passo anterior, AB-I7-005, media
+            // exatamente essa métrica errada para ControlPlaneRpo). Nenhum drill que provoque um
+            // failure-boundary real e meça objetivamente essa janela existe hoje nesta baseline, para
+            // NENHUM dos dois objetivos de RPO — então nenhum código pode construir um Pass para eles
+            // (bloqueio estrutural, mesmo padrão de HaFailover acima): o desfecho permanece explicitamente
+            // Blocked/NotMeasured até um incremento futuro introduzir esse drill dedicado.
+            throw new RecoveryReadinessObjectiveNotMetException(
+                "RPO (ControlPlaneRpo/EvidenceLogicalRpo) não pode resultar em Pass nesta baseline — nenhum drill " +
+                "de failure-boundary real (falha provocada + confronto entre o último estado confirmado antes dela " +
+                "e o último estado recuperável depois) existe hoje; medir a duração entre exercícios consecutivos " +
+                "NÃO é RPO. O desfecho permanece explicitamente Blocked/NotMeasured até um incremento futuro " +
+                "introduzir esse drill dedicado (AB-I7-007 item 2).");
         }
 
         if (objectiveThreshold is { } threshold && measurement.Elapsed > threshold)

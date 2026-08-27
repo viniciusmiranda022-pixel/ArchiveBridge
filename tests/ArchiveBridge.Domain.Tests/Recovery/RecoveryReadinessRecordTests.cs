@@ -74,6 +74,41 @@ public sealed class RecoveryReadinessRecordTests
                 executedBy: "svc-recovery", executedByRole: "ServiceAccount", Correlation, Now));
     }
 
+    // ---- AB-I7-007 item 2 (Blocker 2): RPO nunca é Pass nesta baseline — medir a duração entre dois
+    // exercícios consecutivos NÃO é RPO (a janela de perda de dados entre o último estado confirmado antes
+    // de uma falha real e o último estado recuperável depois dela). Sem um drill de failure-boundary
+    // dedicado, o desfecho permanece explicitamente Blocked/NotMeasured — nenhum caminho de código pode
+    // promover ControlPlaneRpo/EvidenceLogicalRpo a Pass com a métrica errada. ----
+
+    [Theory]
+    [InlineData(RecoveryObjective.ControlPlaneRpo)]
+    [InlineData(RecoveryObjective.EvidenceLogicalRpo)]
+    public void RpoObjectivesCanNeverResultInPassUntilAFailureBoundaryDrillExists(RecoveryObjective rpoObjective)
+    {
+        var measurement = new RecoveryObjectiveMeasurement(Now, Now + TimeSpan.FromMinutes(1));
+
+        Assert.Throws<RecoveryReadinessObjectiveNotMetException>(() =>
+            RecoveryReadinessRecord.Pass(
+                Tenant, Project, RecoveryExerciseType.PendingWorkRebuild, exerciseVersion: 1, rpoObjective,
+                objectiveThreshold: null, measurement, EvidenceFingerprint, notes: "tentativa indevida de medir RPO pela duração entre exercícios.",
+                executedBy: "svc-recovery", executedByRole: "ServiceAccount", Correlation, Now));
+    }
+
+    [Theory]
+    [InlineData(RecoveryObjective.ControlPlaneRpo)]
+    [InlineData(RecoveryObjective.EvidenceLogicalRpo)]
+    public void RpoObjectivesRemainExplicitlyBlockedWithADocumentedFailureDomainUntilAFailureBoundaryDrillExists(RecoveryObjective rpoObjective)
+    {
+        var record = RecoveryReadinessRecord.Blocked(
+            Tenant, Project, RecoveryExerciseType.PendingWorkRebuild, exerciseVersion: 1, rpoObjective,
+            objectiveThreshold: null, measurement: null, RecoveryReadinessRecord.NoEvidenceFingerprint,
+            failureDomain: "Nenhum drill de failure-boundary real existe hoje para medir RPO objetivamente.",
+            notes: string.Empty, executedBy: "svc-recovery", executedByRole: "ServiceAccount", Correlation, Now);
+
+        Assert.Equal(RecoveryReadinessStatus.Blocked, record.Status);
+        Assert.NotEmpty(record.FailureDomain);
+    }
+
     [Fact]
     public void HaFailoverIsExplicitlyBlockedWithADocumentedFailureDomain()
     {
