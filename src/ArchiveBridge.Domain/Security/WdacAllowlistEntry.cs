@@ -81,7 +81,12 @@ public sealed record WdacAllowlistEntry
             && !string.IsNullOrEmpty(candidate.Publisher)
             && !string.IsNullOrEmpty(candidate.Path)
             && string.Equals(Publisher, candidate.Publisher, StringComparison.OrdinalIgnoreCase)
-            && MatchesPathRuleBoundary(PathRule, candidate.Path);
+            // AB-I7-011: o candidato é entrada NÃO CONFIÁVEL — precisa ser canonicalizado com a MESMA
+            // rotina Windows-aware usada para a path rule antes de qualquer comparação. Um candidato que
+            // não canonicaliza de forma inequívoca (relativo, '.'/'..', '/', UNC, ADS/curinga, etc.) é
+            // recusado/Denied — nunca normalizado de forma permissiva.
+            && TryCanonicalizeWindowsPath(candidate.Path, out var canonicalCandidatePath)
+            && MatchesPathRuleBoundary(PathRule, canonicalCandidatePath);
     }
 
     /// <summary>
@@ -92,44 +97,68 @@ public sealed record WdacAllowlistEntry
     /// </summary>
     private static string CanonicalizePathRule(string pathRule)
     {
-        var driveRoot = DriveRootPattern.Match(pathRule);
-        if (!driveRoot.Success)
+        if (!TryCanonicalizeWindowsPath(pathRule, out var canonicalPathRule))
         {
             throw new WdacPolicyInvariantViolationException(
-                "Path rule precisa ser um caminho Windows absoluto no formato 'X:\\...' — caminhos relativos, " +
-                "UNC ou ambíguos são recusados por design (fail-closed).");
+                "Path rule precisa ser um caminho Windows absoluto, específico e sem ambiguidade — sem segmentos " +
+                "relativos ('.'/'..'), sem separadores '/' alternativos, sem UNC, sem caractere reservado " +
+                "(':', '*', '?', '\"', '<', '>', '|') fora do drive designator, e não apontando apenas para a " +
+                "raiz do drive (o que equivaleria a allow-all) — recusada por design (fail-closed).");
         }
 
-        var segments = pathRule[driveRoot.Length..].Split('\\', StringSplitOptions.RemoveEmptyEntries);
+        return canonicalPathRule;
+    }
+
+    /// <summary>
+    /// Tenta canonicalizar um caminho Windows de forma determinística e inequívoca: raiz de drive absoluta
+    /// obrigatória ('X:\...'), nenhum segmento relativo ('.'/'..'), nenhum separador alternativo ('/'),
+    /// nenhum caractere reservado/ambíguo ('*', '?', '"', '&lt;', '&gt;', '|', ':' — este último cobre também
+    /// alternate-data-stream markers) e não apenas a raiz do drive. Retorna falso — sem lançar — para
+    /// qualquer forma que não permita provar boundary de contenção com segurança; usada tanto para validar a
+    /// <see cref="PathRule"/> declarada (fail-closed na criação, AB-I7-010) quanto para o
+    /// <see cref="WdacCandidateBinary.Path"/> apresentado a validação (fail-closed em Denied, AB-I7-011) —
+    /// a MESMA rotina para ambos, para que nenhum dos dois lados possa escapar do boundary por uma forma que
+    /// o outro lado recusaria.
+    /// </summary>
+    private static bool TryCanonicalizeWindowsPath(string path, out string canonicalPath)
+    {
+        canonicalPath = string.Empty;
+
+        var driveRoot = DriveRootPattern.Match(path);
+        if (!driveRoot.Success)
+        {
+            return false;
+        }
+
+        var segments = path[driveRoot.Length..].Split('\\', StringSplitOptions.RemoveEmptyEntries);
         if (segments.Length == 0)
         {
-            throw new WdacPolicyInvariantViolationException(
-                "Uma path rule apontando apenas para a raiz do drive equivaleria a allow-all — recusada por design (fail-closed).");
+            // Apontar apenas para a raiz do drive (ou apenas separadores redundantes) não prova nenhum
+            // boundary de contenção específico — equivaleria a allow-all para uma path rule, e não pode ser
+            // resolvido com segurança para um candidato.
+            return false;
         }
 
         foreach (var segment in segments)
         {
             if (segment is "." or ".." || segment.IndexOfAny(InvalidPathSegmentChars) >= 0)
             {
-                throw new WdacPolicyInvariantViolationException(
-                    "Path rule contém um segmento relativo ('.'/'..') ou com caractere reservado/ambíguo " +
-                    "('/', ':', '*', '?', '\"', '<', '>', '|') — recusada por design (fail-closed).");
+                return false;
             }
         }
 
-        return pathRule[..2] + '\\' + string.Join('\\', segments);
+        canonicalPath = path[..2] + '\\' + string.Join('\\', segments);
+        return true;
     }
 
     /// <summary>
-    /// Verdadeiro quando <paramref name="candidatePath"/> é EXATAMENTE <paramref name="pathRule"/>, ou um
-    /// descendente real dele (separador de path real na fronteira) — nunca um mero prefixo lexical (ex.:
-    /// a regra 'C:\Worker' NUNCA corresponde a 'C:\WorkerEvil\payload.exe'). Não segue symlink/reparse
-    /// point semantics (modelo em memória) — apenas evita uma falsa garantia de contenção.
+    /// Verdadeiro quando <paramref name="canonicalCandidatePath"/> é EXATAMENTE <paramref name="pathRule"/>,
+    /// ou um descendente real dele (separador de path real na fronteira) — nunca um mero prefixo lexical
+    /// (ex.: a regra 'C:\Worker' NUNCA corresponde a 'C:\WorkerEvil\payload.exe'). Ambos os lados já chegam
+    /// aqui canonicalizados por <see cref="TryCanonicalizeWindowsPath"/>. Não segue symlink/reparse point
+    /// semantics (modelo em memória) — apenas evita uma falsa garantia de contenção.
     /// </summary>
-    private static bool MatchesPathRuleBoundary(string pathRule, string candidatePath)
-    {
-        var trimmedCandidate = candidatePath.TrimEnd('\\', '/');
-        return string.Equals(trimmedCandidate, pathRule, StringComparison.OrdinalIgnoreCase)
-            || trimmedCandidate.StartsWith(pathRule + '\\', StringComparison.OrdinalIgnoreCase);
-    }
+    private static bool MatchesPathRuleBoundary(string pathRule, string canonicalCandidatePath) =>
+        string.Equals(canonicalCandidatePath, pathRule, StringComparison.OrdinalIgnoreCase)
+            || canonicalCandidatePath.StartsWith(pathRule + '\\', StringComparison.OrdinalIgnoreCase);
 }

@@ -113,6 +113,59 @@ public sealed class WdacPolicyEvidenceTests
     }
 
     [Fact]
+    public void ValidateAllowsALegitimateNestedDescendantOfTheScopedPathRule()
+    {
+        var entries = new[] { WdacAllowlistEntry.Create("CN=Contoso", sha256: null, @"C:\Program Files\ArchiveBridge\Worker") };
+        var policy = WdacPolicyEvidence.Record(Tenant, Project, policyVersion: 1, entries, "svc-security", "ServiceAccount", Correlation, Now);
+
+        var nestedOutcome = policy.Validate(
+            new WdacCandidateBinary("CN=Contoso", Sha256: null, @"C:\Program Files\ArchiveBridge\Worker\sub\payload.exe"));
+
+        Assert.Equal(WdacValidationOutcome.Allowed, nestedOutcome);
+    }
+
+    /// <summary>
+    /// AB-I7-011 — o candidato apresentado a <see cref="WdacPolicyEvidence.Validate"/> é entrada NÃO
+    /// CONFIÁVEL: uma path rule aparentemente escopada (ex.: 'C:\Worker') NUNCA pode ser escapada por um
+    /// candidato com segmentos relativos ('.'/'..'), separadores alternativos, UNC, ADS/curinga ou forma
+    /// relativa — <see cref="WdacAllowlistEntry.Matches"/> precisa canonicalizar o <c>candidate.Path</c>
+    /// com a MESMA rotina Windows-aware usada para a path rule antes de comparar, e recusar/Denied (nunca
+    /// normalizar de forma permissiva) qualquer forma que não canonicalize sem ambiguidade.
+    /// </summary>
+    [Theory]
+    [InlineData(@"C:\Program Files\ArchiveBridge\Worker\..\WorkerEvil\payload.exe", "dot-dot segment escapes the scoped root")]
+    [InlineData(@"C:\Program Files\ArchiveBridge\Worker\.\payload.exe", "dot segment")]
+    [InlineData(@"ArchiveBridge\Worker\payload.exe", "relative path (no drive root)")]
+    [InlineData(@"\\fileserver01\share\Worker\payload.exe", "UNC path")]
+    [InlineData(@"C:\Program Files/ArchiveBridge/Worker/payload.exe", "forward slash separators")]
+    [InlineData(@"C:\Program Files\ArchiveBridge\Worker\mixed/payload.exe", "mixed separators")]
+    [InlineData(@"C:\Program Files\ArchiveBridge\Worker\payload.exe:hidden", "ADS/colon marker")]
+    public void ValidateDeniesACandidatePathThatCannotBeCanonicalizedUnambiguously(string candidatePath, string reason)
+    {
+        var entries = new[] { WdacAllowlistEntry.Create("CN=Contoso", sha256: null, @"C:\Program Files\ArchiveBridge\Worker") };
+        var policy = WdacPolicyEvidence.Record(Tenant, Project, policyVersion: 1, entries, "svc-security", "ServiceAccount", Correlation, Now);
+
+        var outcome = policy.Validate(new WdacCandidateBinary("CN=Contoso", Sha256: null, candidatePath));
+
+        Assert.True(WdacValidationOutcome.Denied == outcome, $"Expected Denied for {reason}: '{candidatePath}'.");
+    }
+
+    /// <summary>AB-I7-011 — matching por hash exato permanece inalterado, independentemente do <c>Path</c> do candidato (mesmo malformado/ambíguo).</summary>
+    [Fact]
+    public void ValidateByHashRemainsUnaffectedByAnUnrelatedOrMalformedCandidatePath()
+    {
+        var entries = new[] { WdacAllowlistEntry.Create(publisher: null, WorkerHash, pathRule: null) };
+        var policy = WdacPolicyEvidence.Record(Tenant, Project, policyVersion: 1, entries, "svc-security", "ServiceAccount", Correlation, Now);
+
+        var allowedWithNullPath = policy.Validate(new WdacCandidateBinary(Publisher: null, WorkerHash, Path: null));
+        var allowedWithMalformedPath = policy.Validate(
+            new WdacCandidateBinary(Publisher: null, WorkerHash, @"C:\Worker\..\WorkerEvil\payload.exe"));
+
+        Assert.Equal(WdacValidationOutcome.Allowed, allowedWithNullPath);
+        Assert.Equal(WdacValidationOutcome.Allowed, allowedWithMalformedPath);
+    }
+
+    [Fact]
     public void ValidateMatchesThePathRuleCaseInsensitively()
     {
         var entries = new[] { WdacAllowlistEntry.Create("CN=Contoso", sha256: null, @"C:\Program Files\ArchiveBridge\Worker") };
