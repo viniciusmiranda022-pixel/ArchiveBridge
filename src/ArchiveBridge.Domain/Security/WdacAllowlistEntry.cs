@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Text.RegularExpressions;
 using ArchiveBridge.Domain.Common;
 
 namespace ArchiveBridge.Domain.Security;
@@ -12,6 +14,12 @@ public sealed record WdacAllowlistEntry
 {
     private const int PublisherMaxLength = 300;
     private const int PathRuleMaxLength = 500;
+
+    /// <summary>Raiz de um caminho Windows absoluto ('X:\'); qualquer outra forma (relativa, UNC, curinga) é ambígua e recusada.</summary>
+    private static readonly Regex DriveRootPattern = new(@"^[A-Za-z]:\\", RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    private static readonly SearchValues<char> InvalidPathSegmentChars =
+        SearchValues.Create(['*', '?', '"', '<', '>', '|', ':', '/']);
 
     private WdacAllowlistEntry(string? publisher, Sha256Hash? sha256, string? pathRule)
     {
@@ -33,23 +41,19 @@ public sealed record WdacAllowlistEntry
     /// Cria uma entrada válida da allowlist.
     /// </summary>
     /// <exception cref="WdacPolicyInvariantViolationException">
-    /// Nem hash nem (publisher + path rule específica) foram informados, ou a path rule informada
-    /// equivaleria a allow-all (vazia, ou composta somente por curingas/separadores).
+    /// Nem hash nem (publisher + path rule específica) foram informados, ou a path rule informada não é
+    /// um caminho Windows absoluto específico (vazia, curinga, relativa, ambígua, ou equivalente à raiz
+    /// do drive — o que equivaleria a allow-all).
     /// </exception>
     public static WdacAllowlistEntry Create(string? publisher, Sha256Hash? sha256, string? pathRule)
     {
         var sanitizedPublisher = string.IsNullOrWhiteSpace(publisher)
             ? null
             : TextValue.Require(publisher, nameof(publisher), PublisherMaxLength);
-        var sanitizedPathRule = string.IsNullOrWhiteSpace(pathRule)
+        var rawPathRule = string.IsNullOrWhiteSpace(pathRule)
             ? null
             : TextValue.Require(pathRule, nameof(pathRule), PathRuleMaxLength);
-
-        if (sanitizedPathRule is not null && sanitizedPathRule.All(static c => c is '*' or '?' or '\\' or '/'))
-        {
-            throw new WdacPolicyInvariantViolationException(
-                "Uma path rule composta somente por curingas/separadores equivaleria a allow-all — recusada por design (fail-closed).");
-        }
+        var sanitizedPathRule = rawPathRule is null ? null : CanonicalizePathRule(rawPathRule);
 
         var hasHash = sha256 is { Value.Length: > 0 };
         var hasScopedPath = sanitizedPublisher is not null && sanitizedPathRule is not null;
@@ -77,6 +81,55 @@ public sealed record WdacAllowlistEntry
             && !string.IsNullOrEmpty(candidate.Publisher)
             && !string.IsNullOrEmpty(candidate.Path)
             && string.Equals(Publisher, candidate.Publisher, StringComparison.OrdinalIgnoreCase)
-            && candidate.Path.StartsWith(PathRule, StringComparison.OrdinalIgnoreCase);
+            && MatchesPathRuleBoundary(PathRule, candidate.Path);
+    }
+
+    /// <summary>
+    /// Canonicaliza uma path rule Windows: exige raiz de drive absoluta ('X:\...'), rejeita separadores
+    /// '/' (ambíguos), segmentos relativos ('.'/'..') ou caracteres reservados, e remove separador(es)
+    /// finais — para que o matching por boundary (<see cref="MatchesPathRuleBoundary"/>) nunca degenere
+    /// em um mero prefixo lexical (ex.: 'Worker' aceitando 'WorkerEvil').
+    /// </summary>
+    private static string CanonicalizePathRule(string pathRule)
+    {
+        var driveRoot = DriveRootPattern.Match(pathRule);
+        if (!driveRoot.Success)
+        {
+            throw new WdacPolicyInvariantViolationException(
+                "Path rule precisa ser um caminho Windows absoluto no formato 'X:\\...' — caminhos relativos, " +
+                "UNC ou ambíguos são recusados por design (fail-closed).");
+        }
+
+        var segments = pathRule[driveRoot.Length..].Split('\\', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length == 0)
+        {
+            throw new WdacPolicyInvariantViolationException(
+                "Uma path rule apontando apenas para a raiz do drive equivaleria a allow-all — recusada por design (fail-closed).");
+        }
+
+        foreach (var segment in segments)
+        {
+            if (segment is "." or ".." || segment.IndexOfAny(InvalidPathSegmentChars) >= 0)
+            {
+                throw new WdacPolicyInvariantViolationException(
+                    "Path rule contém um segmento relativo ('.'/'..') ou com caractere reservado/ambíguo " +
+                    "('/', ':', '*', '?', '\"', '<', '>', '|') — recusada por design (fail-closed).");
+            }
+        }
+
+        return pathRule[..2] + '\\' + string.Join('\\', segments);
+    }
+
+    /// <summary>
+    /// Verdadeiro quando <paramref name="candidatePath"/> é EXATAMENTE <paramref name="pathRule"/>, ou um
+    /// descendente real dele (separador de path real na fronteira) — nunca um mero prefixo lexical (ex.:
+    /// a regra 'C:\Worker' NUNCA corresponde a 'C:\WorkerEvil\payload.exe'). Não segue symlink/reparse
+    /// point semantics (modelo em memória) — apenas evita uma falsa garantia de contenção.
+    /// </summary>
+    private static bool MatchesPathRuleBoundary(string pathRule, string candidatePath)
+    {
+        var trimmedCandidate = candidatePath.TrimEnd('\\', '/');
+        return string.Equals(trimmedCandidate, pathRule, StringComparison.OrdinalIgnoreCase)
+            || trimmedCandidate.StartsWith(pathRule + '\\', StringComparison.OrdinalIgnoreCase);
     }
 }

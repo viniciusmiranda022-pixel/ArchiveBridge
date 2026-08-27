@@ -95,7 +95,8 @@ public static partial class SecretRedactor
             || BearerTokenPattern().IsMatch(text)
             || UncPathPattern().IsMatch(text)
             || EmailAddressPattern().IsMatch(text)
-            || SensitiveLabeledLinePattern().IsMatch(text);
+            || SensitiveLabeledLinePattern().IsMatch(text)
+            || QueryStringPattern().IsMatch(text);
     }
 
     private static string RedactEmail(string emailAddress, string tenantScopeId)

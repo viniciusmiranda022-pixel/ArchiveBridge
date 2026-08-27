@@ -71,6 +71,72 @@ public sealed class WdacPolicyEvidenceTests
         Assert.Equal(WdacValidationOutcome.Denied, outsideScope);
     }
 
+    /// <summary>
+    /// AB-I7-010 item 2 — <see cref="WdacAllowlistEntry.Matches"/> não pode degenerar em um mero prefixo
+    /// lexical: a path rule 'C:\...\Worker' NUNCA pode corresponder a um caminho irmão como
+    /// 'C:\...\WorkerEvil\...' apenas porque a string 'Worker' é um prefixo textual de 'WorkerEvil'.
+    /// </summary>
+    [Fact]
+    public void ValidateDeniesASiblingDirectoryThatOnlySharesATextualPrefixWithThePathRule()
+    {
+        var entries = new[] { WdacAllowlistEntry.Create("CN=Contoso", sha256: null, @"C:\Program Files\ArchiveBridge\Worker") };
+        var policy = WdacPolicyEvidence.Record(Tenant, Project, policyVersion: 1, entries, "svc-security", "ServiceAccount", Correlation, Now);
+
+        var siblingOutcome = policy.Validate(
+            new WdacCandidateBinary("CN=Contoso", Sha256: null, @"C:\Program Files\ArchiveBridge\WorkerEvil\payload.exe"));
+
+        Assert.Equal(WdacValidationOutcome.Denied, siblingOutcome);
+    }
+
+    [Fact]
+    public void ValidateAllowsALegitimateDescendantOfTheScopedPathRule()
+    {
+        var entries = new[] { WdacAllowlistEntry.Create("CN=Contoso", sha256: null, @"C:\Program Files\ArchiveBridge\Worker") };
+        var policy = WdacPolicyEvidence.Record(Tenant, Project, policyVersion: 1, entries, "svc-security", "ServiceAccount", Correlation, Now);
+
+        var descendantOutcome = policy.Validate(
+            new WdacCandidateBinary("CN=Contoso", Sha256: null, @"C:\Program Files\ArchiveBridge\Worker\archivebridge-worker.exe"));
+
+        Assert.Equal(WdacValidationOutcome.Allowed, descendantOutcome);
+    }
+
+    [Fact]
+    public void ValidateAllowsAnExactPathMatchOfTheScopedPathRule()
+    {
+        var entries = new[] { WdacAllowlistEntry.Create("CN=Contoso", sha256: null, @"C:\Program Files\ArchiveBridge\Worker\worker.exe") };
+        var policy = WdacPolicyEvidence.Record(Tenant, Project, policyVersion: 1, entries, "svc-security", "ServiceAccount", Correlation, Now);
+
+        var exactOutcome = policy.Validate(
+            new WdacCandidateBinary("CN=Contoso", Sha256: null, @"C:\Program Files\ArchiveBridge\Worker\worker.exe"));
+
+        Assert.Equal(WdacValidationOutcome.Allowed, exactOutcome);
+    }
+
+    [Fact]
+    public void ValidateMatchesThePathRuleCaseInsensitively()
+    {
+        var entries = new[] { WdacAllowlistEntry.Create("CN=Contoso", sha256: null, @"C:\Program Files\ArchiveBridge\Worker") };
+        var policy = WdacPolicyEvidence.Record(Tenant, Project, policyVersion: 1, entries, "svc-security", "ServiceAccount", Correlation, Now);
+
+        var caseInsensitiveOutcome = policy.Validate(
+            new WdacCandidateBinary("CN=Contoso", Sha256: null, @"c:\program files\archivebridge\worker\WORKER.EXE"));
+
+        Assert.Equal(WdacValidationOutcome.Allowed, caseInsensitiveOutcome);
+    }
+
+    [Theory]
+    [InlineData(@"ArchiveBridge\Worker")]
+    [InlineData(@"C:\Program Files\..\Worker")]
+    [InlineData(@"C:\Program Files\.\Worker")]
+    [InlineData("C:\\")]
+    [InlineData(@"\\fileserver01\share\Worker")]
+    [InlineData(@"C:\Program Files/ArchiveBridge/Worker")]
+    public void AnAmbiguousOrRelativePathRuleIsRejectedFailClosed(string pathRule)
+    {
+        Assert.Throws<WdacPolicyInvariantViolationException>(() =>
+            WdacAllowlistEntry.Create("CN=Contoso", sha256: null, pathRule));
+    }
+
     [Fact]
     public void RehydrateOfEntriesTamperedOutFromUnderThePolicyDigestIsRejectedFailClosed()
     {

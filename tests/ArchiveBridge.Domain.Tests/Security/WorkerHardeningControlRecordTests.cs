@@ -68,13 +68,16 @@ public sealed class WorkerHardeningControlRecordTests
                 executedByRole: "ServiceAccount", Correlation, Now));
     }
 
-    [Fact]
-    public void NotesOrBlockedReasonWithAnAppearanceOfASecretIsRejectedFailClosed()
+    [Theory]
+    [InlineData("Authorization: Bearer canary-secret-token")]
+    [InlineData("Blocked pending review: https://contoso.example.com/ticket?token=canaryOpaqueValue")]
+    [InlineData("Blocked pending review: https://contoso.example.com/ticket?code=canaryCodeValue")]
+    public void NotesOrBlockedReasonWithAnAppearanceOfASecretIsRejectedFailClosed(string unsafeBlockedReason)
     {
         Assert.Throws<WorkerHardeningInvariantViolationException>(() =>
             WorkerHardeningControlRecord.Blocked(
                 Tenant, Project, WorkerHardeningControl.OutboundRestricted, controlVersion: 1, measurement: null,
-                EvidenceFingerprint, blockedReason: "Authorization: Bearer canary-secret-token", notes: string.Empty,
+                EvidenceFingerprint, blockedReason: unsafeBlockedReason, notes: string.Empty,
                 executedBy: "svc-security", executedByRole: "ServiceAccount", Correlation, Now));
     }
 

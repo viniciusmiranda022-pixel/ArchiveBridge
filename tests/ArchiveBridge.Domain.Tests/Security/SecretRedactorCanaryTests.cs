@@ -89,4 +89,28 @@ public sealed class SecretRedactorCanaryTests
         Assert.False(SecretRedactor.ContainsSuspectedSecret(sample));
         Assert.Equal(sample, SecretRedactor.Redact(sample, TenantScopeId));
     }
+
+    /// <summary>
+    /// AB-I7-010 item 1 — a guarda de aceitação (<see cref="SecretRedactor.ContainsSuspectedSecret"/>)
+    /// precisa recusar QUALQUER query string, não apenas os nomes de parâmetro conhecidos (<c>sig</c>,
+    /// <c>accountkey</c>, <c>sharedaccesssignature</c>) já cobertos por <c>SasTokenPattern</c> — o mesmo
+    /// boundary que <see cref="SecretRedactor.Redact"/> já aplica a QUALQUER query string.
+    /// </summary>
+    [Theory]
+    [InlineData("https://contoso.example.com/mailbox/export?token=opaque-canary-value-123")]
+    [InlineData("https://contoso.example.com/mailbox/export?code=CANARYCODE987654")]
+    [InlineData("https://contoso.example.com/mailbox/export?apiKey=arbitraryParamNameNotOnAnyKnownList")]
+    [InlineData("GET /internal/status?debug=1 HTTP/1.1")]
+    public void ContainsSuspectedSecretFlagsAnyGenericQueryStringNotOnlyKnownParameterNames(string sample)
+    {
+        Assert.True(SecretRedactor.ContainsSuspectedSecret(sample));
+    }
+
+    [Fact]
+    public void ContainsSuspectedSecretDoesNotFlagAPlainUrlWithNoQueryString()
+    {
+        const string sample = "Evidence link: https://contoso.example.com/docs/runbook-section-34";
+
+        Assert.False(SecretRedactor.ContainsSuspectedSecret(sample));
+    }
 }

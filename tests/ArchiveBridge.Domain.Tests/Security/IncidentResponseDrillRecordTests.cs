@@ -46,6 +46,8 @@ public sealed class IncidentResponseDrillRecordTests
     [InlineData("Cookie: session=canary-cookie-value")]
     [InlineData("user.canary@contoso.com replied to the drill")]
     [InlineData(@"Evidence path: \\fileserver\share\canary.pst")]
+    [InlineData("Evidence link: https://contoso.example.com/report?token=opaque-canary-value")]
+    [InlineData("Evidence link: https://contoso.example.com/report?code=canary-code-value")]
     public void ADispositionWithAnAppearanceOfASecretOrPiiIsRejectedFailClosed(string unsafeDisposition)
     {
         Assert.Throws<IncidentResponseInvariantViolationException>(() =>
