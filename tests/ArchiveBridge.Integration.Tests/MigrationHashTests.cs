@@ -634,6 +634,62 @@ public sealed class MigrationHashTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Migration0041AppliesCleanlyAndPriorHashesRemainStable()
+    {
+        // Re-executar o runner é idempotente E revalida os hashes armazenados: se qualquer migration
+        // 0001–0040 tivesse divergido, isto lançaria. Confirma a 0041 (AB-I7-008): as cinco tabelas novas
+        // de evidência de security hardening, todas append-only, e os DOIS CHECK constraints de defesa em
+        // profundidade que tornam estruturalmente impossível persistir um resultado proibido mesmo por
+        // INSERT direto (privilege spoofing) — CK_whe_mde_never_pass e CK_prb_status_never_pass.
+        var runner = new MigrationRunner(fixture.AdminConnectionString);
+        await runner.ApplyAsync(CancellationToken.None); // não lança
+
+        await using var connection = new SqlConnection(fixture.AdminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var applied = new SqlCommand(
+            "SELECT COUNT(*) FROM dbo.schema_migrations WHERE version = 41;", connection))
+        {
+            Assert.Equal(1, Convert.ToInt32(await applied.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        await using (var tables = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.tables WHERE name IN (
+                'security_worker_hardening_evidence', 'security_wdac_policy_evidence', 'security_build_provenance',
+                'security_incident_response_drills', 'security_pentest_readiness_bundles');
+            """,
+            connection))
+        {
+            Assert.Equal(5, Convert.ToInt32(await tables.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // Defesa em profundidade ao nível do schema: nenhum valor "Pass"/concluído pode ser persistido para
+        // um controle Unsupported ou para o pen-test readiness bundle, mesmo por INSERT direto adulterado.
+        await using (var checks = new SqlCommand(
+            "SELECT COUNT(*) FROM sys.check_constraints WHERE name IN ('CK_whe_mde_never_pass', 'CK_prb_status_never_pass');",
+            connection))
+        {
+            Assert.Equal(2, Convert.ToInt32(await checks.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+
+        // Append-only: a aplicação recebe apenas SELECT/INSERT nas cinco tabelas novas (nenhum UPDATE/DELETE).
+        await using var grants = new SqlCommand(
+            """
+            SELECT COUNT(*) FROM sys.database_permissions AS p
+            JOIN sys.objects AS o ON o.object_id = p.major_id
+            JOIN sys.database_principals AS r ON r.principal_id = p.grantee_principal_id
+            WHERE r.name = 'ab_app_role'
+              AND o.name IN ('security_worker_hardening_evidence', 'security_wdac_policy_evidence',
+                              'security_build_provenance', 'security_incident_response_drills',
+                              'security_pentest_readiness_bundles')
+              AND p.permission_name NOT IN ('SELECT', 'INSERT');
+            """,
+            connection);
+        Assert.Equal(0, Convert.ToInt32(await grants.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
     public async Task AnAppliedMigrationWithDivergentContentIsBlocked()
     {
         var original = await ReadHashAsync(1);
