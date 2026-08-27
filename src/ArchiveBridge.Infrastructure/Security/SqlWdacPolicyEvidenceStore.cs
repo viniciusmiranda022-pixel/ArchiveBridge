@@ -143,22 +143,35 @@ public sealed class SqlWdacPolicyEvidenceStore(TenantConnectionFactory connectio
 
     private static WdacPolicyEvidence ReadRecord(SqlDataReader reader)
     {
-        var tenant = new ArchiveBridge.Domain.IdentityAndAccess.TenantId(reader.GetGuid(0));
-        var project = new ArchiveBridge.Domain.Projects.ProjectId(reader.GetGuid(1));
-        var policyVersion = reader.GetInt32(2);
-        var entries = DecodeEntries(reader.GetString(3));
-        var policyDigest = new Sha256Hash(reader.GetString(4).TrimEnd());
-        var contentFingerprint = new Sha256Hash(reader.GetString(5).TrimEnd());
-        var issuedBy = reader.GetString(6).TrimEnd();
-        var issuedByRole = reader.GetString(7).TrimEnd();
-        var correlation = new CorrelationId(reader.GetGuid(8));
-        var issuedAtUtc = SqlJobMapping.ReadUtc(reader.GetDateTime(9));
-        var schemaVersion = reader.GetString(10).TrimEnd();
-        var recordHash = new Sha256Hash(reader.GetString(11).TrimEnd());
+        // Persistence is an untrusted boundary: a row whose entries_canonical column was tampered
+        // with directly (bypassing the store) may not even be structurally parseable (e.g. missing
+        // field/entry separators). Any such failure is an integrity violation, never a raw parsing
+        // exception, and never a silent partial read.
+        try
+        {
+            var tenant = new ArchiveBridge.Domain.IdentityAndAccess.TenantId(reader.GetGuid(0));
+            var project = new ArchiveBridge.Domain.Projects.ProjectId(reader.GetGuid(1));
+            var policyVersion = reader.GetInt32(2);
+            var entries = DecodeEntries(reader.GetString(3));
+            var policyDigest = new Sha256Hash(reader.GetString(4).TrimEnd());
+            var contentFingerprint = new Sha256Hash(reader.GetString(5).TrimEnd());
+            var issuedBy = reader.GetString(6).TrimEnd();
+            var issuedByRole = reader.GetString(7).TrimEnd();
+            var correlation = new CorrelationId(reader.GetGuid(8));
+            var issuedAtUtc = SqlJobMapping.ReadUtc(reader.GetDateTime(9));
+            var schemaVersion = reader.GetString(10).TrimEnd();
+            var recordHash = new Sha256Hash(reader.GetString(11).TrimEnd());
 
-        return WdacPolicyEvidence.Rehydrate(
-            tenant, project, policyVersion, entries, policyDigest, issuedBy, issuedByRole, correlation, issuedAtUtc,
-            schemaVersion, contentFingerprint, recordHash);
+            return WdacPolicyEvidence.Rehydrate(
+                tenant, project, policyVersion, entries, policyDigest, issuedBy, issuedByRole, correlation, issuedAtUtc,
+                schemaVersion, contentFingerprint, recordHash);
+        }
+        catch (Exception ex) when (ex is not WdacPolicyIntegrityViolationException)
+        {
+            throw new WdacPolicyIntegrityViolationException(
+                "Falha ao reconstruir WdacPolicyEvidence a partir da linha persistida; conteúdo estruturalmente inválido ou adulterado.",
+                ex);
+        }
     }
 
     private static string EncodeEntries(IReadOnlyList<WdacAllowlistEntry> entries) =>
