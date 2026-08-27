@@ -392,6 +392,40 @@ public sealed class ReconciliationCertificateIntegrationTests(SqlServerFixture f
         Assert.Equal(ReconciliationOutcome.Inconclusive, certificate.Result);
     }
 
+    // ---- AB-I7-007 item 1 (Blocker 1, cenário 2): reconciliation/certificate não terminal — recovery/
+    // rebuild nunca emite Pass indevido, converge SOMENTE a partir da cadeia canônica persistida ----
+
+    [Fact]
+    public async Task RecoveryNeverEmitsATerminalPassCertificateWhileTheEvidenceChainRemainsIncompleteEvenUnderConcurrentRecoveryAttempts()
+    {
+        var (scope, wave, plannedJobName, _) = await SeedIncompleteEvidenceAsync();
+
+        // Antes de qualquer emissão: uma leitura de "recovery" (GetReconciliationCertificateUseCase) não
+        // encontra NENHUM certificate — a cadeia canônica ainda não é terminal; recovery nunca fabrica um
+        // certificate/Pass a partir do nada.
+        var beforeRecovery = await GetUseCase().ExecuteAsync(scope, wave, plannedJobName, CorrelationId.New(), CancellationToken.None);
+        Assert.Null(beforeRecovery);
+
+        // Múltiplas tentativas concorrentes de "recovery" (reemissão, como faria um worker reivindicado
+        // após uma interrupção) sobre a MESMA evidência canônica incompleta: NENHUMA converge para Pass —
+        // todas derivam EXCLUSIVAMENTE da cadeia persistida (avaliação + dispositions vigentes), nunca de
+        // um estado intermediário/otimista, e todas convergem para a MESMA versão (sem duplicata).
+        var tasks = Enumerable.Range(0, 5).Select(_ => IssueUseCase().ExecuteAsync(Command(scope, wave, plannedJobName), CancellationToken.None));
+        var results = await Task.WhenAll(tasks);
+
+        Assert.All(results, certificate => Assert.Equal(ReconciliationOutcome.Inconclusive, certificate.Result));
+        Assert.All(results, certificate => Assert.False(certificate.Completeness.IsComplete));
+        Assert.All(results, certificate => Assert.Equal(1, certificate.CertificateVersion));
+
+        var count = await CountAsync(scope, "SELECT COUNT(*) FROM dbo.purview_reconciliation_certificates WHERE wave_id = @wave;", ("@wave", wave.Value));
+        Assert.Equal(1, count);
+
+        // Uma leitura de recovery subsequente também nunca promove esse resultado a Pass por si só.
+        var afterRecovery = await GetUseCase().ExecuteAsync(scope, wave, plannedJobName, CorrelationId.New(), CancellationToken.None);
+        Assert.NotNull(afterRecovery);
+        Assert.Equal(ReconciliationOutcome.Inconclusive, afterRecovery!.Certificate.Result);
+    }
+
     // ---- 9: staleness/conflito de evidência durante a emissão (nível de store) ----
 
     [Fact]

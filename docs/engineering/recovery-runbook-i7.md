@@ -1,6 +1,6 @@
-<!-- Evidência do work order AB-I7-001 item 10. Documenta recovery para os estados/mecanismos REALMENTE existentes no código hoje — não os estados aspiracionais de ADR-0003 (RECOVERY_REQUIRED/RECONCILING/dead_letter_jobs/external_operations ledger), que permanecem projetados mas NÃO implementados (nenhuma tabela, nenhum caller). Ver nota de rastreabilidade ao final. -->
+<!-- Evidência do work order AB-I7-001 item 10 (§1-6) e do work order AB-I7-005 item 11 (§7, I7 Passo 3). Documenta recovery para os estados/mecanismos REALMENTE existentes no código hoje — não os estados aspiracionais de ADR-0003 (RECOVERY_REQUIRED/RECONCILING/dead_letter_jobs/external_operations ledger), que permanecem projetados mas NÃO implementados (nenhuma tabela, nenhum caller). Ver nota de rastreabilidade ao final. -->
 
-# Recovery runbook — estados reais (I7 Passo 1)
+# Recovery runbook — estados reais (I7 Passo 1 + Passo 3)
 
 **Autoridade:** este documento não substitui nem contradiz nenhum ADR; documenta o comportamento de
 recuperação que o CÓDIGO hoje realmente implementa, para os operadores que precisam agir quando um destes
@@ -116,6 +116,176 @@ visível.
 **Ação humana:** restaurar a associação de papel (`ALTER ROLE ab_app_role ADD MEMBER ab_app;`) via a
 identidade administrativa; nenhuma limpeza adicional é necessária — a MESMA identidade volta a operar
 normalmente assim que a permissão é restaurada (ver `IdentityPermissionRevocationTests`).
+
+## 7. Recovery readiness / DR evidence (I7 Passo 3 — AB-I7-005)
+
+**Autoridade:** `docs/runbook/05-parte-v-seguranca-infra-operacao.md` §40 (SLO/RTO/RPO) e §41 (backup/DR),
+`docs/runbook/06-parte-vi-plano-desenvolvimento.md` I7/§45. Este Passo transforma esses requisitos
+documentados em evidência EXECUTÁVEL — nunca uma declaração de configuração. Ver
+[`dr-readiness-matrix.md`](dr-readiness-matrix.md) para o mapeamento completo critério de aceite → evidência
+executável/teste.
+
+### 7.1 Modelo de evidência
+
+`ArchiveBridge.Domain.Recovery.RecoveryReadinessRecord` (tabela `dbo.recovery_readiness_evidence`,
+migration `0040_i7_recovery_readiness_evidence.sql`) materializa cada exercício de recovery readiness como
+um registro imutável, append-only, tenant/project-scoped e tamper-evident (mesmo padrão de self-hash
+recomputado e revalidado fail-closed em toda leitura de
+`ReconciliationCertificate`/`0038_i6_reconciliation_certificates.sql`). Quatro tipos de exercício
+(`RecoveryExerciseType`): `RestoreDrill`, `PendingWorkRebuild`, `ArtifactEvidenceRecovery`, `HaFailover`.
+
+O desfecho (`RecoveryReadinessStatus`) só tem três valores — `NotMeasured` (default fail-closed: nenhum
+drill aplicável ainda executado), `Blocked` (limitação arquitetural comprovada OU objetivo não atingido por
+um drill real) e `Pass` (o ÚNICO caminho que exige uma `RecoveryObjectiveMeasurement` real — início/fim
+observados de uma execução de fato — e, quando há um alvo objetivo documentado, que a duração medida não o
+exceda). Não existe NENHUM caminho de código que produza `Pass` a partir de configuração/alegação sem
+execução — `RecoveryReadinessRecord.Pass` exige a medição como parâmetro obrigatório (não anulável) e
+recusa (`RecoveryReadinessObjectiveNotMetException`) quando o objetivo não foi atingido.
+
+**HA nunca é `Pass` nesta baseline:** `RecoveryReadinessRecord.Pass` lança
+`RecoveryReadinessObjectiveNotMetException` incondicionalmente quando `ExerciseType == HaFailover` — bloqueio
+estrutural no domínio, reforçado por um `CHECK` no próprio schema
+(`CK_rre_ha_never_pass`, migration 0040) como defesa em profundidade caso qualquer código futuro tente
+inserir a linha diretamente. Todo componente da baseline atual que dependa de proteção de segredo
+single-node (DPAPI, sem KMS/HSM redundante ou failover comprovado) permanece `Blocked`, com o failure domain
+documentado no próprio registro (`FailureDomain`) — nunca por documentação isolada que possa divergir do
+código.
+
+### 7.2 Restore drill
+
+`ArchiveBridge.Integration.Tests.Support.RestoreDrillHarness` (SQL Server real) provisiona um banco de
+teste efêmero PRÓPRIO e DEDICADO (nunca o banco compartilhado da suíte de integração, para não interferir
+com os demais testes; nunca produção/cliente), aplica as migrations reais e executa `BACKUP DATABASE`/
+`RESTORE DATABASE` nativos do SQL Server sobre esse banco, medindo a duração REAL de cada operação
+(evidência de RTO). O drill prova, no mínimo (`RecoveryReadinessIntegrationTests`):
+
+- estado canônico escrito ANTES do backup sobrevive ao restore com identidade/estado íntegros;
+- estado escrito DEPOIS do backup é descartado pelo restore (prova de que o restore realmente reverteu o
+  banco, não é um no-op);
+- a duração medida (backup + restore) é registrada como `RecoveryObjectiveMeasurement` de
+  `RecoveryObjective.ControlPlaneRto` contra o alvo documentado (`<= 4h`) — `Pass` só é possível se a
+  medição real couber no alvo.
+
+**Abort conditions:** falha ao provisionar o banco efêmero (SQL Server real indisponível/env var
+`ARCHIVEBRIDGE_TEST_SQL` ausente) aborta o teste inteiro (fail-closed, sem fallback em memória); falha do
+`RESTORE DATABASE` propaga sem mascarar como sucesso; o `finally` sempre tenta `SET MULTI_USER` mesmo se o
+`RESTORE` falhar, para não deixar o banco efêmero preso em modo single-user (limpeza best-effort, sem
+impacto em produção pois o banco é sempre descartável).
+
+### 7.3 Pending-work rebuild
+
+`ArchiveBridge.Contracts.Jobs.IPendingWorkRebuildQuery`/`SqlPendingWorkRebuildQuery` reconstrói o conjunto
+de trabalho elegível EXCLUSIVAMENTE do estado persistido em `dbo.jobs`, reutilizando o MESMO predicado de
+elegibilidade já usado pelo claim real (`SqlJobStore.ClaimSql`: `state IN (Pending, RetryScheduled) AND
+(next_attempt_at_utc IS NULL OR next_attempt_at_utc <= @asOf)`) em vez de duplicá-lo. É uma leitura pura —
+nenhum lock de escrita, nenhuma mutação, nenhum efeito colateral; a reivindicação real permanece
+exclusivamente `IJobStore.TryClaimNextAsync` (já atômico/fenced/idempotente), então a reconstrução NUNCA
+duplica um efeito por si só (`PendingWorkRebuildIntegrationTests`):
+
+- um Job `Pending`/`RetryScheduled` já devido aparece; um agendado para o futuro não aparece;
+- um Job preso em `Processing` com lease expirado permanece INVISÍVEL à reconstrução até o reaper
+  (`IJobLeaseManager.RecoverExpiredLeasesAsync`) convergê-lo para `RetryScheduled`/`Failed` — a
+  reconstrução nunca ressuscita um lease diretamente;
+- reexecutar a reconstrução é idempotente (mesma leitura, nenhuma mutação) e escopada por tenant/projeto
+  (RLS + filtro explícito, mesmo padrão de `SqlJobStore`);
+- duas reivindicações concorrentes do MESMO trabalho listado convergem para exatamente UM vencedor (a
+  atomicidade já provada de `TryClaimNextAsync` — a reconstrução não introduz uma segunda fonte de
+  concorrência).
+
+### 7.4 Artifact/evidence recovery
+
+Após um restore real, hashes/manifests/certificates continuam verificáveis porque cada tipo já é
+tamper-evident por construção (`ReconciliationCertificate.Rehydrate`,
+`RecoveryReadinessRecord.Rehydrate`): a leitura SEMPRE recomputa o hash a partir dos campos REALMENTE
+carregados e recusa fail-closed qualquer divergência — nunca retorna um artifact/evidence adulterado como
+válido. `RecoveryReadinessIntegrityViolationException` é o desfecho de uma adulteração pós-restore
+detectada sobre o próprio registro de readiness (prova direta, `RecoveryReadinessIntegrationTests`); o
+MESMO mecanismo (self-hash recomputado, `*IntegrityViolationException`) já protege certificates de
+reconciliação e é reexercitado pelo restore drill acima (a integridade do estado canônico geral é a
+pré-condição de qualquer artifact/evidence individual continuar válido).
+
+### 7.5 RTO/RPO — objetivos documentados
+
+| Objetivo | Alvo documentado | `RecoveryObjective` | Como é medido |
+| --- | --- | --- | --- |
+| Control Plane RTO | `<= 4h` | `ControlPlaneRto` | Duração real de backup+restore do drill (§7.2) |
+| Control Plane RPO | `<= 5min` | `ControlPlaneRpo` | **Nenhum drill dedicado nesta baseline** — permanece `NotMeasured`/`Blocked` (ver correção abaixo) |
+| Evidence event (RPO lógico) | `0` (nenhuma perda lógica) | `EvidenceLogicalRpo` | **Nenhum drill dedicado nesta baseline** — permanece `NotMeasured`/`Blocked` (ver correção abaixo) |
+
+Resultados não medidos permanecem `NotMeasured` por default (`RecoveryReadinessRecord.NotMeasured`) — não
+existe nenhum caminho de código que promova `NotMeasured` a `Pass` sem uma execução real.
+
+**Correção AB-I7-007 item 2 (Blocker 2 da revisão independente do AB-I7-005):** a versão anterior deste
+Passo definia `ControlPlaneRpo` como "a duração real entre exercícios de rebuild/evidência consecutivos".
+Essa definição está ERRADA e foi removida: intervalo entre dois drills não é RPO. RPO é a janela de perda de
+dados entre o último estado **confirmado** antes de uma falha real e o último estado **recuperável** depois
+dela — ela só pode ser medida provocando (ou observando) um ponto de falha real e comparando os dois lados
+dessa fronteira, nunca cronometrando quanto tempo passou entre duas execuções bem-sucedidas.
+
+Nenhum drill que provoque esse failure-boundary existe hoje nesta baseline. Consequentemente,
+`RecoveryReadinessRecord.Pass` agora recusa incondicionalmente `RecoveryObjective.ControlPlaneRpo` e
+`RecoveryObjective.EvidenceLogicalRpo` — o MESMO bloqueio estrutural já aplicado a `HaFailover` (§7.6), não
+apenas uma convenção de chamada — então nenhum caminho de código pode promover RPO a `Pass` com a métrica
+errada nem com nenhuma outra. Ambos os objetivos permanecem explicitamente `NotMeasured`/`Blocked` até um
+incremento futuro introduzir um drill dedicado que provoque um ponto de falha real e meça objetivamente:
+
+- **`ControlPlaneRpo`:** o último estado do control plane confirmado durável (ex.: em SQL Server) antes da
+  falha simulada, versus o último estado efetivamente recuperável depois dela.
+- **`EvidenceLogicalRpo`:** só pode ser `Pass` quando um drill desse tipo comprovar que NENHUM evento de
+  evidência lógica foi perdido no failure boundary exercitado — ausência de um drill assim permanece
+  `NotMeasured`/`Blocked`, nunca `Pass` por omissão.
+
+Prova estrutural: `RecoveryReadinessRecordTests.RpoObjectivesCanNeverResultInPassUntilAFailureBoundaryDrillExists`
+(`Pass` lança para ambos os objetivos) e
+`RecoveryReadinessRecordTests.RpoObjectivesRemainExplicitlyBlockedWithADocumentedFailureDomainUntilAFailureBoundaryDrillExists`
+(`Blocked` continua disponível, com failure domain documentado).
+
+### 7.6 HA / failure domain (I7 Passo 3)
+
+A baseline aceita permanece single-node/on-premises para o armazenamento de segredo da aplicação (DPAPI,
+sem HSM/KMS redundante nem failover automático comprovado). Failure domain documentado:
+
+- **O que é recuperável:** o estado de domínio em SQL Server (via backup/restore nativo, §7.2) e o
+  trabalho pendente (via rebuild determinístico, §7.3) — nenhuma dependência de HA para isso.
+- **O que exige intervenção operacional:** perda do host que detém o segredo protegido por DPAPI exige
+  reprovisionamento manual da identidade/segredo — não há failover automático nesta baseline.
+- **O que continua bloqueando Production Ready:** qualquer alegação de HA para esse componente. Este Passo
+  NÃO introduz Azure Key Vault/HSM nem qualquer outro mecanismo de failover — permanece
+  `RecoveryReadinessStatus.Blocked` explicitamente (STOP-THE-LINE do work order AB-I7-005).
+
+### 7.7 Recovery de estados interrompidos além de pending/retry/lease stale (AB-I7-007 item 1)
+
+O item 8 do work order AB-I7-005 exige exercitar, no mínimo, cinco failure modes de estado interrompido.
+§7.3 já prova pending/retry/lease stale via `SqlPendingWorkRebuildQuery`/reaper (dr-readiness-matrix.md
+critério 6). Os três failure modes restantes exigidos pelo item 8 ganharam evidência executável dedicada
+nesta correção (dr-readiness-matrix.md critérios 11-13):
+
+**Upload com efeito externo já concluído, mas conclusão do Job nunca persistida (crash entre os dois).**
+`PurviewUploadCommandProcessor.DispatchAsync` grava a evidência do transporte (`PurviewUploadAttemptOutcome
+.Uploaded`, via `IPurviewUploadAttemptStore.AppendAsync`) ANTES de `FinalizeJobAsync` chamar
+`IJobStore.CompleteAsync` — um crash exatamente entre essas duas escritas deixa o Job preso em `Processing`
+mesmo com o transporte real já comprovado. A recovery NÃO reexecuta o AzCopy: quando o lease expira, o
+reaper agenda retry, e o novo titular reivindicado consulta `IPurviewUploadAttemptStore.GetLatestAsync`
+ANTES de sequer considerar adquirir um novo SAS — o MESMO réplay idempotente PRECOCE já usado no caminho
+feliz (§ "item 14" de `PurviewUploadCommandProcessor`) converge da evidência existente e completa o Job sem
+produzir um segundo efeito externo. `RecoveryReadinessStatus.Pass`.
+
+**Reconciliation/certificate ainda não terminal (evidência incompleta).** `IssueReconciliationCertificateUseCase`
+e `GetReconciliationCertificateUseCase` derivam o resultado EXCLUSIVAMENTE da cadeia canônica persistida
+(avaliação de reconciliação + dispositions vigentes) — nunca de um estado intermediário/otimista. Uma leitura
+de recovery antes de qualquer emissão não encontra certificate algum (nunca fabrica um `Pass` a partir do
+nada); múltiplas tentativas concorrentes de reemissão sobre evidência incompleta convergem todas para
+`ReconciliationOutcome.Inconclusive`, nunca `Pass`, e para uma única versão (sem duplicata).
+`RecoveryReadinessStatus.Pass` (a PROPRIEDADE de segurança — nunca promover indevidamente — é o que está sendo
+provada e comprovadamente se sustenta).
+
+**Secret/SAS já consumido (uso único).** `SasHandleState.Consumed` é terminal — `AcquireSasForUploadUseCase`
+recusa fail-closed (`PurviewSasAcquisitionDeniedException`) qualquer aquisição sobre um handle `Consumed`
+ANTES de sequer chamar `ISecretStore.AcquireAsync` (o mesmo branch `_ => throw` do ciclo de vida já provado
+por §3). Uma tentativa de recovery pós-interrupção que tente readquirir o SAS para "recuperar" o upload
+NUNCA relê/reconstrói o segredo — o estado permanece `Consumed` (mesma geração, mesmo `ConsumedAtUtc`), e a
+única saída operacional é um novo `Intake` explícito (§3). `RecoveryReadinessStatus.Blocked`, com failure
+domain documentado — este failure mode NUNCA pode ser `Pass` automático.
 
 ---
 
