@@ -323,16 +323,26 @@ public sealed record RecoveryReadinessRecord
         var normalizedExecutedByRole = TextValue.Require(executedByRole, nameof(executedByRole), maxLength: 50);
         var canonicalExecutedAt = TruncateToMilliseconds(executedAtUtc);
 
+        // Mesmo tratamento de canonicalização que executedAtUtc: measurement_started_at_utc/
+        // measurement_completed_at_utc são DATETIME2(3) (precisão de milissegundo), então o início/fim REAIS
+        // do exercício (tipicamente com componente sub-milissegundo) são truncados ANTES de virarem o valor
+        // canônico do registro — nunca depois. Sem isto, o valor gravado no SQL Server (arredondado pelo
+        // driver/engine ao inserir um valor não alinhado) divergiria do valor usado aqui no fingerprint,
+        // disparando RecoveryReadinessIntegrityViolationException falso-positivo em toda leitura real.
+        var canonicalMeasurement = measurement is { } rawMeasurement
+            ? new RecoveryObjectiveMeasurement(TruncateToMilliseconds(rawMeasurement.StartedAtUtc), TruncateToMilliseconds(rawMeasurement.CompletedAtUtc))
+            : (RecoveryObjectiveMeasurement?)null;
+
         var exerciseFingerprint = ComputeExerciseFingerprint(
-            status, objective, objectiveThreshold, measurement, evidenceFingerprint, normalizedFailureDomain, normalizedNotes);
+            status, objective, objectiveThreshold, canonicalMeasurement, evidenceFingerprint, normalizedFailureDomain, normalizedNotes);
 
         var hash = ComputeRecordHash(
-            tenant, project, exerciseType, exerciseVersion, status, objective, objectiveThreshold, measurement,
+            tenant, project, exerciseType, exerciseVersion, status, objective, objectiveThreshold, canonicalMeasurement,
             evidenceFingerprint, normalizedFailureDomain, normalizedNotes, exerciseFingerprint, normalizedExecutedBy,
             normalizedExecutedByRole, correlation, canonicalExecutedAt, CurrentSchemaVersion);
 
         return new RecoveryReadinessRecord(
-            tenant, project, exerciseType, exerciseVersion, status, objective, objectiveThreshold, measurement,
+            tenant, project, exerciseType, exerciseVersion, status, objective, objectiveThreshold, canonicalMeasurement,
             evidenceFingerprint, normalizedFailureDomain, normalizedNotes, normalizedExecutedBy, normalizedExecutedByRole,
             correlation, canonicalExecutedAt, CurrentSchemaVersion, exerciseFingerprint, hash);
     }
@@ -412,8 +422,8 @@ public sealed record RecoveryReadinessRecord
             ((int)status).ToString(CultureInfo.InvariantCulture),
             ((int)objective).ToString(CultureInfo.InvariantCulture),
             objectiveThreshold?.Ticks.ToString(CultureInfo.InvariantCulture) ?? "none",
-            measurement?.StartedAtUtc.UtcTicks.ToString(CultureInfo.InvariantCulture) ?? "none",
-            measurement?.CompletedAtUtc.UtcTicks.ToString(CultureInfo.InvariantCulture) ?? "none",
+            measurement is { } m ? TruncateToMilliseconds(m.StartedAtUtc).UtcTicks.ToString(CultureInfo.InvariantCulture) : "none",
+            measurement is { } m2 ? TruncateToMilliseconds(m2.CompletedAtUtc).UtcTicks.ToString(CultureInfo.InvariantCulture) : "none",
             evidenceFingerprint.Value,
             failureDomain,
             notes,

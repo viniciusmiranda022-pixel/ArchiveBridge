@@ -256,6 +256,16 @@ public sealed partial record ProductionReadinessReviewSnapshot
     /// <see cref="ArchiveBridge.Domain.TargetIngestion.Purview.Reconciliation.ReconciliationCertificate.ComputeEvaluationFingerprint"/>).
     /// NUNCA cobre versão/timestamp/ator (para que uma composição concorrente idêntica convirja para a MESMA versão).
     /// </summary>
+    /// <remarks>
+    /// <paramref name="controlResults"/> é sempre reordenado aqui pela ordem FIXA do catálogo
+    /// (<see cref="ReadinessControlCatalog.AllControls"/>) antes de entrar no fingerprint — nunca confiamos na
+    /// ordem em que o chamador entrega a lista. Em <see cref="Compose"/> ela já chega nessa ordem (garantida
+    /// por <see cref="ProductionReadinessGateEvaluator.Evaluate"/>), mas em <see cref="Rehydrate"/> ela vem de
+    /// uma query SQL (<c>ORDER BY control_id</c>, alfabética — nunca a mesma ordem do catálogo, que é agrupada
+    /// por gate group). Sem esta reordenação explícita, o mesmo conjunto de evidência produziria fingerprints
+    /// DIFERENTES em compose-time vs. rehydrate-time, disparando um falso-positivo de adulteração em toda
+    /// leitura.
+    /// </remarks>
     public static Sha256Hash ComputeReviewFingerprint(
         string buildCommitSha,
         Sha256Hash buildArtifactDigest,
@@ -273,9 +283,12 @@ public sealed partial record ProductionReadinessReviewSnapshot
             capabilityMatrixFingerprint.Value,
         };
 
-        // A ordem já é determinística (ordem do catálogo, preservada pelo avaliador) — nunca reordenada
-        // aqui, para que a MESMA evidência sempre produza o MESMO fingerprint byte-a-byte.
-        foreach (var result in controlResults)
+        // Nunca confiamos na ordem de entrada: reordenamos SEMPRE pela ordem fixa e declarada do catálogo,
+        // para que a MESMA evidência sempre produza o MESMO fingerprint byte-a-byte, não importa se
+        // controlResults veio do avaliador (ordem do catálogo) ou de uma leitura SQL (ordem alfabética).
+        var catalogOrder = CatalogOrderIndex;
+        var orderedResults = controlResults.OrderBy(result => catalogOrder[result.ControlId]);
+        foreach (var result in orderedResults)
         {
             parts.Add(result.ControlId.Value);
             parts.Add(((int)result.Status).ToString(CultureInfo.InvariantCulture));
@@ -286,6 +299,11 @@ public sealed partial record ProductionReadinessReviewSnapshot
 
         return DeterministicHash.Compute(parts);
     }
+
+    private static readonly IReadOnlyDictionary<ReadinessControlId, int> CatalogOrderIndex =
+        ReadinessControlCatalog.AllControls
+            .Select((definition, index) => (definition.Id, index))
+            .ToDictionary(pair => pair.Id, pair => pair.index);
 
     private static Sha256Hash ComputeSnapshotHash(
         TenantId tenant,
