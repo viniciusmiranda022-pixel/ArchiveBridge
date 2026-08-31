@@ -1,3 +1,4 @@
+using System.Data;
 using ArchiveBridge.Application.Canary;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;
@@ -11,6 +12,7 @@ using ArchiveBridge.Infrastructure.ProductionReadiness;
 using ArchiveBridge.Infrastructure.PstProcessing;
 using ArchiveBridge.Infrastructure.Time;
 using ArchiveBridge.Integration.Tests.Support;
+using Microsoft.Data.SqlClient;
 using Xunit;
 
 namespace ArchiveBridge.Integration.Tests;
@@ -145,10 +147,27 @@ public sealed class CanaryReclassifiedScenarioIntegrationTests(SqlServerFixture 
         Assert.Equal(CanaryScenarioStatus.Blocked, result.Status);
     }
 
+    /// <summary>
+    /// Registra a linha REAL de <c>dbo.projects</c> exigida pela FK composta <c>FK_pst_artifacts_project</c>
+    /// (mesmo padrão homologado em outras suítes SQL-real, ex. <c>Slice4aPagedReadTests.SeedProjectAsync</c>),
+    /// para um escopo que nunca passa pelo fluxo de autorização de canário (que a criaria implicitamente via
+    /// <see cref="SqlProductionReadinessReviewStore"/>/<see cref="SqlCanaryPlanStore"/>).
+    /// </summary>
+    private async Task SeedProjectAsync(TenantScope scope)
+    {
+        await using var connection = await fixture.Factory.OpenForTenantAsync(scope, CancellationToken.None);
+        await using var command = new SqlCommand(
+            "INSERT INTO dbo.projects (project_id, tenant_id) VALUES (@project, @tenant);", connection.Connection);
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+        command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+        await command.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
     [Fact]
     public async Task AnotherTenantsInspectionNeverResolvesCorruptionEvenWithTheSameArtifactAndHash()
     {
         var ownerScope = SqlServerFixture.NewScope();
+        await SeedProjectAsync(ownerScope);
         var hash = new Sha256Hash(new string('e', 64));
         var artifact = await SaveInspectionAsync(ownerScope, hash, 4096, PstStructuralDiagnostic.InvalidSignature);
 
