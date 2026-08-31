@@ -25,37 +25,57 @@ public static class CanaryScenarioCatalog
 
     // §48 item 177 — 20 tipos de item e propriedades customizadas. Nenhum store canônico conta diversidade
     // de tipos de item hoje neste repositório — Operator-attested (mesmo princípio de controles Attested sem
-    // store dedicado em ReadinessControlCatalog).
+    // store dedicado em ReadinessControlCatalog). AB-I8-006: a evidência de Pass exige um digest/locator
+    // OPACO a evidência independentemente retida (ex.: hash de um corpus-report exportado), nunca apenas o
+    // texto autoral do próprio operador tratado como prova — reforçado por
+    // SubmitCanaryScenarioEvidenceUseCase, nunca por este catálogo.
     private static readonly CanaryScenarioDefinition CorpusItemTypeDiversity = Define(
         "CANARY.CORPUS_ITEM_TYPE_DIVERSITY", CanaryScenarioEvidenceSource.OperatorAttested,
         "Corpus com 20 tipos de item e propriedades customizadas (§48 item 177).");
 
-    // §48 item 178 — PST pequeno, depois boundary de 18 GB. Nenhum store correlaciona duas inspeções por
-    // faixa de tamanho hoje — Operator-attested.
+    // §48 item 178 — PST pequeno, depois boundary de 18 GB. AB-I8-006: resolvido a partir de DUAS
+    // PstInspectionRecord canônicas já persistidas (Slice 4B/IPstInspectionStore.FindCanonicalAsync) — o
+    // caller informa os DOIS artefatos candidatos (pequeno + boundary); o resolver nunca aceita o veredito
+    // do caller, apenas os ObservedSizeBytes REAIS de cada inspeção canônica. Sem as duas inspeções
+    // canônicas com tamanhos nos dois lados do boundary, permanece Blocked/NotPerformed — nunca Pass por
+    // afirmação do operador.
     private static readonly CanaryScenarioDefinition PstSizeBoundaryCoverage = Define(
-        "CANARY.PST_SIZE_BOUNDARY_COVERAGE", CanaryScenarioEvidenceSource.OperatorAttested,
-        "PST pequeno e PST no boundary de 18 GB (§48 item 178).");
+        "CANARY.PST_SIZE_BOUNDARY_COVERAGE", CanaryScenarioEvidenceSource.SystemDerived,
+        "PST pequeno e PST no boundary de 18 GB (§48 item 178) — resolvido a partir do tamanho observado de " +
+        "duas PstInspectionRecord canônicas (IPstInspectionStore).");
 
-    // §48 item 179 — replay do mesmo PST no mesmo target root. O mecanismo de idempotência já existe no
-    // pipeline real (PurviewUploadRequest/PurviewUploadCommandProcessor) — este cenário observa/atesta o
-    // resultado de uma execução real contra o pipeline, não reimplementa a idempotência.
+    // §48 item 179 — replay do mesmo PST no mesmo target root. AB-I8-006: resolvido a partir da história
+    // REAL de tentativas de upload (IPurviewUploadAttemptStore) do pedido canônico da wave — exige
+    // evidência de que MAIS de uma tentativa foi de fato despachada (retry/réplay real ocorreu, nunca
+    // apenas "nunca reexecutado") e que, apesar disso, existe EXATAMENTE UMA tentativa Uploaded (nenhum
+    // efeito externo duplicado) — nunca aceita o status alegado pelo operador.
     private static readonly CanaryScenarioDefinition ReplaySameTargetRootIdempotent = Define(
-        "CANARY.REPLAY_SAME_TARGET_ROOT_IDEMPOTENT", CanaryScenarioEvidenceSource.OperatorAttested,
-        "Replay do mesmo PST no mesmo target root converge sem duplicar efeito (§48 item 179).");
+        "CANARY.REPLAY_SAME_TARGET_ROOT_IDEMPOTENT", CanaryScenarioEvidenceSource.SystemDerived,
+        "Replay do mesmo PST no mesmo target root converge sem duplicar efeito (§48 item 179) — resolvido a " +
+        "partir da história real de tentativas de upload (IPurviewUploadAttemptStore).");
 
-    // §48 item 180 — target root diferente deve bloquear.
+    // §48 item 180 — target root diferente deve bloquear. AB-I8-006: resolvido exercitando o MESMO guard de
+    // domínio real que protege a produção (MigrationWave.ChangeTargetRootFolder, congelado após aprovação)
+    // contra um root candidato diferente informado pelo caller — nunca persiste a mutação tentada, apenas
+    // observa deterministicamente se InvalidWaveTransitionException é lançada pelo estado REAL da wave.
     private static readonly CanaryScenarioDefinition DifferentTargetRootBlocks = Define(
-        "CANARY.DIFFERENT_TARGET_ROOT_BLOCKS", CanaryScenarioEvidenceSource.OperatorAttested,
-        "Tentativa deliberada com target root diferente é bloqueada (§48 item 180).");
+        "CANARY.DIFFERENT_TARGET_ROOT_BLOCKS", CanaryScenarioEvidenceSource.SystemDerived,
+        "Tentativa deliberada com target root diferente é bloqueada (§48 item 180) — resolvido exercitando o " +
+        "guard real de congelamento de destino da wave (MigrationWave.ChangeTargetRootFolder).");
 
-    // §48 item 181 — corrupção conhecida e quarantine. Nenhum store de "quarantine" dedicado existe hoje
-    // neste repositório (runbook §22.3 ainda não implementado) — Operator-attested, nunca fabricado como
-    // Pass automático (mesmo princípio fail-closed de EvidenceUnavailable em ReadinessControlCatalog).
+    // §48 item 181 — corrupção conhecida e quarantine. AB-I8-006: nenhum store de "quarantine" dedicado
+    // existe hoje neste repositório (runbook §22.3 ainda não implementado) — por isso a evidência Pass
+    // aqui é deliberadamente mais estreita que o texto do runbook: prova que o PST é canonicamente o
+    // artefato esperado (hash bate) E que sua PstInspectionRecord tem StructuralDiagnostic != Valid (a
+    // corrupção foi diagnosticada server-side e o artefato nunca se tornou elegível a transporte), não que
+    // um mecanismo de quarantine operacional foi acionado. Resolvido a partir de
+    // IPstInspectionStore.FindCanonicalAsync — nunca aceita o veredito alegado pelo operador.
     private static readonly CanaryScenarioDefinition KnownCorruptionQuarantine = Define(
-        "CANARY.KNOWN_CORRUPTION_QUARANTINE", CanaryScenarioEvidenceSource.OperatorAttested,
-        "Corrupção conhecida resulta em quarantine, nunca sucesso silencioso (§48 item 181) — nenhum store " +
-        "canônico de quarantine existe hoje neste repositório; resolvido por atestação de operador com " +
-        "referência de evidência (ex.: PstInspectionRecord com StructuralDiagnostic != Valid).");
+        "CANARY.KNOWN_CORRUPTION_QUARANTINE", CanaryScenarioEvidenceSource.SystemDerived,
+        "Corrupção conhecida nunca se torna elegível a transporte (§48 item 181) — resolvido a partir do " +
+        "StructuralDiagnostic de uma PstInspectionRecord canônica (IPstInspectionStore); nenhum mecanismo de " +
+        "quarantine operacional dedicado existe hoje neste repositório (ver comentário de código para o " +
+        "escopo exato desta evidência).");
 
     // §48 item 182 — crash recovery. Fonte canônica real já existente (IRecoveryReadinessStore,
     // RecoveryExerciseType.PendingWorkRebuild, I7).

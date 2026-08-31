@@ -1,14 +1,19 @@
 using System.Globalization;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Contracts.PstProcessing;
 using ArchiveBridge.Contracts.Recovery;
 using ArchiveBridge.Contracts.TargetIngestion.Purview;
 using ArchiveBridge.Contracts.TargetIngestion.Purview.Reconciliation;
+using ArchiveBridge.Contracts.TargetIngestion.Purview.Upload;
+using ArchiveBridge.Contracts.Waves;
 using ArchiveBridge.Domain.Canary;
 using ArchiveBridge.Domain.Common;
+using ArchiveBridge.Domain.PstProcessing;
 using ArchiveBridge.Domain.Reconciliation;
 using ArchiveBridge.Domain.Recovery;
 using ArchiveBridge.Domain.TargetIngestion.Purview;
 using ArchiveBridge.Domain.TargetIngestion.Purview.ServiceResult;
+using ArchiveBridge.Domain.TargetIngestion.Purview.Upload;
 using ArchiveBridge.Domain.Waves;
 
 namespace ArchiveBridge.Application.Canary;
@@ -27,6 +32,18 @@ internal static class CanaryScenarioEvidenceResolvers
     private static readonly CanaryScenarioId CrashRecoveryId = new("CANARY.CRASH_RECOVERY");
     private static readonly CanaryScenarioId ReconciliationEvidencePackageId = new("CANARY.RECONCILIATION_EVIDENCE_PACKAGE");
     private static readonly CanaryScenarioId RestoreRollbackOperationalId = new("CANARY.RESTORE_ROLLBACK_OPERATIONAL");
+    private static readonly CanaryScenarioId ReplaySameTargetRootIdempotentId = new("CANARY.REPLAY_SAME_TARGET_ROOT_IDEMPOTENT");
+    private static readonly CanaryScenarioId DifferentTargetRootBlocksId = new("CANARY.DIFFERENT_TARGET_ROOT_BLOCKS");
+    private static readonly CanaryScenarioId KnownCorruptionQuarantineId = new("CANARY.KNOWN_CORRUPTION_QUARANTINE");
+    private static readonly CanaryScenarioId PstSizeBoundaryCoverageId = new("CANARY.PST_SIZE_BOUNDARY_COVERAGE");
+
+    // AB-I8-006: o runbook §48 item 178 não define um limiar numérico exato para "PST pequeno" / "boundary
+    // de 18 GB" — estes valores são uma interpretação de engenharia EXPLÍCITA e versionada (documentada no
+    // CLAUDE_DONE de AB-I8-006), sujeita a ajuste pelo Engineering Reviewer: "pequeno" é um PST claramente
+    // trivial (&lt; 64 MiB) e "boundary" exige pelo menos 16 GiB observados (dentro de ~2 GiB do limite de
+    // 18 GiB citado no runbook) — NUNCA fabricado a partir de metadado meramente declarado pelo operador.
+    private const long SmallPstMaxBytes = 64L * 1024 * 1024;
+    private const long BoundaryPstMinBytes = 16L * 1024 * 1024 * 1024;
 
     /// <summary>CANARY.TENANT_MAILBOX_CONTROLLED — precheck de mailbox mais recente já registrado neste tenant/projeto; ausente ou não Active nunca é Pass.</summary>
     public static async Task<CanaryScenarioResult> ResolveTenantMailboxControlledAsync(
@@ -100,6 +117,201 @@ internal static class CanaryScenarioEvidenceResolvers
             _ =>
                 CanaryScenarioResult.Create(ReconciliationEvidencePackageId, CanaryScenarioStatus.Fail, evidence, $"RECONCILIATION_{certificate.Result.ToString().ToUpperInvariant()}", certificate.GeneratedAtUtc),
         };
+    }
+
+    /// <summary>
+    /// CANARY.REPLAY_SAME_TARGET_ROOT_IDEMPOTENT (AB-I8-006 reclassificação de OperatorAttested para
+    /// SystemDerived) — resolvido a partir da história REAL de tentativas de upload
+    /// (<see cref="IPurviewUploadAttemptStore"/>) do pedido canônico da wave. Pass exige DUAS provas
+    /// independentes, nunca o status alegado pelo operador: (1) evidência de que o pedido foi de fato
+    /// despachado mais de uma vez (réplay real ocorreu — nunca apenas "nunca reexecutado"); (2) apesar
+    /// disso, EXATAMENTE UMA tentativa terminou <see cref="PurviewUploadAttemptOutcome.Uploaded"/> (nenhum
+    /// efeito externo duplicado — o mesmo invariante que <c>PurviewUploadCommandProcessor</c> aplica no
+    /// réplay idempotente precoce, aqui apenas OBSERVADO, nunca reimplementado).
+    /// </summary>
+    public static async Task<CanaryScenarioResult> ResolveReplaySameTargetRootIdempotentAsync(
+        IPurviewUploadRequestStore requestStore, IPurviewUploadAttemptStore attemptStore, TenantScope scope, WaveId wave,
+        DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var request = await requestStore.FindCanonicalAsync(scope, wave, cancellationToken).ConfigureAwait(false);
+        if (request is null)
+        {
+            return CanaryScenarioResult.Create(
+                ReplaySameTargetRootIdempotentId, CanaryScenarioStatus.NotPerformed, CanaryEvidenceReference.None,
+                "UPLOAD_REQUEST_NOT_YET_CREATED", now);
+        }
+
+        var attempts = await attemptStore.ListAttemptsAsync(scope, request.Id, cancellationToken).ConfigureAwait(false);
+        var uploaded = attempts.Where(attempt => attempt.Outcome == PurviewUploadAttemptOutcome.Uploaded).ToList();
+
+        if (uploaded.Count == 0)
+        {
+            return CanaryScenarioResult.Create(
+                ReplaySameTargetRootIdempotentId, CanaryScenarioStatus.NotPerformed, CanaryEvidenceReference.None,
+                "UPLOAD_NOT_YET_COMPLETED", now);
+        }
+
+        var latestUploaded = uploaded[^1];
+        var evidence = CanaryEvidenceReference.SystemDerived(
+            latestUploaded.IdentityHash,
+            $"purview-upload-attempts:{request.Id.Value:N}:attempt={latestUploaded.AttemptNumber.ToString(CultureInfo.InvariantCulture)}:total={attempts.Count.ToString(CultureInfo.InvariantCulture)}");
+
+        if (uploaded.Count > 1)
+        {
+            // O pedido lógico é 1:1 com a wave PARA SEMPRE e o réplay idempotente precoce do processador
+            // real nunca acrescenta uma segunda linha Uploaded (converge sem reexecutar) — mais de uma
+            // tentativa Uploaded é, portanto, uma divergência estrutural do invariante de exactly-once, nunca
+            // Pass.
+            return CanaryScenarioResult.Create(
+                ReplaySameTargetRootIdempotentId, CanaryScenarioStatus.Fail, evidence,
+                "MULTIPLE_UPLOADED_ATTEMPTS_STRUCTURALLY_UNEXPECTED", latestUploaded.CompletedAtUtc);
+        }
+
+        if (attempts.Count < 2 && latestUploaded.AttemptNumber < 2)
+        {
+            // Uma única tentativa isolada prova apenas "transportado uma vez" — nunca "réplay convergiu sem
+            // duplicar efeito" (nenhuma evidência de que o pedido foi de fato despachado de novo). Fail-closed:
+            // permanece Blocked até que uma tentativa adicional (retry/reclaim real) seja observada.
+            return CanaryScenarioResult.Create(
+                ReplaySameTargetRootIdempotentId, CanaryScenarioStatus.Blocked, evidence, "REPLAY_NOT_YET_OBSERVED", latestUploaded.CompletedAtUtc);
+        }
+
+        return CanaryScenarioResult.Create(
+            ReplaySameTargetRootIdempotentId, CanaryScenarioStatus.Pass, evidence, reasonCode: string.Empty, latestUploaded.CompletedAtUtc);
+    }
+
+    /// <summary>
+    /// CANARY.DIFFERENT_TARGET_ROOT_BLOCKS (AB-I8-006 reclassificação de OperatorAttested para SystemDerived)
+    /// — resolvido exercitando o MESMO guard de domínio que protege produção
+    /// (<see cref="MigrationWave.ChangeTargetRootFolder"/>, congelado após aprovação) contra um root
+    /// candidato DIFERENTE do atual, informado pelo caller. A mutação NUNCA é persistida (a instância
+    /// carregada aqui é sempre descartada) — apenas observa deterministicamente se
+    /// <see cref="InvalidWaveTransitionException"/> é lançada pelo estado REAL da wave, nunca aceita o
+    /// veredito alegado pelo operador.
+    /// </summary>
+    public static async Task<CanaryScenarioResult> ResolveDifferentTargetRootBlocksAsync(
+        IWaveStore waveStore, TenantScope scope, WaveId wave, TargetRootFolder attemptedDifferentRoot, DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var loaded = await waveStore.GetAsync(scope, wave, cancellationToken).ConfigureAwait(false);
+        if (loaded is null)
+        {
+            return CanaryScenarioResult.Create(
+                DifferentTargetRootBlocksId, CanaryScenarioStatus.NotPerformed, CanaryEvidenceReference.None, "WAVE_NOT_FOUND", now);
+        }
+
+        if (string.Equals(loaded.TargetRootFolder.Value, attemptedDifferentRoot.Value, StringComparison.Ordinal))
+        {
+            // O caller precisa informar um root GENUINAMENTE diferente do atual — sem isso não há nada a
+            // provar (o guard nunca é sequer exercitado). Fail-closed: nunca Pass por engano de entrada.
+            return CanaryScenarioResult.Create(
+                DifferentTargetRootBlocksId, CanaryScenarioStatus.Blocked, CanaryEvidenceReference.None, "ATTEMPTED_ROOT_NOT_ACTUALLY_DIFFERENT", now);
+        }
+
+        var evidence = CanaryEvidenceReference.SystemDerived(
+            DeterministicHash.Compute(
+            [
+                "archivebridge.canary.target-root-guard.v1", wave.Value.ToString("N"), loaded.TargetRootFolder.Value,
+                attemptedDifferentRoot.Value, loaded.Status.ToString(),
+            ]),
+            $"wave-target-root-guard:{wave.Value:N}:status={loaded.Status}");
+
+        try
+        {
+            loaded.ChangeTargetRootFolder(attemptedDifferentRoot);
+        }
+        catch (InvalidWaveTransitionException)
+        {
+            // O guard REAL de domínio recusou a mutação antes de qualquer persistência/efeito externo.
+            return CanaryScenarioResult.Create(DifferentTargetRootBlocksId, CanaryScenarioStatus.Pass, evidence, reasonCode: string.Empty, now);
+        }
+
+        // A mutação foi aceita: a seleção/destino desta wave ainda está mutável (pré-aprovação) — o guard de
+        // congelamento ainda não está em vigor, então não é possível provar bloqueio ainda. Fail-closed:
+        // nunca Pass sem a exceção real.
+        return CanaryScenarioResult.Create(DifferentTargetRootBlocksId, CanaryScenarioStatus.Blocked, evidence, "WAVE_SELECTION_STILL_MUTABLE", now);
+    }
+
+    /// <summary>
+    /// CANARY.KNOWN_CORRUPTION_QUARANTINE (AB-I8-006 reclassificação de OperatorAttested para SystemDerived)
+    /// — resolvido a partir de uma <see cref="PstInspectionRecord"/> CANÔNICA já persistida
+    /// (<see cref="IPstInspectionStore.FindCanonicalAsync"/>: hash observado bate com o esperado, então o
+    /// artefato É genuinamente o esperado, apenas estruturalmente inválido). Nenhum store de "quarantine"
+    /// dedicado existe hoje neste repositório — a evidência de Pass é, por isso, deliberadamente mais
+    /// estreita que o texto do runbook: prova que o PST NUNCA se tornou elegível a transporte
+    /// (<see cref="PstStructuralDiagnostic"/> diferente de <see cref="PstStructuralDiagnostic.Valid"/>), não
+    /// que um mecanismo de quarantine operacional foi acionado.
+    /// </summary>
+    public static async Task<CanaryScenarioResult> ResolveKnownCorruptionQuarantineAsync(
+        IPstInspectionStore inspectionStore, TenantScope scope, ArtifactId artifact, Sha256Hash expectedHash, DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var record = await inspectionStore.FindCanonicalAsync(scope, artifact, expectedHash, cancellationToken).ConfigureAwait(false);
+        if (record is null)
+        {
+            return CanaryScenarioResult.Create(
+                KnownCorruptionQuarantineId, CanaryScenarioStatus.NotPerformed, CanaryEvidenceReference.None, "PST_INSPECTION_NOT_PERFORMED", now);
+        }
+
+        var evidence = CanaryEvidenceReference.SystemDerived(
+            DeterministicHash.Compute(
+                ["archivebridge.canary.pst-corruption.v1", record.Id.Value.ToString("N"), record.ExpectedHash.Value, record.Diagnostic?.ToString() ?? "none"]),
+            $"pst-inspection:{record.Id.Value:N}:diagnostic={record.Diagnostic?.ToString() ?? "none"}");
+
+        if (record.Diagnostic is null or PstStructuralDiagnostic.Valid)
+        {
+            // Este artefato canônico não está, de fato, diagnosticado como corrupto — não é possível provar
+            // o cenário de corrupção conhecida com ele. Fail-closed: nunca Pass sem diagnóstico real != Valid.
+            return CanaryScenarioResult.Create(
+                KnownCorruptionQuarantineId, CanaryScenarioStatus.Blocked, evidence, "PST_NOT_DIAGNOSED_CORRUPT", record.CompletedAtUtc);
+        }
+
+        return CanaryScenarioResult.Create(KnownCorruptionQuarantineId, CanaryScenarioStatus.Pass, evidence, reasonCode: string.Empty, record.CompletedAtUtc);
+    }
+
+    /// <summary>
+    /// CANARY.PST_SIZE_BOUNDARY_COVERAGE (AB-I8-006 reclassificação de OperatorAttested para SystemDerived)
+    /// — resolvido a partir do <c>ObservedSizeBytes</c> REAL de DUAS <see cref="PstInspectionRecord"/>
+    /// canônicas já persistidas (o caller informa os dois artefatos candidatos — pequeno e boundary; o
+    /// resolver nunca aceita o veredito do caller, apenas os tamanhos observados). Sem as duas inspeções
+    /// canônicas com tamanhos nos dois lados dos limiares (<see cref="SmallPstMaxBytes"/>/
+    /// <see cref="BoundaryPstMinBytes"/>), permanece Blocked/NotPerformed.
+    /// </summary>
+    public static async Task<CanaryScenarioResult> ResolvePstSizeBoundaryCoverageAsync(
+        IPstInspectionStore inspectionStore, TenantScope scope,
+        ArtifactId smallArtifact, Sha256Hash smallExpectedHash, ArtifactId boundaryArtifact, Sha256Hash boundaryExpectedHash,
+        DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var small = await inspectionStore.FindCanonicalAsync(scope, smallArtifact, smallExpectedHash, cancellationToken).ConfigureAwait(false);
+        var boundary = await inspectionStore.FindCanonicalAsync(scope, boundaryArtifact, boundaryExpectedHash, cancellationToken).ConfigureAwait(false);
+
+        if (small is null || boundary is null)
+        {
+            return CanaryScenarioResult.Create(
+                PstSizeBoundaryCoverageId, CanaryScenarioStatus.NotPerformed, CanaryEvidenceReference.None,
+                small is null ? "SMALL_ARTIFACT_INSPECTION_MISSING" : "BOUNDARY_ARTIFACT_INSPECTION_MISSING", now);
+        }
+
+        var observedAt = small.CompletedAtUtc > boundary.CompletedAtUtc ? small.CompletedAtUtc : boundary.CompletedAtUtc;
+        var evidence = CanaryEvidenceReference.SystemDerived(
+            DeterministicHash.Compute(
+            [
+                "archivebridge.canary.pst-size-boundary.v1", small.Id.Value.ToString("N"), boundary.Id.Value.ToString("N"),
+                (small.ObservedSizeBytes ?? 0).ToString(CultureInfo.InvariantCulture), (boundary.ObservedSizeBytes ?? 0).ToString(CultureInfo.InvariantCulture),
+            ]),
+            $"pst-size-boundary:small={small.Id.Value:N}:boundary={boundary.Id.Value:N}");
+
+        if (small.ObservedSizeBytes is not { } smallSize || smallSize > SmallPstMaxBytes)
+        {
+            return CanaryScenarioResult.Create(PstSizeBoundaryCoverageId, CanaryScenarioStatus.Blocked, evidence, "SMALL_ARTIFACT_NOT_SMALL_ENOUGH", observedAt);
+        }
+
+        if (boundary.ObservedSizeBytes is not { } boundarySize || boundarySize < BoundaryPstMinBytes)
+        {
+            return CanaryScenarioResult.Create(PstSizeBoundaryCoverageId, CanaryScenarioStatus.Blocked, evidence, "BOUNDARY_ARTIFACT_BELOW_THRESHOLD", observedAt);
+        }
+
+        return CanaryScenarioResult.Create(PstSizeBoundaryCoverageId, CanaryScenarioStatus.Pass, evidence, reasonCode: string.Empty, observedAt);
     }
 
     private static CanaryScenarioResult MapRecoveryRecord(

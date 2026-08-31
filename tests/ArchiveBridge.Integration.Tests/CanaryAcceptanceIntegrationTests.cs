@@ -163,7 +163,7 @@ public sealed class CanaryAcceptanceIntegrationTests(SqlServerFixture fixture)
 
         await Assert.ThrowsAsync<CanaryScenarioNotAttestableException>(() => SubmitUseCase().ExecuteAsync(
             new SubmitCanaryScenarioEvidenceCommand(scope, 1, new CanaryScenarioId("CANARY.CRASH_RECOVERY"), CanaryScenarioStatus.Pass,
-                "it definitely recovered", string.Empty, Clock.UtcNow, CorrelationId.New()),
+                SomeFingerprint, "it definitely recovered", string.Empty, Clock.UtcNow, CorrelationId.New()),
             CancellationToken.None));
 
         Assert.Null(await Results().GetLatestAsync(scope, 1, new CanaryScenarioId("CANARY.CRASH_RECOVERY"), CancellationToken.None));
@@ -196,7 +196,7 @@ public sealed class CanaryAcceptanceIntegrationTests(SqlServerFixture fixture)
 
         await Assert.ThrowsAsync<CanaryPlanSupersededException>(() => SubmitUseCase().ExecuteAsync(
             new SubmitCanaryScenarioEvidenceCommand(scope, 1, new CanaryScenarioId("CANARY.CORPUS_ITEM_TYPE_DIVERSITY"), CanaryScenarioStatus.Pass,
-                "20 item types observed", string.Empty, Clock.UtcNow, CorrelationId.New()),
+                SomeFingerprint, "external-corpus-report:v1", string.Empty, Clock.UtcNow, CorrelationId.New()),
             CancellationToken.None));
     }
 
@@ -215,7 +215,7 @@ public sealed class CanaryAcceptanceIntegrationTests(SqlServerFixture fixture)
         // "não convergiu", não uma falha de concorrência real.
         var observedAt = Clock.UtcNow;
         var tasks = Enumerable.Range(0, 5).Select(_ => SubmitUseCase().ExecuteAsync(
-            new SubmitCanaryScenarioEvidenceCommand(scope, 1, scenarioId, CanaryScenarioStatus.Pass, "20 item types observed", string.Empty, observedAt, CorrelationId.New()),
+            new SubmitCanaryScenarioEvidenceCommand(scope, 1, scenarioId, CanaryScenarioStatus.Pass, SomeFingerprint, "external-corpus-report:v2", string.Empty, observedAt, CorrelationId.New()),
             CancellationToken.None));
         await Task.WhenAll(tasks);
 
@@ -231,7 +231,7 @@ public sealed class CanaryAcceptanceIntegrationTests(SqlServerFixture fixture)
         await AuthorizeUseCase().ExecuteAsync(new AuthorizeCanaryPlanCommand(scope, CorrelationId.New()), CancellationToken.None);
         var scenarioId = new CanaryScenarioId("CANARY.CORPUS_ITEM_TYPE_DIVERSITY");
         await SubmitUseCase().ExecuteAsync(
-            new SubmitCanaryScenarioEvidenceCommand(scope, 1, scenarioId, CanaryScenarioStatus.Pass, "20 item types observed", string.Empty, Clock.UtcNow, CorrelationId.New()),
+            new SubmitCanaryScenarioEvidenceCommand(scope, 1, scenarioId, CanaryScenarioStatus.Pass, SomeFingerprint, "external-corpus-report:v3", string.Empty, Clock.UtcNow, CorrelationId.New()),
             CancellationToken.None);
 
         await TamperAsync(scope, "UPDATE dbo.canary_scenario_results SET status = 4 WHERE tenant_id = @tenant AND project_id = @project AND scenario_id = 'CANARY.CORPUS_ITEM_TYPE_DIVERSITY';");
@@ -257,26 +257,26 @@ public sealed class CanaryAcceptanceIntegrationTests(SqlServerFixture fixture)
         await SeedReadyForCanaryAsync(scope);
         await AuthorizeUseCase().ExecuteAsync(new AuthorizeCanaryPlanCommand(scope, CorrelationId.New()), CancellationToken.None);
 
-        var operatorAttested = new[]
-        {
-            "CANARY.CORPUS_ITEM_TYPE_DIVERSITY",
-            "CANARY.PST_SIZE_BOUNDARY_COVERAGE",
-            "CANARY.REPLAY_SAME_TARGET_ROOT_IDEMPOTENT",
-            "CANARY.DIFFERENT_TARGET_ROOT_BLOCKS",
-            "CANARY.KNOWN_CORRUPTION_QUARANTINE",
-        };
-        foreach (var scenarioIdValue in operatorAttested)
-        {
-            await SubmitUseCase().ExecuteAsync(
-                new SubmitCanaryScenarioEvidenceCommand(scope, 1, new CanaryScenarioId(scenarioIdValue), CanaryScenarioStatus.Pass,
-                    $"observed evidence for {scenarioIdValue}", string.Empty, Clock.UtcNow, CorrelationId.New()),
-                CancellationToken.None);
-        }
+        // AB-I8-006: CANARY.CORPUS_ITEM_TYPE_DIVERSITY é o ÚNICO cenário que permanece OperatorAttested —
+        // os outros quatro anteriormente OperatorAttested (PST_SIZE_BOUNDARY_COVERAGE,
+        // REPLAY_SAME_TARGET_ROOT_IDEMPOTENT, DIFFERENT_TARGET_ROOT_BLOCKS, KNOWN_CORRUPTION_QUARANTINE)
+        // foram reclassificados para SystemDerived — exercitar seus resolvers reais contra a store SQL real
+        // é coberto por CanaryReclassifiedScenarioIntegrationTests; aqui, como os demais SystemDerived
+        // abaixo, são persistidos diretamente via a store REAL apenas para completar o happy path fim a fim.
+        await SubmitUseCase().ExecuteAsync(
+            new SubmitCanaryScenarioEvidenceCommand(scope, 1, new CanaryScenarioId("CANARY.CORPUS_ITEM_TYPE_DIVERSITY"), CanaryScenarioStatus.Pass,
+                SomeFingerprint, "external-corpus-report:happy-path", string.Empty, Clock.UtcNow, CorrelationId.New()),
+            CancellationToken.None);
 
-        // Os quatro SystemDerived não têm store canônico seedado neste teste (não são o foco de
-        // ResolveCanarySystemEvidenceUseCase, já coberto em Application.Tests) — persistidos aqui diretamente
-        // via a store REAL para completar o happy path e provar a aprovação/promoção fim a fim.
-        foreach (var scenarioIdValue in new[] { "CANARY.TENANT_MAILBOX_CONTROLLED", "CANARY.CRASH_RECOVERY", "CANARY.RECONCILIATION_EVIDENCE_PACKAGE", "CANARY.RESTORE_ROLLBACK_OPERATIONAL" })
+        // Os oito SystemDerived não têm store canônico seedado neste teste (não são o foco desta suíte —
+        // ver ResolveCanarySystemEvidenceUseCaseTests e CanaryReclassifiedScenarioIntegrationTests) —
+        // persistidos aqui diretamente via a store REAL para completar o happy path e provar a
+        // aprovação/promoção fim a fim.
+        foreach (var scenarioIdValue in new[]
+        {
+            "CANARY.TENANT_MAILBOX_CONTROLLED", "CANARY.CRASH_RECOVERY", "CANARY.RECONCILIATION_EVIDENCE_PACKAGE", "CANARY.RESTORE_ROLLBACK_OPERATIONAL",
+            "CANARY.PST_SIZE_BOUNDARY_COVERAGE", "CANARY.REPLAY_SAME_TARGET_ROOT_IDEMPOTENT", "CANARY.DIFFERENT_TARGET_ROOT_BLOCKS", "CANARY.KNOWN_CORRUPTION_QUARANTINE",
+        })
         {
             await Results().RecordResultAsync(
                 scope, 1, new CanaryScenarioId(scenarioIdValue), CanaryScenarioStatus.Pass, ArchiveBridge.Domain.Canary.CanaryEvidenceReference.SystemDerived(SomeFingerprint, $"fixture:{scenarioIdValue}"),

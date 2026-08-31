@@ -2,21 +2,29 @@ using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Canary;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Contracts.ProductionReadiness;
+using ArchiveBridge.Contracts.PstProcessing;
 using ArchiveBridge.Contracts.Recovery;
 using ArchiveBridge.Contracts.TargetIngestion.Purview;
 using ArchiveBridge.Contracts.TargetIngestion.Purview.Reconciliation;
+using ArchiveBridge.Contracts.TargetIngestion.Purview.Upload;
+using ArchiveBridge.Contracts.Waves;
 using ArchiveBridge.Domain.Canary;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.IdentityAndAccess;
+using ArchiveBridge.Domain.Jobs;
+using ArchiveBridge.Domain.Planning;
 using ArchiveBridge.Domain.ProductionReadiness;
 using ArchiveBridge.Domain.Projects;
+using ArchiveBridge.Domain.PstProcessing;
 using ArchiveBridge.Domain.Reconciliation;
 using ArchiveBridge.Domain.Recovery;
 using ArchiveBridge.Domain.TargetIngestion;
 using ArchiveBridge.Domain.TargetIngestion.Purview;
 using ArchiveBridge.Domain.TargetIngestion.Purview.Reconciliation;
 using ArchiveBridge.Domain.TargetIngestion.Purview.ServiceResult;
+using ArchiveBridge.Domain.TargetIngestion.Purview.Upload;
 using ArchiveBridge.Domain.Waves;
+using ArchiveBridge.Contracts.Approvals;
 
 namespace ArchiveBridge.Application.Tests.Canary;
 
@@ -274,4 +282,103 @@ internal sealed class InMemoryReconciliationCertificateStore : IReconciliationCe
         string actorId, string actorRole, bool succeeded, string reason, CorrelationId correlation, DateTimeOffset occurredAtUtc,
         CancellationToken cancellationToken) =>
         Task.CompletedTask;
+}
+
+/// <summary>AB-I8-006: duplo de <see cref="IPstInspectionStore"/> para os resolvers reclassificados (KNOWN_CORRUPTION_QUARANTINE, PST_SIZE_BOUNDARY_COVERAGE).</summary>
+internal sealed class InMemoryPstInspectionStore : IPstInspectionStore
+{
+    private readonly Dictionary<(Guid Tenant, Guid Project, Guid Artifact, string ExpectedHash), PstInspectionRecord> _canonical = [];
+
+    public void Seed(TenantScope scope, PstInspectionRecord record) =>
+        _canonical[(scope.Tenant.Value, scope.Project.Value, record.Artifact.Value, record.ExpectedHash.Value)] = record;
+
+    public Task<PstInspectionRecord?> FindCanonicalAsync(TenantScope scope, ArtifactId artifact, Sha256Hash expectedHash, CancellationToken cancellationToken) =>
+        Task.FromResult(_canonical.TryGetValue((scope.Tenant.Value, scope.Project.Value, artifact.Value, expectedHash.Value), out var record) ? record : null);
+
+    public Task<PstInspectionRecord> SaveAsync(PstInspectionRecord record, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
+}
+
+/// <summary>AB-I8-006: duplo de <see cref="IPurviewUploadRequestStore"/> para o resolver CANARY.REPLAY_SAME_TARGET_ROOT_IDEMPOTENT.</summary>
+internal sealed class InMemoryPurviewUploadRequestStore : IPurviewUploadRequestStore
+{
+    private readonly Dictionary<(Guid Tenant, Guid Project, Guid Wave), PurviewUploadRequest> _canonical = [];
+
+    public void Seed(TenantScope scope, PurviewUploadRequest request) =>
+        _canonical[(scope.Tenant.Value, scope.Project.Value, request.Wave.Value)] = request;
+
+    public Task<PurviewUploadRequestEnqueueResult> EnqueueIdempotentAsync(TenantScope scope, WaveId wave, CorrelationId correlation, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
+
+    public Task<PurviewUploadRequest?> FindCanonicalAsync(TenantScope scope, WaveId wave, CancellationToken cancellationToken) =>
+        Task.FromResult(_canonical.TryGetValue((scope.Tenant.Value, scope.Project.Value, wave.Value), out var request) ? request : null);
+
+    public Task<PurviewUploadRequest?> GetByJobAsync(TenantScope scope, JobId job, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
+}
+
+/// <summary>AB-I8-006: duplo de <see cref="IPurviewUploadAttemptStore"/> para o resolver CANARY.REPLAY_SAME_TARGET_ROOT_IDEMPOTENT.</summary>
+internal sealed class InMemoryPurviewUploadAttemptStore : IPurviewUploadAttemptStore
+{
+    private readonly Dictionary<Guid, List<PurviewUploadAttemptRecord>> _attempts = [];
+
+    public void Seed(PurviewUploadRequestId request, params PurviewUploadAttemptRecord[] records) => _attempts[request.Value] = [.. records];
+
+    public Task AppendAsync(TenantScope scope, PurviewUploadAttemptRecord record, JobFence? fence, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
+
+    public Task<PurviewUploadAttemptRecord?> GetLatestAsync(TenantScope scope, PurviewUploadRequestId request, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
+
+    public Task<PurviewUploadAttemptRecord?> GetLatestAcrossRequestsAsync(TenantScope scope, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
+
+    public Task<IReadOnlyList<PurviewUploadAttemptRecord>> ListAttemptsAsync(TenantScope scope, PurviewUploadRequestId request, CancellationToken cancellationToken)
+    {
+        IReadOnlyList<PurviewUploadAttemptRecord> result = _attempts.TryGetValue(request.Value, out var list) ? [.. list] : [];
+        return Task.FromResult(result);
+    }
+}
+
+/// <summary>
+/// AB-I8-006: duplo de <see cref="IWaveStore"/> para o resolver CANARY.DIFFERENT_TARGET_ROOT_BLOCKS.
+/// <see cref="GetAsync"/> devolve SEMPRE uma instância REIDRATADA a partir dos campos do seed (nunca a
+/// própria referência seedada) — mesmo comportamento de uma store SQL real (cada leitura reconstrói um
+/// objeto novo), para que uma mutação em memória feita pelo resolver (<c>ChangeTargetRootFolder</c>, nunca
+/// persistida de volta) jamais vaze para o próximo teste/leitura através do mesmo objeto compartilhado.
+/// </summary>
+internal sealed class InMemoryWaveStore : IWaveStore
+{
+    private readonly Dictionary<(Guid Tenant, Guid Project, Guid Wave), MigrationWave> _waves = [];
+
+    public void Seed(TenantScope scope, MigrationWave wave) => _waves[(scope.Tenant.Value, scope.Project.Value, wave.Id.Value)] = wave;
+
+    public Task AddAsync(MigrationWave wave, CorrelationId correlation, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
+
+    public Task<MigrationWave?> GetAsync(TenantScope scope, WaveId waveId, CancellationToken cancellationToken)
+    {
+        if (!_waves.TryGetValue((scope.Tenant.Value, scope.Project.Value, waveId.Value), out var wave))
+        {
+            return Task.FromResult<MigrationWave?>(null);
+        }
+
+        var fresh = MigrationWave.Rehydrate(
+            wave.Id, scope.Tenant, scope.Project, wave.Name, wave.TargetRootFolder, wave.ConfigurationHash, wave.Selection,
+            wave.Version, wave.Status, wave.ApprovedAtUtc, wave.ApprovedBy, wave.CreatedAtUtc, wave.RowVersion);
+        return Task.FromResult<MigrationWave?>(fresh);
+    }
+
+    public Task SaveStatusAsync(MigrationWave wave, CorrelationId correlation, CancellationToken cancellationToken, JobFence? fence = null) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
+
+    public Task SaveValidationAsync(
+        MigrationWave wave, IReadOnlyList<PlanningAssessment> assessments, CorrelationId correlation, CancellationToken cancellationToken, JobFence? fence = null) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
+
+    public Task SaveSelectionAsync(MigrationWave wave, CorrelationId correlation, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
+
+    public Task SaveStatusWithApprovalAsync(MigrationWave wave, ApprovalRecord approval, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de canário.");
 }

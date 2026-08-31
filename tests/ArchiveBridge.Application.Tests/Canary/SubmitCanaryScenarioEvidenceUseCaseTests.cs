@@ -19,6 +19,7 @@ public sealed class SubmitCanaryScenarioEvidenceUseCaseTests
     private static readonly DateTimeOffset Now = new(2026, 8, 30, 9, 0, 0, TimeSpan.Zero);
     private static readonly CanaryScenarioId OperatorAttestedScenario = new("CANARY.CORPUS_ITEM_TYPE_DIVERSITY");
     private static readonly CanaryScenarioId SystemDerivedScenario = new("CANARY.CRASH_RECOVERY");
+    private static readonly Sha256Hash SomeDigest = new(new string('d', 64));
 
     private static SubmitCanaryScenarioEvidenceUseCase BuildUseCase(InMemoryCanaryScenarioResultStore resultStore, FakeAuthenticatedActorAccessor? actor = null) =>
         new(resultStore, new FixedClock(Now), actor ?? new FakeAuthenticatedActorAccessor("operator-1", PortalRoles.Operator));
@@ -40,7 +41,7 @@ public sealed class SubmitCanaryScenarioEvidenceUseCaseTests
         var useCase = BuildUseCase(resultStore);
 
         await Assert.ThrowsAsync<CanaryScenarioNotAttestableException>(() => useCase.ExecuteAsync(
-            new SubmitCanaryScenarioEvidenceCommand(Scope, 1, SystemDerivedScenario, CanaryScenarioStatus.Pass, "I promise it passed", string.Empty, Now, CorrelationId.New()),
+            new SubmitCanaryScenarioEvidenceCommand(Scope, 1, SystemDerivedScenario, CanaryScenarioStatus.Pass, SomeDigest, "external-corpus-report:v1", string.Empty, Now, CorrelationId.New()),
             CancellationToken.None));
 
         Assert.Null(await resultStore.GetLatestAsync(Scope, 1, SystemDerivedScenario, CancellationToken.None));
@@ -54,7 +55,7 @@ public sealed class SubmitCanaryScenarioEvidenceUseCaseTests
 
         await Assert.ThrowsAsync<CanaryScenarioNotAttestableException>(() => useCase.ExecuteAsync(
             new SubmitCanaryScenarioEvidenceCommand(
-                Scope, 1, CanaryScenarioCatalog.FirstWaveApprovalScenarioId, CanaryScenarioStatus.Pass, "I approve", string.Empty, Now, CorrelationId.New()),
+                Scope, 1, CanaryScenarioCatalog.FirstWaveApprovalScenarioId, CanaryScenarioStatus.Pass, SomeDigest, "approval-note:v1", string.Empty, Now, CorrelationId.New()),
             CancellationToken.None));
     }
 
@@ -66,7 +67,7 @@ public sealed class SubmitCanaryScenarioEvidenceUseCaseTests
 
         var result = await useCase.ExecuteAsync(
             new SubmitCanaryScenarioEvidenceCommand(
-                Scope, 1, OperatorAttestedScenario, CanaryScenarioStatus.Pass, "20 item types observed in the canary corpus report v3",
+                Scope, 1, OperatorAttestedScenario, CanaryScenarioStatus.Pass, SomeDigest, "external-corpus-report:v3",
                 string.Empty, Now, CorrelationId.New()),
             CancellationToken.None);
 
@@ -80,7 +81,7 @@ public sealed class SubmitCanaryScenarioEvidenceUseCaseTests
         var resultStore = await SeedAuthorizedPlanAsync();
         var useCase = BuildUseCase(resultStore);
         var command = new SubmitCanaryScenarioEvidenceCommand(
-            Scope, 1, OperatorAttestedScenario, CanaryScenarioStatus.Pass, "same evidence text", string.Empty, Now, CorrelationId.New());
+            Scope, 1, OperatorAttestedScenario, CanaryScenarioStatus.Pass, SomeDigest, "external-corpus-report:v4", string.Empty, Now, CorrelationId.New());
 
         await useCase.ExecuteAsync(command, CancellationToken.None);
         await useCase.ExecuteAsync(command with { Correlation = CorrelationId.New() }, CancellationToken.None);
@@ -107,7 +108,7 @@ public sealed class SubmitCanaryScenarioEvidenceUseCaseTests
             new Sha256Hash(new string('a', 64)), "approver-1", "Approver", CorrelationId.New(), Now, CancellationToken.None);
 
         await Assert.ThrowsAsync<CanaryPlanSupersededException>(() => useCase.ExecuteAsync(
-            new SubmitCanaryScenarioEvidenceCommand(Scope, 1, OperatorAttestedScenario, CanaryScenarioStatus.Pass, "evidence", string.Empty, Now, CorrelationId.New()),
+            new SubmitCanaryScenarioEvidenceCommand(Scope, 1, OperatorAttestedScenario, CanaryScenarioStatus.Pass, SomeDigest, "external-corpus-report:v5", string.Empty, Now, CorrelationId.New()),
             CancellationToken.None));
     }
 
@@ -119,7 +120,7 @@ public sealed class SubmitCanaryScenarioEvidenceUseCaseTests
             resultStore, new FixedClock(Now), new FakeAuthenticatedActorAccessor("viewer-1", PortalRoles.Viewer));
 
         await Assert.ThrowsAsync<CanaryAuthorizationException>(() => useCase.ExecuteAsync(
-            new SubmitCanaryScenarioEvidenceCommand(Scope, 1, OperatorAttestedScenario, CanaryScenarioStatus.Pass, "evidence", string.Empty, Now, CorrelationId.New()),
+            new SubmitCanaryScenarioEvidenceCommand(Scope, 1, OperatorAttestedScenario, CanaryScenarioStatus.Pass, SomeDigest, "external-corpus-report:v5", string.Empty, Now, CorrelationId.New()),
             CancellationToken.None));
     }
 }
