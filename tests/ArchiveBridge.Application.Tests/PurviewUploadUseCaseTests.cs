@@ -622,5 +622,8 @@ public sealed class PurviewUploadUseCaseTests
         public Task<IReadOnlyList<PurviewUploadAttemptRecord>> ListAttemptsAsync(
             TenantScope scope, PurviewUploadRequestId request, CancellationToken cancellationToken) =>
             Task.FromResult<IReadOnlyList<PurviewUploadAttemptRecord>>([.. Appended.Where(record => record.Request == request)]);
+
+        public Task<PurviewUploadAttemptRecord?> GetLatestAcrossRequestsAsync(TenantScope scope, CancellationToken cancellationToken) =>
+            Task.FromResult(Appended.OrderByDescending(record => record.CompletedAtUtc).FirstOrDefault());
     }
 }

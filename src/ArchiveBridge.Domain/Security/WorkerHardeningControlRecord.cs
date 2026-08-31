@@ -236,13 +236,24 @@ public sealed record WorkerHardeningControlRecord
         var canonicalExecutedAt = TruncateToMilliseconds(executedAtUtc);
         var applicability = WorkerHardeningBaselineCatalog.Applicability(control);
 
-        var fingerprint = ComputeContentFingerprint(status, measurement, evidenceFingerprint, normalizedBlockedReason, normalizedNotes);
+        // Mesmo tratamento de canonicalização que executedAtUtc: a coluna persistida
+        // (measurement_measured_at_utc DATETIME2(3)) só guarda precisão de milissegundo, então o instante
+        // real da medição (tipicamente DateTimeOffset.UtcNow, com componente sub-milissegundo) é truncado
+        // ANTES de virar o valor canônico do registro — nunca depois. Sem isto, o valor gravado no SQL
+        // Server (arredondado pelo próprio driver/engine ao inserir um valor não alinhado) divergiria do
+        // valor usado aqui no fingerprint, disparando WorkerHardeningIntegrityViolationException
+        // falso-positivo em toda leitura real.
+        var canonicalMeasurement = measurement is { } rawMeasurement
+            ? new WorkerHardeningMeasurement(TruncateToMilliseconds(rawMeasurement.MeasuredAtUtc), rawMeasurement.MeasurementMethod)
+            : (WorkerHardeningMeasurement?)null;
+
+        var fingerprint = ComputeContentFingerprint(status, canonicalMeasurement, evidenceFingerprint, normalizedBlockedReason, normalizedNotes);
         var hash = ComputeRecordHash(
             tenant, project, control, controlVersion, applicability, fingerprint, normalizedExecutedBy,
             normalizedExecutedByRole, correlation, canonicalExecutedAt, CurrentSchemaVersion);
 
         return new WorkerHardeningControlRecord(
-            tenant, project, control, controlVersion, applicability, status, measurement, evidenceFingerprint,
+            tenant, project, control, controlVersion, applicability, status, canonicalMeasurement, evidenceFingerprint,
             normalizedBlockedReason, normalizedNotes, normalizedExecutedBy, normalizedExecutedByRole, correlation,
             canonicalExecutedAt, CurrentSchemaVersion, fingerprint, hash);
     }
@@ -294,6 +305,14 @@ public sealed record WorkerHardeningControlRecord
     }
 
     /// <summary>Impressão digital determinística do RESULTADO da verificação — exposta para que a store resolva convergência idempotente antes de conhecer a versão a alocar.</summary>
+    /// <remarks>
+    /// <see cref="WorkerHardeningMeasurement.MeasuredAtUtc"/> é truncado para precisão de milissegundo antes
+    /// de entrar no fingerprint — a coluna persistida (<c>measurement_measured_at_utc DATETIME2(3)</c>) só
+    /// guarda essa precisão; sem truncar aqui, uma medição real com componente sub-milissegundo (comum em
+    /// <see cref="DateTimeOffset.UtcNow"/>) produziria um fingerprint que NUNCA sobrevive a um round-trip real
+    /// pelo SQL Server, disparando <see cref="WorkerHardeningIntegrityViolationException"/> falso-positivo em
+    /// toda leitura — o mesmo padrão já aplicado a <c>executedAtUtc</c> nesta classe.
+    /// </remarks>
     public static Sha256Hash ComputeContentFingerprint(
         WorkerHardeningStatus status,
         WorkerHardeningMeasurement? measurement,
@@ -304,7 +323,7 @@ public sealed record WorkerHardeningControlRecord
         [
             "archivebridge.security.worker-hardening-fingerprint.v1",
             ((int)status).ToString(CultureInfo.InvariantCulture),
-            measurement?.MeasuredAtUtc.UtcTicks.ToString(CultureInfo.InvariantCulture) ?? "none",
+            measurement is { } m ? TruncateToMilliseconds(m.MeasuredAtUtc).UtcTicks.ToString(CultureInfo.InvariantCulture) : "none",
             measurement?.MeasurementMethod ?? "none",
             evidenceFingerprint.Value,
             blockedReason,

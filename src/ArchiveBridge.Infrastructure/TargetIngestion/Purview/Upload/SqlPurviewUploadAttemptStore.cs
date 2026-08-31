@@ -52,6 +52,10 @@ public sealed class SqlPurviewUploadAttemptStore(TenantConnectionFactory connect
         $"SELECT TOP (1) {Columns} FROM dbo.purview_upload_attempts " +
         "WHERE request_id = @request AND tenant_id = @tenant AND project_id = @project ORDER BY attempt_number DESC;";
 
+    private const string SelectLatestAcrossRequestsSql =
+        $"SELECT TOP (1) request_id, {Columns} FROM dbo.purview_upload_attempts " +
+        "WHERE tenant_id = @tenant AND project_id = @project ORDER BY completed_at_utc DESC;";
+
     private const string SelectAllSql =
         $"SELECT {Columns} FROM dbo.purview_upload_attempts " +
         "WHERE request_id = @request AND tenant_id = @tenant AND project_id = @project ORDER BY attempt_number ASC;";
@@ -136,6 +140,29 @@ public sealed class SqlPurviewUploadAttemptStore(TenantConnectionFactory connect
         }
 
         return raw is null ? null : await BuildRecordAsync(connection.Connection, scope, request, raw.Value, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<PurviewUploadAttemptRecord?> GetLatestAcrossRequestsAsync(TenantScope scope, CancellationToken cancellationToken)
+    {
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        PurviewUploadRequestId request;
+        RawAttemptRow raw;
+        await using (var command = new SqlCommand(SelectLatestAcrossRequestsSql, connection.Connection))
+        {
+            command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+            command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return null;
+            }
+
+            request = new PurviewUploadRequestId(reader.GetGuid(0));
+            raw = ReadRaw(reader, columnOffset: 1);
+        }
+
+        return await BuildRecordAsync(connection.Connection, scope, request, raw, cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -231,21 +258,24 @@ public sealed class SqlPurviewUploadAttemptStore(TenantConnectionFactory connect
         DateTime StartedAtUtc,
         DateTime CompletedAtUtc);
 
-    private static RawAttemptRow ReadRaw(SqlDataReader reader) => new(
-        reader.GetGuid(0),
-        reader.GetInt32(2),
-        reader.GetString(3).TrimEnd(),
-        (PurviewUploadAttemptOutcome)reader.GetByte(4),
-        reader.IsDBNull(5) ? null : reader.GetString(5),
-        reader.IsDBNull(6) ? null : reader.GetInt32(6),
-        reader.IsDBNull(7) ? null : reader.GetString(7),
-        reader.IsDBNull(8) ? null : reader.GetString(8).TrimEnd(),
-        reader.IsDBNull(9) ? null : reader.GetInt32(9),
-        reader.IsDBNull(10) ? null : reader.GetInt64(10),
-        reader.IsDBNull(11) ? null : reader.GetString(11),
-        reader.IsDBNull(12) ? null : reader.GetString(12).TrimEnd(),
-        reader.GetDateTime(13),
-        reader.GetDateTime(14));
+    // columnOffset desloca todos os índices em +1 quando a query prefixa a projeção com request_id
+    // (SelectLatestAcrossRequestsSql) — Columns por si só nunca inclui request_id (só é necessário quando a
+    // query não filtra por um pedido já conhecido).
+    private static RawAttemptRow ReadRaw(SqlDataReader reader, int columnOffset = 0) => new(
+        reader.GetGuid(0 + columnOffset),
+        reader.GetInt32(2 + columnOffset),
+        reader.GetString(3 + columnOffset).TrimEnd(),
+        (PurviewUploadAttemptOutcome)reader.GetByte(4 + columnOffset),
+        reader.IsDBNull(5 + columnOffset) ? null : reader.GetString(5 + columnOffset),
+        reader.IsDBNull(6 + columnOffset) ? null : reader.GetInt32(6 + columnOffset),
+        reader.IsDBNull(7 + columnOffset) ? null : reader.GetString(7 + columnOffset),
+        reader.IsDBNull(8 + columnOffset) ? null : reader.GetString(8 + columnOffset).TrimEnd(),
+        reader.IsDBNull(9 + columnOffset) ? null : reader.GetInt32(9 + columnOffset),
+        reader.IsDBNull(10 + columnOffset) ? null : reader.GetInt64(10 + columnOffset),
+        reader.IsDBNull(11 + columnOffset) ? null : reader.GetString(11 + columnOffset),
+        reader.IsDBNull(12 + columnOffset) ? null : reader.GetString(12 + columnOffset).TrimEnd(),
+        reader.GetDateTime(13 + columnOffset),
+        reader.GetDateTime(14 + columnOffset));
 
     // Reconstrói o registro completo — para Uploaded, carrega e revalida a manifestação persistida (item
     // 2/6): o hash recomputado a partir dos itens REALMENTE carregados precisa corresponder EXATAMENTE ao
