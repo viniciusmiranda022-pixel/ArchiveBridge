@@ -12,8 +12,10 @@ namespace ArchiveBridge.Application.Tests.Canary;
 
 /// <summary>
 /// AB-I8-006 — <see cref="ResolveCanaryPstSizeBoundaryEvidenceUseCase"/>: CANARY.PST_SIZE_BOUNDARY_COVERAGE
-/// reclassificado de OperatorAttested para SystemDerived. Pass exige o ObservedSizeBytes REAL de duas
-/// PstInspectionRecord canônicas nos dois lados dos limiares — nunca o veredito alegado pelo operador.
+/// reclassificado de OperatorAttested para SystemDerived. AB-I8-007: o lado "boundary" é verificado contra
+/// o ÚNICO limiar de 18 GB REALMENTE documentado (PartitionPolicy.RunbookTargetPartBytes), sem tolerância
+/// inventada; o lado "pequeno" não tem limiar numérico documentado em lugar algum, então nunca é fabricado —
+/// o cenário permanece estruturalmente Blocked (nunca Pass) até que um critério documentado exista.
 /// </summary>
 public sealed class ResolveCanaryPstSizeBoundaryEvidenceUseCaseTests
 {
@@ -73,20 +75,6 @@ public sealed class ResolveCanaryPstSizeBoundaryEvidenceUseCaseTests
     }
 
     [Fact]
-    public async Task ASmallArtifactThatIsNotActuallySmallIsBlocked()
-    {
-        var (resultStore, inspectionStore) = await SeedAuthorizedPlanAsync();
-        inspectionStore.Seed(Scope, ValidRecord(SmallArtifact, SmallHash, 512L * 1024 * 1024)); // 512 MiB — não é "pequeno" o suficiente.
-        inspectionStore.Seed(Scope, ValidRecord(BoundaryArtifact, BoundaryHash, 17L * OneGib));
-        var useCase = BuildUseCase(inspectionStore, resultStore);
-
-        var result = await useCase.ExecuteAsync(Command(), CancellationToken.None);
-
-        Assert.Equal(CanaryScenarioStatus.Blocked, result.Status);
-        Assert.Equal("SMALL_ARTIFACT_NOT_SMALL_ENOUGH", result.ReasonCode);
-    }
-
-    [Fact]
     public async Task ABoundaryArtifactBelowTheThresholdIsBlocked()
     {
         var (resultStore, inspectionStore) = await SeedAuthorizedPlanAsync();
@@ -101,16 +89,55 @@ public sealed class ResolveCanaryPstSizeBoundaryEvidenceUseCaseTests
     }
 
     [Fact]
-    public async Task TwoGenuinelySizedArtifactsAreProvenAsPass()
+    public async Task SixteenGibNeverSatisfiesTheDocumentedEighteenGibBoundaryDespiteBeingCloseToIt()
     {
+        // AB-I8-007: AB-I8-006 havia aceito 16 GiB (uma tolerância implementation-defined de ~2 GiB abaixo
+        // do limiar REALMENTE documentado). Isso foi rejeitado — 16 GiB continua abaixo do único limiar de
+        // 18 GB documentado (PartitionPolicy.RunbookTargetPartBytes) e nunca satisfaz o boundary.
         var (resultStore, inspectionStore) = await SeedAuthorizedPlanAsync();
         inspectionStore.Seed(Scope, ValidRecord(SmallArtifact, SmallHash, 1024));
-        inspectionStore.Seed(Scope, ValidRecord(BoundaryArtifact, BoundaryHash, 17L * OneGib));
+        inspectionStore.Seed(Scope, ValidRecord(BoundaryArtifact, BoundaryHash, 16L * OneGib));
         var useCase = BuildUseCase(inspectionStore, resultStore);
 
         var result = await useCase.ExecuteAsync(Command(), CancellationToken.None);
 
-        Assert.Equal(CanaryScenarioStatus.Pass, result.Status);
+        Assert.Equal(CanaryScenarioStatus.Blocked, result.Status);
+        Assert.Equal("BOUNDARY_ARTIFACT_BELOW_THRESHOLD", result.ReasonCode);
+    }
+
+    [Fact]
+    public async Task ABoundaryArtifactAtExactlyTheDocumentedThresholdSatisfiesTheBoundaryCheckDeterministically()
+    {
+        var (resultStore, inspectionStore) = await SeedAuthorizedPlanAsync();
+        inspectionStore.Seed(Scope, ValidRecord(SmallArtifact, SmallHash, 1024));
+        inspectionStore.Seed(Scope, ValidRecord(BoundaryArtifact, BoundaryHash, PartitionPolicy.RunbookTargetPartBytes));
+        var useCase = BuildUseCase(inspectionStore, resultStore);
+
+        var result = await useCase.ExecuteAsync(Command(), CancellationToken.None);
+
+        // O lado "boundary" está genuinamente provado contra o limiar documentado — mas o cenário ainda
+        // nunca vira Pass, porque "PST pequeno" não tem nenhum limiar numérico documentado (ver teste
+        // abaixo).
+        Assert.Equal(CanaryScenarioStatus.Blocked, result.Status);
+        Assert.Equal("SMALL_PST_THRESHOLD_UNDOCUMENTED", result.ReasonCode);
+    }
+
+    [Fact]
+    public async Task TheScenarioNeverBecomesPassBecauseSmallPstHasNoDocumentedNumericThreshold()
+    {
+        // AB-I8-007: AB-I8-006 havia fabricado 64 MiB como limiar de "pequeno" (nenhuma autoridade
+        // documentada define esse número). Mesmo com o lado "boundary" genuinamente provado (bem acima do
+        // limiar documentado) e um artefato "pequeno" de qualquer tamanho, o cenário nunca vira Pass —
+        // fail-closed até existir critério documentado, nunca por aproximação de engenharia.
+        var (resultStore, inspectionStore) = await SeedAuthorizedPlanAsync();
+        inspectionStore.Seed(Scope, ValidRecord(SmallArtifact, SmallHash, 1024));
+        inspectionStore.Seed(Scope, ValidRecord(BoundaryArtifact, BoundaryHash, 50L * OneGib));
+        var useCase = BuildUseCase(inspectionStore, resultStore);
+
+        var result = await useCase.ExecuteAsync(Command(), CancellationToken.None);
+
+        Assert.Equal(CanaryScenarioStatus.Blocked, result.Status);
+        Assert.Equal("SMALL_PST_THRESHOLD_UNDOCUMENTED", result.ReasonCode);
         Assert.Equal(CanaryEvidenceKind.SystemDerived, result.Evidence.Kind);
     }
 

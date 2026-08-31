@@ -12,8 +12,9 @@ namespace ArchiveBridge.Application.Tests.Canary;
 
 /// <summary>
 /// AB-I8-006 — <see cref="ResolveCanaryPstCorruptionEvidenceUseCase"/>: CANARY.KNOWN_CORRUPTION_QUARANTINE
-/// reclassificado de OperatorAttested para SystemDerived. Pass exige uma PstInspectionRecord CANÔNICA
-/// (hash bate) com StructuralDiagnostic != Valid — nunca o veredito alegado pelo operador.
+/// reclassificado de OperatorAttested para SystemDerived. AB-I8-007: nenhum mecanismo de quarantine existe
+/// neste repositório, então o cenário NUNCA emite Pass — nem mesmo com uma PstInspectionRecord CANÔNICA
+/// (hash bate) diagnosticada corrupta (StructuralDiagnostic != Valid), permanece Blocked.
 /// </summary>
 public sealed class ResolveCanaryPstCorruptionEvidenceUseCaseTests
 {
@@ -73,7 +74,7 @@ public sealed class ResolveCanaryPstCorruptionEvidenceUseCaseTests
     [InlineData(PstStructuralDiagnostic.InvalidSignature)]
     [InlineData(PstStructuralDiagnostic.InvalidClientSignature)]
     [InlineData(PstStructuralDiagnostic.UnsupportedVersion)]
-    public async Task ADiagnosedStructuralCorruptionIsPass(PstStructuralDiagnostic diagnostic)
+    public async Task ADiagnosedStructuralCorruptionNeverBecomesPassWithoutAQuarantineMechanism(PstStructuralDiagnostic diagnostic)
     {
         var (resultStore, inspectionStore) = await SeedAuthorizedPlanAsync();
         inspectionStore.Seed(Scope, CompletedRecord(diagnostic));
@@ -82,7 +83,11 @@ public sealed class ResolveCanaryPstCorruptionEvidenceUseCaseTests
         var result = await useCase.ExecuteAsync(
             new ResolveCanaryPstCorruptionEvidenceCommand(Scope, 1, Artifact, ExpectedPstHash, CorrelationId.New()), CancellationToken.None);
 
-        Assert.Equal(CanaryScenarioStatus.Pass, result.Status);
+        // AB-I8-007: o §48 item 181 exige quarantine, não apenas diagnóstico — nenhum mecanismo de
+        // quarantine existe neste repositório, então mesmo uma corrupção genuinamente diagnosticada (com
+        // evidência canônica real anexada) nunca vira Pass.
+        Assert.Equal(CanaryScenarioStatus.Blocked, result.Status);
+        Assert.Equal("CORRUPTION_DIAGNOSED_BUT_NO_QUARANTINE_MECHANISM", result.ReasonCode);
         Assert.Equal(CanaryEvidenceKind.SystemDerived, result.Evidence.Kind);
     }
 

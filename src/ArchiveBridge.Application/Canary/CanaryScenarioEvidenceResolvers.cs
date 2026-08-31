@@ -37,13 +37,14 @@ internal static class CanaryScenarioEvidenceResolvers
     private static readonly CanaryScenarioId KnownCorruptionQuarantineId = new("CANARY.KNOWN_CORRUPTION_QUARANTINE");
     private static readonly CanaryScenarioId PstSizeBoundaryCoverageId = new("CANARY.PST_SIZE_BOUNDARY_COVERAGE");
 
-    // AB-I8-006: o runbook §48 item 178 não define um limiar numérico exato para "PST pequeno" / "boundary
-    // de 18 GB" — estes valores são uma interpretação de engenharia EXPLÍCITA e versionada (documentada no
-    // CLAUDE_DONE de AB-I8-006), sujeita a ajuste pelo Engineering Reviewer: "pequeno" é um PST claramente
-    // trivial (&lt; 64 MiB) e "boundary" exige pelo menos 16 GiB observados (dentro de ~2 GiB do limite de
-    // 18 GiB citado no runbook) — NUNCA fabricado a partir de metadado meramente declarado pelo operador.
-    private const long SmallPstMaxBytes = 64L * 1024 * 1024;
-    private const long BoundaryPstMinBytes = 16L * 1024 * 1024 * 1024;
+    // AB-I8-007: AB-I8-006 tinha inventado 64 MiB/16 GiB (nem um nem outro documentado em lugar algum) —
+    // corrigido para usar EXCLUSIVAMENTE autoridade já documentada/existente no repositório, nunca um
+    // palpite de engenharia. O runbook (§16.3, §20.1) e o Domain (Slice 4B) já definem o ÚNICO limiar
+    // numérico real de "boundary de 18 GB": PartitionPolicy.RunbookTargetPartBytes (18 GiB), o mesmo valor
+    // que decide se um PST cabe em uma parte ou exige split. Reutilizado aqui tal como está — sem
+    // tolerância/margem implementation-defined: o artefato "boundary" só prova o cenário quando seu
+    // ObservedSizeBytes real alcança ou ultrapassa esse limiar exato.
+    private static readonly long BoundaryPstMinBytes = PartitionPolicy.RunbookTargetPartBytes;
 
     /// <summary>CANARY.TENANT_MAILBOX_CONTROLLED — precheck de mailbox mais recente já registrado neste tenant/projeto; ausente ou não Active nunca é Pass.</summary>
     public static async Task<CanaryScenarioResult> ResolveTenantMailboxControlledAsync(
@@ -233,14 +234,17 @@ internal static class CanaryScenarioEvidenceResolvers
     }
 
     /// <summary>
-    /// CANARY.KNOWN_CORRUPTION_QUARANTINE (AB-I8-006 reclassificação de OperatorAttested para SystemDerived)
-    /// — resolvido a partir de uma <see cref="PstInspectionRecord"/> CANÔNICA já persistida
-    /// (<see cref="IPstInspectionStore.FindCanonicalAsync"/>: hash observado bate com o esperado, então o
-    /// artefato É genuinamente o esperado, apenas estruturalmente inválido). Nenhum store de "quarantine"
-    /// dedicado existe hoje neste repositório — a evidência de Pass é, por isso, deliberadamente mais
-    /// estreita que o texto do runbook: prova que o PST NUNCA se tornou elegível a transporte
-    /// (<see cref="PstStructuralDiagnostic"/> diferente de <see cref="PstStructuralDiagnostic.Valid"/>), não
-    /// que um mecanismo de quarantine operacional foi acionado.
+    /// CANARY.KNOWN_CORRUPTION_QUARANTINE (AB-I8-006 reclassificação de OperatorAttested para SystemDerived;
+    /// corrigido por AB-I8-007) — resolvido a partir de uma <see cref="PstInspectionRecord"/> CANÔNICA já
+    /// persistida (<see cref="IPstInspectionStore.FindCanonicalAsync"/>: hash observado bate com o esperado,
+    /// então o artefato É genuinamente o esperado, apenas estruturalmente inválido). O §48 item 181 exige
+    /// que "corrupção conhecida deve resultar em quarantine" — nenhum mecanismo de quarantine (store,
+    /// estado ou ação reforçada) existe hoje neste repositório (grep repo-wide: apenas menções em
+    /// prosa/comentário). AB-I8-006 havia estreitado silenciosamente o SIGNIFICADO do cenário para "nunca
+    /// elegível a transporte" e ainda assim emitido <see cref="CanaryScenarioStatus.Pass"/> — isso viola o
+    /// contrato do cenário. Esta versão NUNCA emite Pass: mesmo com corrupção diagnosticada (evidência
+    /// canônica anexada), o resultado é <see cref="CanaryScenarioStatus.Blocked"/> até que um mecanismo de
+    /// quarantine real exista e possa ser verificado server-side.
     /// </summary>
     public static async Task<CanaryScenarioResult> ResolveKnownCorruptionQuarantineAsync(
         IPstInspectionStore inspectionStore, TenantScope scope, ArtifactId artifact, Sha256Hash expectedHash, DateTimeOffset now,
@@ -266,16 +270,26 @@ internal static class CanaryScenarioEvidenceResolvers
                 KnownCorruptionQuarantineId, CanaryScenarioStatus.Blocked, evidence, "PST_NOT_DIAGNOSED_CORRUPT", record.CompletedAtUtc);
         }
 
-        return CanaryScenarioResult.Create(KnownCorruptionQuarantineId, CanaryScenarioStatus.Pass, evidence, reasonCode: string.Empty, record.CompletedAtUtc);
+        // A corrupção FOI diagnosticada server-side (evidência canônica acima) — mas o §48 item 181 exige
+        // quarantine, não apenas "diagnosticado corrupto", e nenhum mecanismo de quarantine existe para
+        // verificar aqui. Nunca estreitar o requisito para emitir Pass silenciosamente: fail-closed até que
+        // um mecanismo real exista.
+        return CanaryScenarioResult.Create(
+            KnownCorruptionQuarantineId, CanaryScenarioStatus.Blocked, evidence, "CORRUPTION_DIAGNOSED_BUT_NO_QUARANTINE_MECHANISM", record.CompletedAtUtc);
     }
 
     /// <summary>
-    /// CANARY.PST_SIZE_BOUNDARY_COVERAGE (AB-I8-006 reclassificação de OperatorAttested para SystemDerived)
-    /// — resolvido a partir do <c>ObservedSizeBytes</c> REAL de DUAS <see cref="PstInspectionRecord"/>
-    /// canônicas já persistidas (o caller informa os dois artefatos candidatos — pequeno e boundary; o
-    /// resolver nunca aceita o veredito do caller, apenas os tamanhos observados). Sem as duas inspeções
-    /// canônicas com tamanhos nos dois lados dos limiares (<see cref="SmallPstMaxBytes"/>/
-    /// <see cref="BoundaryPstMinBytes"/>), permanece Blocked/NotPerformed.
+    /// CANARY.PST_SIZE_BOUNDARY_COVERAGE (AB-I8-006 reclassificação de OperatorAttested para SystemDerived;
+    /// limiares corrigidos por AB-I8-007) — resolvido a partir do <c>ObservedSizeBytes</c> REAL de DUAS
+    /// <see cref="PstInspectionRecord"/> canônicas já persistidas (o caller informa os dois artefatos
+    /// candidatos — pequeno e boundary; o resolver nunca aceita o veredito do caller, apenas os tamanhos
+    /// observados). O lado "boundary" é verificado contra <see cref="BoundaryPstMinBytes"/> — o ÚNICO
+    /// limiar de 18 GB documentado neste repositório (<c>PartitionPolicy.RunbookTargetPartBytes</c>, runbook
+    /// §16.3/§20.1), sem tolerância implementation-defined. O lado "pequeno" NÃO tem limiar numérico
+    /// documentado em lugar algum (runbook, AB-I8-004, ADR ou código-fonte) — AB-I8-006 havia inventado um
+    /// (64 MiB), o que AB-I8-007 rejeitou; esta versão nunca inventa um substituto e, por isso, este cenário
+    /// permanece estruturalmente <see cref="CanaryScenarioStatus.Blocked"/> até que um critério documentado
+    /// para "PST pequeno" exista — nunca Pass por aproximação de engenharia.
     /// </summary>
     public static async Task<CanaryScenarioResult> ResolvePstSizeBoundaryCoverageAsync(
         IPstInspectionStore inspectionStore, TenantScope scope,
@@ -301,17 +315,24 @@ internal static class CanaryScenarioEvidenceResolvers
             ]),
             $"pst-size-boundary:small={small.Id.Value:N}:boundary={boundary.Id.Value:N}");
 
-        if (small.ObservedSizeBytes is not { } smallSize || smallSize > SmallPstMaxBytes)
-        {
-            return CanaryScenarioResult.Create(PstSizeBoundaryCoverageId, CanaryScenarioStatus.Blocked, evidence, "SMALL_ARTIFACT_NOT_SMALL_ENOUGH", observedAt);
-        }
-
         if (boundary.ObservedSizeBytes is not { } boundarySize || boundarySize < BoundaryPstMinBytes)
         {
+            // Único limiar realmente documentado (18 GiB, PartitionPolicy.RunbookTargetPartBytes) — sem
+            // margem/tolerância inventada: 16 GiB (o valor anteriormente aceito) fica abaixo e é Blocked.
             return CanaryScenarioResult.Create(PstSizeBoundaryCoverageId, CanaryScenarioStatus.Blocked, evidence, "BOUNDARY_ARTIFACT_BELOW_THRESHOLD", observedAt);
         }
 
-        return CanaryScenarioResult.Create(PstSizeBoundaryCoverageId, CanaryScenarioStatus.Pass, evidence, reasonCode: string.Empty, observedAt);
+        if (small.ObservedSizeBytes is null)
+        {
+            return CanaryScenarioResult.Create(PstSizeBoundaryCoverageId, CanaryScenarioStatus.Blocked, evidence, "SMALL_ARTIFACT_SIZE_UNAVAILABLE", observedAt);
+        }
+
+        // O lado "boundary" está genuinamente provado (limiar documentado, sem tolerância inventada) — mas
+        // "PST pequeno" não tem nenhum limiar numérico documentado em runbook/ADR/código-fonte para provar o
+        // outro lado do item 178. Fail-closed: nunca Pass fabricando um critério que a autoridade documentada
+        // não define.
+        return CanaryScenarioResult.Create(
+            PstSizeBoundaryCoverageId, CanaryScenarioStatus.Blocked, evidence, "SMALL_PST_THRESHOLD_UNDOCUMENTED", observedAt);
     }
 
     private static CanaryScenarioResult MapRecoveryRecord(

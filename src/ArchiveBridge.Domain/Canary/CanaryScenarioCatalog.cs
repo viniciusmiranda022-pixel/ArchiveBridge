@@ -36,13 +36,17 @@ public static class CanaryScenarioCatalog
     // §48 item 178 — PST pequeno, depois boundary de 18 GB. AB-I8-006: resolvido a partir de DUAS
     // PstInspectionRecord canônicas já persistidas (Slice 4B/IPstInspectionStore.FindCanonicalAsync) — o
     // caller informa os DOIS artefatos candidatos (pequeno + boundary); o resolver nunca aceita o veredito
-    // do caller, apenas os ObservedSizeBytes REAIS de cada inspeção canônica. Sem as duas inspeções
-    // canônicas com tamanhos nos dois lados do boundary, permanece Blocked/NotPerformed — nunca Pass por
-    // afirmação do operador.
+    // do caller, apenas os ObservedSizeBytes REAIS de cada inspeção canônica. AB-I8-007: o lado "boundary" é
+    // verificado contra o ÚNICO limiar de 18 GB REALMENTE documentado no repositório
+    // (PartitionPolicy.RunbookTargetPartBytes, runbook §16.3/§20.1); o lado "pequeno" não tem limiar numérico
+    // documentado em lugar algum, então nunca é inventado — o cenário permanece estruturalmente
+    // Blocked/NotPerformed até que um critério documentado para "PST pequeno" exista, nunca Pass por
+    // afirmação do operador nem por aproximação de engenharia.
     private static readonly CanaryScenarioDefinition PstSizeBoundaryCoverage = Define(
         "CANARY.PST_SIZE_BOUNDARY_COVERAGE", CanaryScenarioEvidenceSource.SystemDerived,
         "PST pequeno e PST no boundary de 18 GB (§48 item 178) — resolvido a partir do tamanho observado de " +
-        "duas PstInspectionRecord canônicas (IPstInspectionStore).");
+        "duas PstInspectionRecord canônicas (IPstInspectionStore); permanece Blocked até existir critério " +
+        "documentado para \"PST pequeno\".");
 
     // §48 item 179 — replay do mesmo PST no mesmo target root. AB-I8-006: resolvido a partir da história
     // REAL de tentativas de upload (IPurviewUploadAttemptStore) do pedido canônico da wave — exige
@@ -64,18 +68,17 @@ public static class CanaryScenarioCatalog
         "guard real de congelamento de destino da wave (MigrationWave.ChangeTargetRootFolder).");
 
     // §48 item 181 — corrupção conhecida e quarantine. AB-I8-006: nenhum store de "quarantine" dedicado
-    // existe hoje neste repositório (runbook §22.3 ainda não implementado) — por isso a evidência Pass
-    // aqui é deliberadamente mais estreita que o texto do runbook: prova que o PST é canonicamente o
-    // artefato esperado (hash bate) E que sua PstInspectionRecord tem StructuralDiagnostic != Valid (a
-    // corrupção foi diagnosticada server-side e o artefato nunca se tornou elegível a transporte), não que
-    // um mecanismo de quarantine operacional foi acionado. Resolvido a partir de
-    // IPstInspectionStore.FindCanonicalAsync — nunca aceita o veredito alegado pelo operador.
+    // existe hoje neste repositório (runbook §22.3 ainda não implementado; grep repo-wide confirma ausência
+    // de qualquer store/estado/ação). AB-I8-006 havia estreitado o SIGNIFICADO do cenário para "nunca se
+    // tornou elegível a transporte" e ainda assim emitido Pass — AB-I8-007 rejeitou isso: o item 181 exige
+    // quarantine, não apenas diagnóstico. Resolvido a partir de IPstInspectionStore.FindCanonicalAsync, mas
+    // NUNCA emite Pass hoje: mesmo com corrupção diagnosticada server-side (evidência canônica anexada), o
+    // resultado é Blocked até que um mecanismo de quarantine real exista e possa ser verificado.
     private static readonly CanaryScenarioDefinition KnownCorruptionQuarantine = Define(
         "CANARY.KNOWN_CORRUPTION_QUARANTINE", CanaryScenarioEvidenceSource.SystemDerived,
-        "Corrupção conhecida nunca se torna elegível a transporte (§48 item 181) — resolvido a partir do " +
-        "StructuralDiagnostic de uma PstInspectionRecord canônica (IPstInspectionStore); nenhum mecanismo de " +
-        "quarantine operacional dedicado existe hoje neste repositório (ver comentário de código para o " +
-        "escopo exato desta evidência).");
+        "Corrupção conhecida deve resultar em quarantine (§48 item 181) — resolvido a partir do " +
+        "StructuralDiagnostic de uma PstInspectionRecord canônica (IPstInspectionStore); permanece Blocked " +
+        "até existir um mecanismo de quarantine real neste repositório, mesmo com corrupção diagnosticada.");
 
     // §48 item 182 — crash recovery. Fonte canônica real já existente (IRecoveryReadinessStore,
     // RecoveryExerciseType.PendingWorkRebuild, I7).

@@ -54,6 +54,8 @@ public sealed class CanaryReclassifiedScenarioIntegrationTests(SqlServerFixture 
 
     private SqlPstInspectionStore Inspections() => new(fixture.Factory);
 
+    private SqlPstCustodyStore Custody() => new(fixture.Factory, Clock);
+
     private AuthorizeCanaryPlanUseCase AuthorizeUseCase(IAuthenticatedActorAccessor? actor = null) =>
         new(Readiness(), Plans(), Clock, actor ?? ApproverActor);
 
@@ -87,30 +89,46 @@ public sealed class CanaryReclassifiedScenarioIntegrationTests(SqlServerFixture 
         return plan.PlanVersion;
     }
 
-    private async Task<PstInspectionRecord> SaveInspectionAsync(
-        TenantScope scope, ArtifactId artifact, Sha256Hash hash, long sizeBytes, PstStructuralDiagnostic diagnostic) =>
+    /// <summary>
+    /// Registra a custódia REAL do artefato (obrigatório pela FK composta
+    /// <c>FK_pst_inspections_artifact -&gt; dbo.pst_artifacts</c>, mesmo mecanismo homologado pela Slice 4B) e só
+    /// então grava a inspeção apontando para o artefato recém-registrado. Retorna o <see cref="ArtifactId"/>
+    /// realmente emitido pela store — nunca um Guid fabricado pelo teste, porque
+    /// <see cref="ArchiveBridge.Contracts.PstProcessing.IPstCustodyStore.RegisterAsync"/> sempre emite sua
+    /// própria identidade, exatamente como em produção.
+    /// </summary>
+    private async Task<ArtifactId> SaveInspectionAsync(
+        TenantScope scope, Sha256Hash hash, long sizeBytes, PstStructuralDiagnostic diagnostic)
+    {
+        var relativePath = new PstRelativePath($"canary/{Guid.NewGuid():N}.pst");
+        var registered = await Custody().RegisterAsync(scope.Tenant, scope.Project, relativePath, hash, sizeBytes, CancellationToken.None);
         await Inspections().SaveAsync(
             PstInspectionRecord.Complete(
-                InspectionId.New(), scope.Tenant, scope.Project, artifact, hash, hash, sizeBytes, diagnostic,
+                InspectionId.New(), scope.Tenant, scope.Project, registered.Id, hash, hash, sizeBytes, diagnostic,
                 PstFormatVariant.Unicode2013Plus, "pst-engine", "1.0.0", CorrelationId.New(), Clock.UtcNow, Clock.UtcNow),
             CancellationToken.None);
+        return registered.Id;
+    }
 
     [Fact]
-    public async Task KnownCorruptionResolvesToPassFromARealCanonicalInspectionAgainstTheSqlStore()
+    public async Task KnownCorruptionAgainstARealCanonicalInspectionNeverBecomesPassWithoutAQuarantineMechanism()
     {
+        // AB-I8-007: nenhum mecanismo de quarantine existe neste repositório — mesmo com uma
+        // PstInspectionRecord CANÔNICA REAL (SQL Server) diagnosticada corrupta, o cenário permanece
+        // Blocked, nunca Pass.
         var scope = SqlServerFixture.NewScope();
         var planVersion = await AuthorizeCanaryPlanAsync(scope);
-        var artifact = new ArtifactId(Guid.NewGuid());
         var hash = new Sha256Hash(new string('c', 64));
-        await SaveInspectionAsync(scope, artifact, hash, 4096, PstStructuralDiagnostic.InvalidSignature);
+        var artifact = await SaveInspectionAsync(scope, hash, 4096, PstStructuralDiagnostic.InvalidSignature);
 
         var result = await CorruptionUseCase().ExecuteAsync(
             new ResolveCanaryPstCorruptionEvidenceCommand(scope, planVersion, artifact, hash, CorrelationId.New()), CancellationToken.None);
 
-        Assert.Equal(CanaryScenarioStatus.Pass, result.Status);
+        Assert.Equal(CanaryScenarioStatus.Blocked, result.Status);
+        Assert.Equal("CORRUPTION_DIAGNOSED_BUT_NO_QUARANTINE_MECHANISM", result.ReasonCode);
         var persisted = await Results().GetLatestAsync(scope, planVersion, new CanaryScenarioId("CANARY.KNOWN_CORRUPTION_QUARANTINE"), CancellationToken.None);
         Assert.NotNull(persisted);
-        Assert.Equal(CanaryScenarioStatus.Pass, persisted!.Status);
+        Assert.Equal(CanaryScenarioStatus.Blocked, persisted!.Status);
     }
 
     [Fact]
@@ -118,9 +136,8 @@ public sealed class CanaryReclassifiedScenarioIntegrationTests(SqlServerFixture 
     {
         var scope = SqlServerFixture.NewScope();
         var planVersion = await AuthorizeCanaryPlanAsync(scope);
-        var artifact = new ArtifactId(Guid.NewGuid());
         var hash = new Sha256Hash(new string('d', 64));
-        await SaveInspectionAsync(scope, artifact, hash, 4096, PstStructuralDiagnostic.Valid);
+        var artifact = await SaveInspectionAsync(scope, hash, 4096, PstStructuralDiagnostic.Valid);
 
         var result = await CorruptionUseCase().ExecuteAsync(
             new ResolveCanaryPstCorruptionEvidenceCommand(scope, planVersion, artifact, hash, CorrelationId.New()), CancellationToken.None);
@@ -132,9 +149,8 @@ public sealed class CanaryReclassifiedScenarioIntegrationTests(SqlServerFixture 
     public async Task AnotherTenantsInspectionNeverResolvesCorruptionEvenWithTheSameArtifactAndHash()
     {
         var ownerScope = SqlServerFixture.NewScope();
-        var artifact = new ArtifactId(Guid.NewGuid());
         var hash = new Sha256Hash(new string('e', 64));
-        await SaveInspectionAsync(ownerScope, artifact, hash, 4096, PstStructuralDiagnostic.InvalidSignature);
+        var artifact = await SaveInspectionAsync(ownerScope, hash, 4096, PstStructuralDiagnostic.InvalidSignature);
 
         var otherScope = SqlServerFixture.NewScope();
         var planVersion = await AuthorizeCanaryPlanAsync(otherScope);
@@ -146,25 +162,27 @@ public sealed class CanaryReclassifiedScenarioIntegrationTests(SqlServerFixture 
     }
 
     [Fact]
-    public async Task PstSizeBoundaryResolvesToPassFromTwoRealCanonicalInspectionsAgainstTheSqlStore()
+    public async Task PstSizeBoundaryAgainstTwoRealCanonicalInspectionsNeverBecomesPassBecauseSmallPstHasNoDocumentedThreshold()
     {
+        // AB-I8-007: mesmo com o lado "boundary" genuinamente provado (>= PartitionPolicy.RunbookTargetPartBytes,
+        // o único limiar de 18 GB REALMENTE documentado) contra a store SQL real, o cenário nunca vira Pass —
+        // "PST pequeno" não tem nenhum limiar numérico documentado em lugar algum.
         var scope = SqlServerFixture.NewScope();
         var planVersion = await AuthorizeCanaryPlanAsync(scope);
-        var smallArtifact = new ArtifactId(Guid.NewGuid());
         var smallHash = new Sha256Hash(new string('1', 64));
-        var boundaryArtifact = new ArtifactId(Guid.NewGuid());
         var boundaryHash = new Sha256Hash(new string('2', 64));
-        await SaveInspectionAsync(scope, smallArtifact, smallHash, 1024, PstStructuralDiagnostic.Valid);
-        await SaveInspectionAsync(scope, boundaryArtifact, boundaryHash, 17L * OneGib, PstStructuralDiagnostic.Valid);
+        var smallArtifact = await SaveInspectionAsync(scope, smallHash, 1024, PstStructuralDiagnostic.Valid);
+        var boundaryArtifact = await SaveInspectionAsync(scope, boundaryHash, 19L * OneGib, PstStructuralDiagnostic.Valid);
 
         var result = await SizeBoundaryUseCase().ExecuteAsync(
             new ResolveCanaryPstSizeBoundaryEvidenceCommand(scope, planVersion, smallArtifact, smallHash, boundaryArtifact, boundaryHash, CorrelationId.New()),
             CancellationToken.None);
 
-        Assert.Equal(CanaryScenarioStatus.Pass, result.Status);
+        Assert.Equal(CanaryScenarioStatus.Blocked, result.Status);
+        Assert.Equal("SMALL_PST_THRESHOLD_UNDOCUMENTED", result.ReasonCode);
         var persisted = await Results().GetLatestAsync(scope, planVersion, new CanaryScenarioId("CANARY.PST_SIZE_BOUNDARY_COVERAGE"), CancellationToken.None);
         Assert.NotNull(persisted);
-        Assert.Equal(CanaryScenarioStatus.Pass, persisted!.Status);
+        Assert.Equal(CanaryScenarioStatus.Blocked, persisted!.Status);
     }
 
     [Fact]
@@ -172,12 +190,10 @@ public sealed class CanaryReclassifiedScenarioIntegrationTests(SqlServerFixture 
     {
         var scope = SqlServerFixture.NewScope();
         var planVersion = await AuthorizeCanaryPlanAsync(scope);
-        var smallArtifact = new ArtifactId(Guid.NewGuid());
         var smallHash = new Sha256Hash(new string('3', 64));
-        var boundaryArtifact = new ArtifactId(Guid.NewGuid());
         var boundaryHash = new Sha256Hash(new string('4', 64));
-        await SaveInspectionAsync(scope, smallArtifact, smallHash, 1024, PstStructuralDiagnostic.Valid);
-        await SaveInspectionAsync(scope, boundaryArtifact, boundaryHash, 1L * OneGib, PstStructuralDiagnostic.Valid);
+        var smallArtifact = await SaveInspectionAsync(scope, smallHash, 1024, PstStructuralDiagnostic.Valid);
+        var boundaryArtifact = await SaveInspectionAsync(scope, boundaryHash, 1L * OneGib, PstStructuralDiagnostic.Valid);
 
         var result = await SizeBoundaryUseCase().ExecuteAsync(
             new ResolveCanaryPstSizeBoundaryEvidenceCommand(scope, planVersion, smallArtifact, smallHash, boundaryArtifact, boundaryHash, CorrelationId.New()),
@@ -192,9 +208,8 @@ public sealed class CanaryReclassifiedScenarioIntegrationTests(SqlServerFixture 
     {
         var scope = SqlServerFixture.NewScope();
         var planVersion = await AuthorizeCanaryPlanAsync(scope);
-        var artifact = new ArtifactId(Guid.NewGuid());
         var hash = new Sha256Hash(new string('f', 64));
-        await SaveInspectionAsync(scope, artifact, hash, 4096, PstStructuralDiagnostic.InvalidSignature);
+        var artifact = await SaveInspectionAsync(scope, hash, 4096, PstStructuralDiagnostic.InvalidSignature);
         var viewerActor = new FakeAuthenticatedActorAccessor("viewer-1@contoso.com", PortalRoles.Viewer);
 
         await Assert.ThrowsAsync<CanaryAuthorizationException>(() => CorruptionUseCase(viewerActor).ExecuteAsync(
