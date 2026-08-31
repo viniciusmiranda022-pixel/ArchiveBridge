@@ -19,13 +19,13 @@ using Xunit;
 namespace ArchiveBridge.Integration.Tests;
 
 /// <summary>
-/// AB-I8-010 (SQL Server real) — <see cref="ComposeMigrationCompletionAssessmentUseCase"/>,
+/// AB-I8-010/AB-I8-011 (SQL Server real) — <see cref="ComposeMigrationCompletionAssessmentUseCase"/>,
 /// <see cref="SubmitMigrationCompletionCriterionAttestationUseCase"/>, <see cref="SqlMigrationCompletionAssessmentStore"/>
 /// e <see cref="SqlMigrationCompletionCriterionAttestationStore"/>: nenhum critério fabricado como Pass sem
-/// evidência real, bloqueio estrutural contra atestar um critério SystemDerived, RBAC server-side, anti-IDOR
-/// cross-tenant, convergência idempotente sob concorrência, e tamper-evidence sobre as tabelas append-only.
-/// NUNCA marca migração/projeto/wave <c>Completed</c>, NUNCA executa decommission/exclusão destrutiva, NUNCA
-/// escreve em Purview/EXO/Graph/EV real (STOP-THE-LINE).
+/// evidência real, bloqueio estrutural contra atestar um critério SystemDerived OU EvidenceDerived (AB-I8-011),
+/// RBAC server-side, anti-IDOR cross-tenant, convergência idempotente sob concorrência, e tamper-evidence sobre
+/// as tabelas append-only. NUNCA marca migração/projeto/wave <c>Completed</c>, NUNCA executa
+/// decommission/exclusão destrutiva, NUNCA escreve em Purview/EXO/Graph/EV real (STOP-THE-LINE).
 /// </summary>
 [Collection(SqlServerCollectionDefinition.Name)]
 public sealed class MigrationCompletionIntegrationTests(SqlServerFixture fixture)
@@ -55,20 +55,27 @@ public sealed class MigrationCompletionIntegrationTests(SqlServerFixture fixture
         public AuthenticatedActor Current { get; } = new(actorId, roles);
     }
 
+    // Os cinco critérios HumanApproval — os únicos que podem ser atestados manualmente (AB-I8-011).
     private static readonly string[] AttestedCriteria =
     [
         "COMPLETION.SCOPE_AND_POLICY_SIGNED",
-        "COMPLETION.SOURCE_DISPOSITION_COMPLETE",
-        "COMPLETION.PARTS_DISPOSITION_COMPLETE",
         "COMPLETION.HOLDS_RETENTION_REVIEWED",
         "COMPLETION.USERS_INACTIVE_HANDLED",
-        "COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM",
         "COMPLETION.ROLLBACK_DECOMMISSION_WINDOW_DEFINED",
         "COMPLETION.CUSTOMER_FINAL_APPROVAL",
-        "COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL",
     ];
 
-    private async Task AttestAllNineCriteriaAsPassAsync(TenantScope scope)
+    // Os quatro critérios EvidenceDerived (AB-I8-011) — tecnicamente objetivos, sem store canônico suficiente
+    // neste repositório; SEMPRE resolvem para NotMeasured com um reason code específico e estável.
+    private static readonly (string CriterionId, string ReasonCode)[] EvidenceDerivedCriteria =
+    [
+        ("COMPLETION.SOURCE_DISPOSITION_COMPLETE", "NO_CANONICAL_SOURCE_DISPOSITION_STORE"),
+        ("COMPLETION.PARTS_DISPOSITION_COMPLETE", "NO_CANONICAL_PARTS_DISPOSITION_STORE"),
+        ("COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM", "NO_CANONICAL_EVIDENCE_PACKAGE_WORM_PUBLICATION_STORE"),
+        ("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL", "NO_CANONICAL_TEMPORARY_CREDENTIAL_REGISTRY"),
+    ];
+
+    private async Task AttestAllHumanApprovalCriteriaAsPassAsync(TenantScope scope)
     {
         foreach (var criterionIdValue in AttestedCriteria)
         {
@@ -95,27 +102,53 @@ public sealed class MigrationCompletionIntegrationTests(SqlServerFixture fixture
     }
 
     [Fact]
-    public async Task WithAllNineAttestableCriteriaSatisfiedTheAssessmentStillBlocksOnTheTwoSystemDerivedOnes()
+    public async Task WithAllFiveHumanApprovalCriteriaSatisfiedTheAssessmentStillBlocksOnSystemDerivedAndEvidenceDerivedOnes()
     {
         var scope = SqlServerFixture.NewScope();
         var wave = new WaveId(Guid.NewGuid());
         var jobName = ArchiveBridge.Domain.TargetIngestion.Purview.ServiceResult.PurviewImportJobName.Compute(scope.Tenant, scope.Project, wave, 1);
-        await AttestAllNineCriteriaAsPassAsync(scope);
+        await AttestAllHumanApprovalCriteriaAsPassAsync(scope);
 
         var assessment = await ComposeUseCase().ExecuteAsync(
             new ComposeMigrationCompletionAssessmentCommand(scope, wave, jobName, CorrelationId.New()), CancellationToken.None);
 
-        // Nenhum reconciliation certificate/service result report real existe para esta onda/plano — os dois
-        // critérios SystemDerived permanecem NotMeasured mesmo com os nove Attested todos Pass (prova
-        // executável de que nada é fabricado por omissão).
+        // Nenhum reconciliation certificate/service result report real existe para esta onda/plano (os dois
+        // critérios SystemDerived) e nenhum store canônico existe para nenhum dos quatro critérios
+        // EvidenceDerived (AB-I8-011) — todos os seis permanecem NotMeasured mesmo com os cinco HumanApproval
+        // todos Pass (prova executável, contra SQL real, de que nada é fabricado por omissão e de que uma
+        // atestação nunca contorna a ausência de um store canônico real).
         Assert.Equal(MigrationCompletionOutcome.Blocked, assessment.Outcome);
-        Assert.Equal(2, assessment.Blockers.Count);
+        Assert.Equal(2 + EvidenceDerivedCriteria.Length, assessment.Blockers.Count);
         Assert.Contains(assessment.Blockers, b => b.CriterionId.Value == "COMPLETION.RECONCILIATION_CLOSED");
         Assert.Contains(assessment.Blockers, b => b.CriterionId.Value == "COMPLETION.PROVIDER_RESULTS_COLLECTED");
+        Assert.All(EvidenceDerivedCriteria, expected =>
+        {
+            var blocker = Assert.Single(assessment.Blockers, b => b.CriterionId.Value == expected.CriterionId);
+            Assert.Equal(ReadinessControlStatus.NotMeasured, blocker.Status);
+            Assert.Equal(expected.ReasonCode, blocker.ReasonCode);
+        });
         Assert.All(AttestedCriteria, criterionIdValue =>
             Assert.Equal(
                 ReadinessControlStatus.Pass,
                 assessment.CriterionResults.Single(r => r.CriterionId.Value == criterionIdValue).Status));
+    }
+
+    [Theory]
+    [InlineData("COMPLETION.SOURCE_DISPOSITION_COMPLETE")]
+    [InlineData("COMPLETION.PARTS_DISPOSITION_COMPLETE")]
+    [InlineData("COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM")]
+    [InlineData("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL")]
+    public async Task AttestingAnEvidenceDerivedCriterionIsRefusedEvenAgainstTheRealStore(string evidenceDerivedCriterionId)
+    {
+        var scope = SqlServerFixture.NewScope();
+
+        await Assert.ThrowsAsync<MigrationCompletionAttestationNotAllowedException>(() => SubmitUseCase().ExecuteAsync(
+            new SubmitMigrationCompletionCriterionAttestationCommand(
+                scope, new MigrationCompletionCriterionId(evidenceDerivedCriterionId), ReadinessControlStatus.Pass,
+                "manual override attempt", ReasonCode: string.Empty, CorrelationId.New()),
+            CancellationToken.None));
+
+        Assert.Null(await Attestations().GetLatestAsync(scope, new MigrationCompletionCriterionId(evidenceDerivedCriterionId), CancellationToken.None));
     }
 
     [Fact]
@@ -198,8 +231,8 @@ public sealed class MigrationCompletionIntegrationTests(SqlServerFixture fixture
     {
         var scope = SqlServerFixture.NewScope();
         var command = new SubmitMigrationCompletionCriterionAttestationCommand(
-            scope, new MigrationCompletionCriterionId("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL"), ReadinessControlStatus.Pass,
-            "credential-registry-review:v1", ReasonCode: string.Empty, CorrelationId.New());
+            scope, new MigrationCompletionCriterionId("COMPLETION.ROLLBACK_DECOMMISSION_WINDOW_DEFINED"), ReadinessControlStatus.Pass,
+            "rollback-window-definition:v1", ReasonCode: string.Empty, CorrelationId.New());
 
         var tasks = Enumerable.Range(0, 5).Select(_ => SubmitUseCase().ExecuteAsync(command, CancellationToken.None));
         var results = await Task.WhenAll(tasks);

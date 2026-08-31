@@ -8,17 +8,21 @@ using ArchiveBridge.Domain.Security;
 namespace ArchiveBridge.Domain.MigrationCompletion;
 
 /// <summary>
-/// Atestação IMUTÁVEL e append-only de UM critério <see cref="MigrationCompletionCriterionEvidenceSource.Attested"/>
-/// de encerramento de migração (AB-I8-010 escopo obrigatório item 7/8) — tenant/project-scoped, tamper-evident
-/// e versionado por (tenant, project, critério). Registra a decisão HUMANA explícita de um ator autorizado
-/// server-side sobre um critério que ainda não possui evidência automatizada (mesmo princípio de
-/// <see cref="ReadinessControlAttestation"/>, Passo 1).
+/// Atestação IMUTÁVEL e append-only de UM critério <see cref="MigrationCompletionCriterionEvidenceSource.HumanApproval"/>
+/// de encerramento de migração (AB-I8-010 escopo obrigatório item 7/8; classificação corrigida por AB-I8-011)
+/// — tenant/project-scoped, tamper-evident e versionado por (tenant, project, critério). Registra a decisão
+/// HUMANA explícita de um ator autorizado server-side sobre um critério GENUINAMENTE processual, sem verdade
+/// técnica automatizável (mesmo princípio de <see cref="ReadinessControlAttestation"/>, Passo 1).
 /// <para>
 /// Bloqueio estrutural (STOP-THE-LINE): <see cref="Create"/> RECUSA qualquer <see cref="MigrationCompletionCriterionId"/>
 /// cuja <see cref="MigrationCompletionCriterionEvidenceSource"/> no catálogo NÃO seja
-/// <see cref="MigrationCompletionCriterionEvidenceSource.Attested"/> — reconciliação fechada e coleta de
+/// <see cref="MigrationCompletionCriterionEvidenceSource.HumanApproval"/> — isso cobre tanto
+/// <see cref="MigrationCompletionCriterionEvidenceSource.SystemDerived"/> (reconciliação fechada e coleta de
 /// resultados do provider NUNCA podem ser "aprovados" por alegação humana, mesmo por um ator com o papel mais
-/// privilegiado.
+/// privilegiado) quanto <see cref="MigrationCompletionCriterionEvidenceSource.EvidenceDerived"/> (um critério
+/// tecnicamente objetivo sem store canônico suficiente — ex. disposition de fontes/parts, publicação WORM,
+/// ausência de credencial temporária — permanece bloqueante ATÉ existir esse store; uma atestação humana NUNCA
+/// pode substituí-lo, AB-I8-011).
 /// </para>
 /// <para>
 /// A persistência é fronteira NÃO CONFIÁVEL: <see cref="Rehydrate"/> recomputa <see cref="RecordHash"/> a
@@ -192,10 +196,13 @@ public sealed record MigrationCompletionCriterionAttestation
 
     /// <summary>
     /// Recusa fail-closed qualquer critério desconhecido ou que não seja
-    /// <see cref="MigrationCompletionCriterionEvidenceSource.Attested"/> (SystemDerived) — a ÚNICA barreira que
-    /// impede atestação manual de sobrescrever evidência automatizada.
+    /// <see cref="MigrationCompletionCriterionEvidenceSource.HumanApproval"/> (ou seja, recusa tanto
+    /// <see cref="MigrationCompletionCriterionEvidenceSource.SystemDerived"/> quanto
+    /// <see cref="MigrationCompletionCriterionEvidenceSource.EvidenceDerived"/>) — a ÚNICA barreira que impede
+    /// atestação manual de sobrescrever evidência automatizada ou de "aprovar" um critério tecnicamente
+    /// objetivo cujo store canônico ainda não existe (AB-I8-011).
     /// </summary>
-    /// <exception cref="MigrationCompletionAttestationNotAllowedException"><paramref name="criterionId"/> desconhecido ou SystemDerived.</exception>
+    /// <exception cref="MigrationCompletionAttestationNotAllowedException"><paramref name="criterionId"/> desconhecido, SystemDerived ou EvidenceDerived.</exception>
     public static void RequireAttestable(MigrationCompletionCriterionId criterionId)
     {
         if (!MigrationCompletionCriterionCatalog.IsKnown(criterionId))
@@ -205,10 +212,10 @@ public sealed record MigrationCompletionCriterionAttestation
         }
 
         var definition = MigrationCompletionCriterionCatalog.Definition(criterionId);
-        if (definition.EvidenceSource != MigrationCompletionCriterionEvidenceSource.Attested)
+        if (definition.EvidenceSource != MigrationCompletionCriterionEvidenceSource.HumanApproval)
         {
             throw new MigrationCompletionAttestationNotAllowedException(
-                $"O critério {criterionId.Value} é SystemDerived — nunca pode ser aprovado por atestação manual (bloqueio estrutural).");
+                $"O critério {criterionId.Value} é {definition.EvidenceSource} — nunca pode ser aprovado por atestação manual (bloqueio estrutural).");
         }
     }
 

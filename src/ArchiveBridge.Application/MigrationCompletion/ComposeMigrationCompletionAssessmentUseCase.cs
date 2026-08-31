@@ -25,14 +25,19 @@ public sealed record ComposeMigrationCompletionAssessmentCommand(
 
 /// <summary>
 /// Compõe (ou converge idempotentemente para) a versão VIGENTE da avaliação de encerramento de migração de um
-/// tenant/projeto (AB-I8-010, escopo obrigatório itens 7-8). Resolve <c>COMPLETION.RECONCILIATION_CLOSED</c> a
-/// partir do reconciliation certificate canônico e vigente (<see cref="IReconciliationCertificateStore"/>, I6)
-/// e <c>COMPLETION.PROVIDER_RESULTS_COLLECTED</c> a partir do validation report/service result mais recente já
-/// importado (<see cref="IPurviewServiceResultReportStore"/>, I6); para os nove demais critérios, a atestação
-/// manual vigente (se houver) — ausente permanece <c>NotMeasured</c> por default no avaliador (nunca
-/// fabricado). Delega a agregação PURA para <see cref="MigrationCompletionAssessment.Compose"/>. NUNCA marca
-/// migração/projeto/wave <c>Completed</c>, NUNCA executa decommission/exclusão destrutiva, NUNCA escreve em
-/// Purview/EXO/Graph/EV real (STOP-THE-LINE).
+/// tenant/projeto (AB-I8-010, escopo obrigatório itens 7-8; classificação corrigida por AB-I8-011). Resolve
+/// <c>COMPLETION.RECONCILIATION_CLOSED</c> a partir do reconciliation certificate canônico e vigente
+/// (<see cref="IReconciliationCertificateStore"/>, I6) e <c>COMPLETION.PROVIDER_RESULTS_COLLECTED</c> a partir
+/// do validation report/service result mais recente já importado (<see cref="IPurviewServiceResultReportStore"/>,
+/// I6) — os dois únicos critérios <c>SystemDerived</c>. Resolve os quatro critérios <c>EvidenceDerived</c>
+/// (disposition de fontes/parts, publicação WORM, ausência de credencial temporária) SEMPRE como
+/// <c>NotMeasured</c> com um reason code específico e estável (AB-I8-011: nenhum store canônico suficiente
+/// existe hoje neste repositório para nenhum deles — a resolução correta e fail-closed é permanecer bloqueante,
+/// nunca um resolver parcial/heurístico e nunca uma atestação humana). Para os cinco critérios
+/// <c>HumanApproval</c> restantes, aplica a atestação manual vigente (se houver) — ausente permanece
+/// <c>NotMeasured</c> por default no avaliador (nunca fabricado). Delega a agregação PURA para
+/// <see cref="MigrationCompletionAssessment.Compose"/>. NUNCA marca migração/projeto/wave <c>Completed</c>,
+/// NUNCA executa decommission/exclusão destrutiva, NUNCA escreve em Purview/EXO/Graph/EV real (STOP-THE-LINE).
 /// </summary>
 public sealed class ComposeMigrationCompletionAssessmentUseCase(
     IReconciliationCertificateStore reconciliationStore,
@@ -44,6 +49,21 @@ public sealed class ComposeMigrationCompletionAssessmentUseCase(
 {
     private static readonly MigrationCompletionCriterionId ReconciliationClosedId = new("COMPLETION.RECONCILIATION_CLOSED");
     private static readonly MigrationCompletionCriterionId ProviderResultsCollectedId = new("COMPLETION.PROVIDER_RESULTS_COLLECTED");
+
+    // AB-I8-011: os quatro critérios EvidenceDerived — verdade técnica/objetiva, mas SEM store canônico
+    // suficiente neste repositório hoje. Cada um resolve SEMPRE para NotMeasured com um reason code específico
+    // (nunca o genérico "CRITERION_EVIDENCE_MISSING" sintetizado pelo avaliador para uma chave simplesmente
+    // ausente) — auditável, estável, e nunca satisfeito por atestação (bloqueio estrutural em
+    // MigrationCompletionCriterionAttestation.RequireAttestable). Substituir CADA UM destes por um resolver real
+    // é trabalho de um slice futuro, quando o store canônico correspondente existir — nunca por enfraquecer
+    // esta classificação de volta para HumanApproval/Attested.
+    private static readonly (MigrationCompletionCriterionId Id, string ReasonCode)[] NotYetVerifiableEvidenceDerivedCriteria =
+    [
+        (new MigrationCompletionCriterionId("COMPLETION.SOURCE_DISPOSITION_COMPLETE"), "NO_CANONICAL_SOURCE_DISPOSITION_STORE"),
+        (new MigrationCompletionCriterionId("COMPLETION.PARTS_DISPOSITION_COMPLETE"), "NO_CANONICAL_PARTS_DISPOSITION_STORE"),
+        (new MigrationCompletionCriterionId("COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM"), "NO_CANONICAL_EVIDENCE_PACKAGE_WORM_PUBLICATION_STORE"),
+        (new MigrationCompletionCriterionId("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL"), "NO_CANONICAL_TEMPORARY_CREDENTIAL_REGISTRY"),
+    ];
 
     /// <exception cref="MigrationCompletionAuthorizationException">Ator anônimo ou nenhum papel efetivo autorizado.</exception>
     /// <exception cref="InvalidOperationException">Nenhum principal autenticado válido no contexto atual.</exception>
@@ -69,8 +89,16 @@ public sealed class ComposeMigrationCompletionAssessmentUseCase(
             .ConfigureAwait(false);
         Add(ResolveProviderResultsCollected(report, now));
 
-        // Attested — atestação manual VIGENTE de cada critério já atestado; ausente permanece NotMeasured por
-        // default no avaliador (nunca fabricado aqui).
+        // EvidenceDerived — sempre NotMeasured (AB-I8-011): nenhum store canônico suficiente existe hoje para
+        // nenhum destes quatro critérios; nunca resolvido por atestação (ver RequireAttestable) nem por
+        // heurística parcial.
+        foreach (var (criterionId, reasonCode) in NotYetVerifiableEvidenceDerivedCriteria)
+        {
+            Add(MigrationCompletionCriterionResult.NotMeasured(criterionId, reasonCode, now));
+        }
+
+        // HumanApproval — atestação manual VIGENTE de cada critério já atestado; ausente permanece NotMeasured
+        // por default no avaliador (nunca fabricado aqui).
         var attestations = await attestationStore.GetLatestForAllAsync(command.Scope, cancellationToken).ConfigureAwait(false);
         foreach (var attestation in attestations)
         {
@@ -80,7 +108,7 @@ public sealed class ComposeMigrationCompletionAssessmentUseCase(
             }
 
             var definition = MigrationCompletionCriterionCatalog.Definition(attestation.CriterionId);
-            if (definition.EvidenceSource != MigrationCompletionCriterionEvidenceSource.Attested)
+            if (definition.EvidenceSource != MigrationCompletionCriterionEvidenceSource.HumanApproval)
             {
                 continue;
             }
