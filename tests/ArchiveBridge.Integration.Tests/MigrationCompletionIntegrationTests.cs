@@ -19,13 +19,13 @@ using Xunit;
 namespace ArchiveBridge.Integration.Tests;
 
 /// <summary>
-/// AB-I8-010/AB-I8-011 (SQL Server real) — <see cref="ComposeMigrationCompletionAssessmentUseCase"/>,
+/// AB-I8-010/AB-I8-011/AB-I8-012 (SQL Server real) — <see cref="ComposeMigrationCompletionAssessmentUseCase"/>,
 /// <see cref="SubmitMigrationCompletionCriterionAttestationUseCase"/>, <see cref="SqlMigrationCompletionAssessmentStore"/>
 /// e <see cref="SqlMigrationCompletionCriterionAttestationStore"/>: nenhum critério fabricado como Pass sem
-/// evidência real, bloqueio estrutural contra atestar um critério SystemDerived OU EvidenceDerived (AB-I8-011),
-/// RBAC server-side, anti-IDOR cross-tenant, convergência idempotente sob concorrência, e tamper-evidence sobre
-/// as tabelas append-only. NUNCA marca migração/projeto/wave <c>Completed</c>, NUNCA executa
-/// decommission/exclusão destrutiva, NUNCA escreve em Purview/EXO/Graph/EV real (STOP-THE-LINE).
+/// evidência real, bloqueio estrutural contra atestar um critério SystemDerived OU EvidenceDerived
+/// (AB-I8-011/AB-I8-012), RBAC server-side, anti-IDOR cross-tenant, convergência idempotente sob concorrência,
+/// e tamper-evidence sobre as tabelas append-only. NUNCA marca migração/projeto/wave <c>Completed</c>, NUNCA
+/// executa decommission/exclusão destrutiva, NUNCA escreve em Purview/EXO/Graph/EV real (STOP-THE-LINE).
 /// </summary>
 [Collection(SqlServerCollectionDefinition.Name)]
 public sealed class MigrationCompletionIntegrationTests(SqlServerFixture fixture)
@@ -55,24 +55,24 @@ public sealed class MigrationCompletionIntegrationTests(SqlServerFixture fixture
         public AuthenticatedActor Current { get; } = new(actorId, roles);
     }
 
-    // Os cinco critérios HumanApproval — os únicos que podem ser atestados manualmente (AB-I8-011).
+    // Os quatro critérios HumanApproval — os únicos que podem ser atestados manualmente (AB-I8-011/AB-I8-012).
     private static readonly string[] AttestedCriteria =
     [
         "COMPLETION.SCOPE_AND_POLICY_SIGNED",
         "COMPLETION.HOLDS_RETENTION_REVIEWED",
-        "COMPLETION.USERS_INACTIVE_HANDLED",
         "COMPLETION.ROLLBACK_DECOMMISSION_WINDOW_DEFINED",
         "COMPLETION.CUSTOMER_FINAL_APPROVAL",
     ];
 
-    // Os quatro critérios EvidenceDerived (AB-I8-011) — tecnicamente objetivos, sem store canônico suficiente
-    // neste repositório; SEMPRE resolvem para NotMeasured com um reason code específico e estável.
+    // Os cinco critérios EvidenceDerived (AB-I8-011/AB-I8-012) — tecnicamente objetivos, sem store canônico
+    // suficiente neste repositório; SEMPRE resolvem para NotMeasured com um reason code específico e estável.
     private static readonly (string CriterionId, string ReasonCode)[] EvidenceDerivedCriteria =
     [
         ("COMPLETION.SOURCE_DISPOSITION_COMPLETE", "NO_CANONICAL_SOURCE_DISPOSITION_STORE"),
         ("COMPLETION.PARTS_DISPOSITION_COMPLETE", "NO_CANONICAL_PARTS_DISPOSITION_STORE"),
         ("COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM", "NO_CANONICAL_EVIDENCE_PACKAGE_WORM_PUBLICATION_STORE"),
         ("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL", "NO_CANONICAL_TEMPORARY_CREDENTIAL_REGISTRY"),
+        ("COMPLETION.USERS_INACTIVE_HANDLED", "NO_CANONICAL_USER_INACTIVE_DISPOSITION_STORE"),
     ];
 
     private async Task AttestAllHumanApprovalCriteriaAsPassAsync(TenantScope scope)
@@ -102,7 +102,7 @@ public sealed class MigrationCompletionIntegrationTests(SqlServerFixture fixture
     }
 
     [Fact]
-    public async Task WithAllFiveHumanApprovalCriteriaSatisfiedTheAssessmentStillBlocksOnSystemDerivedAndEvidenceDerivedOnes()
+    public async Task WithAllFourHumanApprovalCriteriaSatisfiedTheAssessmentStillBlocksOnSystemDerivedAndEvidenceDerivedOnes()
     {
         var scope = SqlServerFixture.NewScope();
         var wave = new WaveId(Guid.NewGuid());
@@ -113,10 +113,10 @@ public sealed class MigrationCompletionIntegrationTests(SqlServerFixture fixture
             new ComposeMigrationCompletionAssessmentCommand(scope, wave, jobName, CorrelationId.New()), CancellationToken.None);
 
         // Nenhum reconciliation certificate/service result report real existe para esta onda/plano (os dois
-        // critérios SystemDerived) e nenhum store canônico existe para nenhum dos quatro critérios
-        // EvidenceDerived (AB-I8-011) — todos os seis permanecem NotMeasured mesmo com os cinco HumanApproval
-        // todos Pass (prova executável, contra SQL real, de que nada é fabricado por omissão e de que uma
-        // atestação nunca contorna a ausência de um store canônico real).
+        // critérios SystemDerived) e nenhum store canônico existe para nenhum dos cinco critérios
+        // EvidenceDerived (AB-I8-011/AB-I8-012) — todos os sete permanecem NotMeasured mesmo com os quatro
+        // HumanApproval todos Pass (prova executável, contra SQL real, de que nada é fabricado por omissão e
+        // de que uma atestação nunca contorna a ausência de um store canônico real).
         Assert.Equal(MigrationCompletionOutcome.Blocked, assessment.Outcome);
         Assert.Equal(2 + EvidenceDerivedCriteria.Length, assessment.Blockers.Count);
         Assert.Contains(assessment.Blockers, b => b.CriterionId.Value == "COMPLETION.RECONCILIATION_CLOSED");
@@ -138,6 +138,7 @@ public sealed class MigrationCompletionIntegrationTests(SqlServerFixture fixture
     [InlineData("COMPLETION.PARTS_DISPOSITION_COMPLETE")]
     [InlineData("COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM")]
     [InlineData("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL")]
+    [InlineData("COMPLETION.USERS_INACTIVE_HANDLED")]
     public async Task AttestingAnEvidenceDerivedCriterionIsRefusedEvenAgainstTheRealStore(string evidenceDerivedCriterionId)
     {
         var scope = SqlServerFixture.NewScope();

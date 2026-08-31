@@ -11,11 +11,12 @@ using Canary = ArchiveBridge.Application.Tests.Canary;
 namespace ArchiveBridge.Application.Tests.MigrationCompletion;
 
 /// <summary>
-/// AB-I8-010/AB-I8-011 — <see cref="SubmitMigrationCompletionCriterionAttestationUseCase"/>: RBAC server-side,
-/// bloqueio estrutural contra atestar um critério SystemDerived OU EvidenceDerived (AB-I8-011: disposition de
-/// fontes/parts, publicação WORM, ausência de credencial temporária — técnicos/objetivos, sem store canônico
-/// suficiente), e Pass exige evidência real (nunca aprovação implícita — escopo obrigatório item 8, aplicável
-/// explicitamente a "cliente aprovou relatório final" e a "janela de rollback/decommission definida").
+/// AB-I8-010/AB-I8-011/AB-I8-012 — <see cref="SubmitMigrationCompletionCriterionAttestationUseCase"/>: RBAC
+/// server-side, bloqueio estrutural contra atestar um critério SystemDerived OU EvidenceDerived (AB-I8-011/
+/// AB-I8-012: disposition de fontes/parts, publicação WORM, ausência de credencial temporária, tratamento de
+/// usuários/inativos — técnicos/objetivos, sem store canônico suficiente), e Pass exige evidência real (nunca
+/// aprovação implícita — escopo obrigatório item 8, aplicável explicitamente a "cliente aprovou relatório
+/// final" e a "janela de rollback/decommission definida").
 /// </summary>
 public sealed class SubmitMigrationCompletionCriterionAttestationUseCaseTests
 {
@@ -70,14 +71,16 @@ public sealed class SubmitMigrationCompletionCriterionAttestationUseCaseTests
         Assert.Empty(await store.GetLatestForAllAsync(NewScope(), CancellationToken.None));
     }
 
-    // AB-I8-011: os quatro critérios EvidenceDerived são tecnicamente objetivos e este repositório ainda não
-    // possui um store canônico suficiente para nenhum deles — uma atestação humana, mesmo de um ator
-    // autorizado, NUNCA pode substituir essa ausência (mesmo bloqueio estrutural de um critério SystemDerived).
+    // AB-I8-011/AB-I8-012: os cinco critérios EvidenceDerived são tecnicamente objetivos e este repositório
+    // ainda não possui um store canônico suficiente para nenhum deles — uma atestação humana, mesmo de um
+    // ator autorizado, NUNCA pode substituir essa ausência (mesmo bloqueio estrutural de um critério
+    // SystemDerived).
     [Theory]
     [InlineData("COMPLETION.SOURCE_DISPOSITION_COMPLETE")]
     [InlineData("COMPLETION.PARTS_DISPOSITION_COMPLETE")]
     [InlineData("COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM")]
     [InlineData("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL")]
+    [InlineData("COMPLETION.USERS_INACTIVE_HANDLED")]
     public async Task AttestingAnEvidenceDerivedCriterionIsRefused(string evidenceDerivedCriterionId)
     {
         var store = new InMemoryMigrationCompletionCriterionAttestationStore();

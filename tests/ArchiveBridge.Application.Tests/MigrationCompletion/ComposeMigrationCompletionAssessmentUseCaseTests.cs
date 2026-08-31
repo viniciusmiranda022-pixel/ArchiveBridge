@@ -15,11 +15,12 @@ using Canary = ArchiveBridge.Application.Tests.Canary;
 namespace ArchiveBridge.Application.Tests.MigrationCompletion;
 
 /// <summary>
-/// AB-I8-010/AB-I8-011 — <see cref="ComposeMigrationCompletionAssessmentUseCase"/>: RBAC server-side, nenhum
-/// critério fabricado como Pass sem evidência real, cada critério ausente individualmente bloqueia
-/// <c>Eligible</c>, reconciliation Inconclusive/Fail/evidência incompleta bloqueia mesmo com todos os demais
-/// Pass, replay idêntico converge, e os quatro critérios EvidenceDerived (AB-I8-011) permanecem bloqueantes
-/// mesmo quando TODOS os demais critérios estão satisfeitos — nunca satisfeitos por atestação.
+/// AB-I8-010/AB-I8-011/AB-I8-012 — <see cref="ComposeMigrationCompletionAssessmentUseCase"/>: RBAC
+/// server-side, nenhum critério fabricado como Pass sem evidência real, cada critério ausente individualmente
+/// bloqueia <c>Eligible</c>, reconciliation Inconclusive/Fail/evidência incompleta bloqueia mesmo com todos os
+/// demais Pass, replay idêntico converge, e os cinco critérios EvidenceDerived (AB-I8-011/AB-I8-012)
+/// permanecem bloqueantes mesmo quando TODOS os demais critérios estão satisfeitos — nunca satisfeitos por
+/// atestação.
 /// </summary>
 public sealed class ComposeMigrationCompletionAssessmentUseCaseTests
 {
@@ -39,25 +40,25 @@ public sealed class ComposeMigrationCompletionAssessmentUseCaseTests
             new(ReconciliationStore, ServiceResultStore, AttestationStore, AssessmentStore, new Canary.FixedClock(Now), actorAccessor);
     }
 
-    // Os cinco critérios HumanApproval — os únicos que podem ser atestados manualmente (AB-I8-011).
+    // Os quatro critérios HumanApproval — os únicos que podem ser atestados manualmente (AB-I8-011/AB-I8-012).
     private static readonly string[] AttestedCriteria =
     [
         "COMPLETION.SCOPE_AND_POLICY_SIGNED",
         "COMPLETION.HOLDS_RETENTION_REVIEWED",
-        "COMPLETION.USERS_INACTIVE_HANDLED",
         "COMPLETION.ROLLBACK_DECOMMISSION_WINDOW_DEFINED",
         "COMPLETION.CUSTOMER_FINAL_APPROVAL",
     ];
 
-    // Os quatro critérios EvidenceDerived (AB-I8-011) — tecnicamente objetivos, sem store canônico suficiente
-    // neste repositório; permanecem SEMPRE NotMeasured com um reason code específico e estável, nunca
-    // satisfeitos por atestação.
+    // Os cinco critérios EvidenceDerived (AB-I8-011/AB-I8-012) — tecnicamente objetivos, sem store canônico
+    // suficiente neste repositório; permanecem SEMPRE NotMeasured com um reason code específico e estável,
+    // nunca satisfeitos por atestação.
     private static readonly (string CriterionId, string ReasonCode)[] EvidenceDerivedCriteria =
     [
         ("COMPLETION.SOURCE_DISPOSITION_COMPLETE", "NO_CANONICAL_SOURCE_DISPOSITION_STORE"),
         ("COMPLETION.PARTS_DISPOSITION_COMPLETE", "NO_CANONICAL_PARTS_DISPOSITION_STORE"),
         ("COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM", "NO_CANONICAL_EVIDENCE_PACKAGE_WORM_PUBLICATION_STORE"),
         ("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL", "NO_CANONICAL_TEMPORARY_CREDENTIAL_REGISTRY"),
+        ("COMPLETION.USERS_INACTIVE_HANDLED", "NO_CANONICAL_USER_INACTIVE_DISPOSITION_STORE"),
     ];
 
     private static void SeedAllAttestedCriteriaAsPass(InMemoryMigrationCompletionCriterionAttestationStore store, TenantScope scope)
@@ -135,9 +136,9 @@ public sealed class ComposeMigrationCompletionAssessmentUseCaseTests
         Assert.Equal(11, assessment.Blockers.Count);
     }
 
-    // AB-I8-011: com os dois SystemDerived e os cinco HumanApproval TODOS satisfeitos, a avaliação permanece
-    // Blocked — os quatro critérios EvidenceDerived não têm store canônico neste repositório, então NUNCA
-    // podem convergir para Eligible por meio deste caminho (prova executável de que nada é fabricado por
+    // AB-I8-011/AB-I8-012: com os dois SystemDerived e os quatro HumanApproval TODOS satisfeitos, a avaliação
+    // permanece Blocked — os cinco critérios EvidenceDerived não têm store canônico neste repositório, então
+    // NUNCA podem convergir para Eligible por meio deste caminho (prova executável de que nada é fabricado por
     // omissão, e de que uma atestação não pode contornar a ausência de um store canônico real).
     [Fact]
     public async Task EvenWithSystemDerivedAndAllHumanApprovalCriteriaSatisfiedTheEvidenceDerivedCriteriaStillBlock()
@@ -163,20 +164,21 @@ public sealed class ComposeMigrationCompletionAssessmentUseCaseTests
             Assert.Equal(expected.ReasonCode, blocker.ReasonCode);
         });
 
-        // Os SystemDerived e os cinco HumanApproval de fato passaram — só os quatro EvidenceDerived bloqueiam.
+        // Os SystemDerived e os quatro HumanApproval de fato passaram — só os cinco EvidenceDerived bloqueiam.
         Assert.Equal(ReadinessControlStatus.Pass, assessment.CriterionResults.Single(r => r.CriterionId.Value == "COMPLETION.RECONCILIATION_CLOSED").Status);
         Assert.Equal(ReadinessControlStatus.Pass, assessment.CriterionResults.Single(r => r.CriterionId.Value == "COMPLETION.PROVIDER_RESULTS_COLLECTED").Status);
         Assert.All(AttestedCriteria, criterionIdValue =>
             Assert.Equal(ReadinessControlStatus.Pass, assessment.CriterionResults.Single(r => r.CriterionId.Value == criterionIdValue).Status));
     }
 
-    // AB-I8-011 item 6: tentar atestar qualquer um dos quatro critérios EvidenceDerived é recusado — nunca
-    // silenciosamente ignorado nem convertido em Pass — mesmo por um ator autorizado a atestar os demais.
+    // AB-I8-011 item 6/AB-I8-012: tentar atestar qualquer um dos cinco critérios EvidenceDerived é recusado —
+    // nunca silenciosamente ignorado nem convertido em Pass — mesmo por um ator autorizado a atestar os demais.
     [Theory]
     [InlineData("COMPLETION.SOURCE_DISPOSITION_COMPLETE")]
     [InlineData("COMPLETION.PARTS_DISPOSITION_COMPLETE")]
     [InlineData("COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM")]
     [InlineData("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL")]
+    [InlineData("COMPLETION.USERS_INACTIVE_HANDLED")]
     public void AnEvidenceDerivedCriterionCanNeverBeConstructedAsAnAttestationRegardlessOfActorPrivilege(string evidenceDerivedCriterionId)
     {
         var scope = NewScope();

@@ -21,8 +21,8 @@ namespace ArchiveBridge.Domain.MigrationCompletion;
 /// resultados do provider NUNCA podem ser "aprovados" por alegação humana, mesmo por um ator com o papel mais
 /// privilegiado) quanto <see cref="MigrationCompletionCriterionEvidenceSource.EvidenceDerived"/> (um critério
 /// tecnicamente objetivo sem store canônico suficiente — ex. disposition de fontes/parts, publicação WORM,
-/// ausência de credencial temporária — permanece bloqueante ATÉ existir esse store; uma atestação humana NUNCA
-/// pode substituí-lo, AB-I8-011).
+/// ausência de credencial temporária, tratamento de usuários/inativos — permanece bloqueante ATÉ existir esse
+/// store; uma atestação humana NUNCA pode substituí-lo, AB-I8-011/AB-I8-012).
 /// </para>
 /// <para>
 /// A persistência é fronteira NÃO CONFIÁVEL: <see cref="Rehydrate"/> recomputa <see cref="RecordHash"/> a

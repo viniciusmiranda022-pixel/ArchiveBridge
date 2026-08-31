@@ -8,12 +8,12 @@ using Xunit;
 namespace ArchiveBridge.Domain.Tests.MigrationCompletion;
 
 /// <summary>
-/// AB-I8-010/AB-I8-011 — <see cref="MigrationCompletionCriterionAttestation"/>: bloqueio estrutural contra
-/// atestar um critério SystemDerived (reconciliação/resultados do provider) OU EvidenceDerived (disposition de
-/// fontes/parts, publicação WORM, ausência de credencial temporária — técnicos/objetivos, sem store canônico
-/// suficiente, AB-I8-011) e contra aprovação implícita (Pass sem evidência real) — escopo obrigatório item 8:
-/// "aprovação do cliente deve ser evidência auditável; ausência de evidência não pode virar aprovação
-/// implícita".
+/// AB-I8-010/AB-I8-011/AB-I8-012 — <see cref="MigrationCompletionCriterionAttestation"/>: bloqueio estrutural
+/// contra atestar um critério SystemDerived (reconciliação/resultados do provider) OU EvidenceDerived
+/// (disposition de fontes/parts, publicação WORM, ausência de credencial temporária, tratamento de
+/// usuários/inativos — técnicos/objetivos, sem store canônico suficiente, AB-I8-011/AB-I8-012) e contra
+/// aprovação implícita (Pass sem evidência real) — escopo obrigatório item 8: "aprovação do cliente deve ser
+/// evidência auditável; ausência de evidência não pode virar aprovação implícita".
 /// </summary>
 public sealed class MigrationCompletionCriterionAttestationTests
 {
@@ -33,14 +33,15 @@ public sealed class MigrationCompletionCriterionAttestationTests
             "Administrator", CorrelationId.New(), Now));
     }
 
-    // AB-I8-011: critérios tecnicamente objetivos sem store canônico suficiente neste repositório — uma
-    // atestação humana NUNCA pode substituir a ausência desse store, mesmo por um ator com o papel mais
+    // AB-I8-011/AB-I8-012: critérios tecnicamente objetivos sem store canônico suficiente neste repositório —
+    // uma atestação humana NUNCA pode substituir a ausência desse store, mesmo por um ator com o papel mais
     // privilegiado (mesmo bloqueio estrutural de um critério SystemDerived).
     [Theory]
     [InlineData("COMPLETION.SOURCE_DISPOSITION_COMPLETE")]
     [InlineData("COMPLETION.PARTS_DISPOSITION_COMPLETE")]
     [InlineData("COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM")]
     [InlineData("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL")]
+    [InlineData("COMPLETION.USERS_INACTIVE_HANDLED")]
     public void CreateThrowsForAnEvidenceDerivedCriterion(string evidenceDerivedCriterionId)
     {
         Assert.Throws<MigrationCompletionAttestationNotAllowedException>(() => MigrationCompletionCriterionAttestation.Create(

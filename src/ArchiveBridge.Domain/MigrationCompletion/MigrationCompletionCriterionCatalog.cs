@@ -24,6 +24,13 @@ namespace ArchiveBridge.Domain.MigrationCompletion;
 /// <see cref="MigrationCompletionCriterionEvidenceSource.EvidenceDerived"/> — permanentemente bloqueantes
 /// (nunca satisfeitos por atestação) até que um store real seja implementado em um slice futuro.
 /// </para>
+/// <para>
+/// AB-I8-012 (correção adicional sobre AB-I8-011): a revisão independente subsequente encontrou o mesmo
+/// blocker semântico ainda residual em <c>COMPLETION.USERS_INACTIVE_HANDLED</c> — "tratados conforme
+/// mapeamento" é um fato técnico/objetivo, não uma decisão humana, então a ausência de store canônico o torna
+/// <see cref="MigrationCompletionCriterionEvidenceSource.EvidenceDerived"/> (permanentemente bloqueante), não
+/// <see cref="MigrationCompletionCriterionEvidenceSource.HumanApproval"/>.
+/// </para>
 /// </summary>
 public static class MigrationCompletionCriterionCatalog
 {
@@ -84,13 +91,18 @@ public static class MigrationCompletionCriterionCatalog
         "COMPLETION.HOLDS_RETENTION_REVIEWED", MigrationCompletionCriterionEvidenceSource.HumanApproval,
         "Holds/retention foram revisados pelo owner (§49).");
 
-    // §49 bullet 7 — usuários e inativos foram tratados conforme mapeamento. AB-I8-011 item 5: nenhum store de
-    // mapeamento usuário-a-tratamento/inativo existe neste repositório (MappingDocument/MappingCsv modelam
-    // mapeamento de pasta/caixa de destino, não disposition de usuário/inativo) — "tratados conforme
-    // mapeamento" permanece uma confirmação genuinamente processual do operador. Permanece HumanApproval.
+    // §49 bullet 7 — usuários e inativos foram tratados conforme mapeamento. AB-I8-012 (corrigindo AB-I8-011
+    // item 5): "tratados conforme mapeamento" afirma um fato operacional TÉCNICO/objetivo (o tratamento
+    // realmente ocorreu conforme o mapeamento), não uma opinião humana — pelo próprio princípio do AB-I8-011,
+    // a ausência de um store canônico suficiente (MappingDocument/MappingCsv modelam mapeamento de
+    // pasta/caixa de destino, não disposition de usuário/inativo; nenhum UserMapping/InactiveUser/
+    // UserDisposition existe neste repositório) NÃO transforma esse fato técnico em decisão humana — deve
+    // permanecer bloqueante (EvidenceDerived, NotMeasured) até existir uma fonte canônica verificável, nunca
+    // Pass por atestação isolada.
     private static readonly MigrationCompletionCriterionDefinition UsersInactiveHandled = Define(
-        "COMPLETION.USERS_INACTIVE_HANDLED", MigrationCompletionCriterionEvidenceSource.HumanApproval,
-        "Usuários e inativos foram tratados conforme mapeamento (§49).");
+        "COMPLETION.USERS_INACTIVE_HANDLED", MigrationCompletionCriterionEvidenceSource.EvidenceDerived,
+        "Usuários e inativos foram tratados conforme mapeamento (§49) — sem store canônico de disposition de " +
+        "usuário/inativo neste repositório; permanece NotMeasured até existir fonte de evidência verificável (AB-I8-012).");
 
     // §49 bullet 8 — pacote de evidência foi assinado e publicado WORM. AB-I8-011 item 1/3: verdade
     // TÉCNICA/objetiva (foi ou não publicado em WORM com assinatura real) — uma evidence ref humana NÃO prova

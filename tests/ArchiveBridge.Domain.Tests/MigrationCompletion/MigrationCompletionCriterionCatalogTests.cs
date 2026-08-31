@@ -4,9 +4,10 @@ using Xunit;
 namespace ArchiveBridge.Domain.Tests.MigrationCompletion;
 
 /// <summary>
-/// AB-I8-010/AB-I8-011 — <see cref="MigrationCompletionCriterionCatalog"/>: identidade estável, cobertura fixa
-/// dos onze critérios do §49, e a classificação SystemDerived/EvidenceDerived/HumanApproval corrigida por
-/// AB-I8-011 (nenhum critério tecnicamente objetivo pode permanecer mascarado sob um "Attested" genérico).
+/// AB-I8-010/AB-I8-011/AB-I8-012 — <see cref="MigrationCompletionCriterionCatalog"/>: identidade estável,
+/// cobertura fixa dos onze critérios do §49, e a classificação SystemDerived/EvidenceDerived/HumanApproval
+/// corrigida por AB-I8-011 e AB-I8-012 (nenhum critério tecnicamente objetivo pode permanecer mascarado sob um
+/// "Attested"/"HumanApproval" genérico).
 /// </summary>
 public sealed class MigrationCompletionCriterionCatalogTests
 {
@@ -47,15 +48,16 @@ public sealed class MigrationCompletionCriterionCatalogTests
         Assert.Equal(MigrationCompletionCriterionEvidenceSource.SystemDerived, definition.EvidenceSource);
     }
 
-    // AB-I8-011: critérios tecnicamente/objetivamente verificáveis, mas para os quais este repositório NÃO
-    // expõe hoje um store canônico suficiente — nunca satisfeitos por atestação humana, permanentemente
-    // NotMeasured até que um store real seja implementado.
+    // AB-I8-011/AB-I8-012: critérios tecnicamente/objetivamente verificáveis, mas para os quais este
+    // repositório NÃO expõe hoje um store canônico suficiente — nunca satisfeitos por atestação humana,
+    // permanentemente NotMeasured até que um store real seja implementado.
     [Theory]
     [InlineData("COMPLETION.SOURCE_DISPOSITION_COMPLETE")]
     [InlineData("COMPLETION.PARTS_DISPOSITION_COMPLETE")]
     [InlineData("COMPLETION.EVIDENCE_PACKAGE_PUBLISHED_WORM")]
     [InlineData("COMPLETION.NO_ACTIVE_TEMPORARY_CREDENTIAL")]
-    public void TheFourEvidenceDerivedCriteriaAreClassifiedCorrectly(string criterionId)
+    [InlineData("COMPLETION.USERS_INACTIVE_HANDLED")]
+    public void TheFiveEvidenceDerivedCriteriaAreClassifiedCorrectly(string criterionId)
     {
         var definition = MigrationCompletionCriterionCatalog.Definition(new MigrationCompletionCriterionId(criterionId));
         Assert.Equal(MigrationCompletionCriterionEvidenceSource.EvidenceDerived, definition.EvidenceSource);
@@ -66,10 +68,9 @@ public sealed class MigrationCompletionCriterionCatalogTests
     [Theory]
     [InlineData("COMPLETION.SCOPE_AND_POLICY_SIGNED")]
     [InlineData("COMPLETION.HOLDS_RETENTION_REVIEWED")]
-    [InlineData("COMPLETION.USERS_INACTIVE_HANDLED")]
     [InlineData("COMPLETION.ROLLBACK_DECOMMISSION_WINDOW_DEFINED")]
     [InlineData("COMPLETION.CUSTOMER_FINAL_APPROVAL")]
-    public void TheFiveHumanApprovalCriteriaAreClassifiedCorrectly(string criterionId)
+    public void TheFourHumanApprovalCriteriaAreClassifiedCorrectly(string criterionId)
     {
         var definition = MigrationCompletionCriterionCatalog.Definition(new MigrationCompletionCriterionId(criterionId));
         Assert.Equal(MigrationCompletionCriterionEvidenceSource.HumanApproval, definition.EvidenceSource);
@@ -92,7 +93,7 @@ public sealed class MigrationCompletionCriterionCatalogTests
             .ToDictionary(group => group.Key, group => group.Count());
 
         Assert.Equal(2, byClass.GetValueOrDefault(MigrationCompletionCriterionEvidenceSource.SystemDerived));
-        Assert.Equal(4, byClass.GetValueOrDefault(MigrationCompletionCriterionEvidenceSource.EvidenceDerived));
-        Assert.Equal(5, byClass.GetValueOrDefault(MigrationCompletionCriterionEvidenceSource.HumanApproval));
+        Assert.Equal(5, byClass.GetValueOrDefault(MigrationCompletionCriterionEvidenceSource.EvidenceDerived));
+        Assert.Equal(4, byClass.GetValueOrDefault(MigrationCompletionCriterionEvidenceSource.HumanApproval));
     }
 }

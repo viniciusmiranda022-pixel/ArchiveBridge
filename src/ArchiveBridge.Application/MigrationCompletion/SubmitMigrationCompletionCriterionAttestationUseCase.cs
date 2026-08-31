@@ -23,18 +23,19 @@ public sealed record SubmitMigrationCompletionCriterionAttestationCommand(
 /// <summary>
 /// Submete (ou converge idempotentemente para) uma atestação manual de UM critério
 /// <see cref="MigrationCompletionCriterionEvidenceSource.HumanApproval"/> do catálogo do §49 (classificação
-/// corrigida por AB-I8-011). RECUSA fail-closed, ANTES de qualquer acesso a dado de escopo, tanto ator
-/// anônimo/não autorizado quanto tentativa de atestar um critério
+/// corrigida por AB-I8-011 e AB-I8-012). RECUSA fail-closed, ANTES de qualquer acesso a dado de escopo, tanto
+/// ator anônimo/não autorizado quanto tentativa de atestar um critério
 /// <see cref="MigrationCompletionCriterionEvidenceSource.SystemDerived"/> (reconciliação/resultados do
 /// provider nunca podem ser "aprovados" por alegação humana) OU
 /// <see cref="MigrationCompletionCriterionEvidenceSource.EvidenceDerived"/> (disposition de fontes/parts,
-/// publicação WORM e ausência de credencial temporária são fatos técnicos objetivos sem store canônico
-/// suficiente hoje — permanecem bloqueantes até que esse store exista; uma atestação humana NUNCA os
-/// substitui, AB-I8-011). Esta atestação é, ela própria, a evidência auditável exigida pelo runbook §49 para
-/// os cinco critérios genuinamente processuais — inclui explicitamente "cliente aprovou relatório final"
-/// (ausência nunca vira aprovação implícita, escopo obrigatório item 8) e "janela de rollback/decommission
-/// definida" (registra APENAS a definição, nunca dispara ou representa execução de decommission/exclusão
-/// destrutiva, escopo obrigatório item 9 — STOP-THE-LINE).
+/// publicação WORM, ausência de credencial temporária e tratamento de usuários/inativos são fatos técnicos
+/// objetivos sem store canônico suficiente hoje — permanecem bloqueantes até que esse store exista; uma
+/// atestação humana NUNCA os substitui, AB-I8-011/AB-I8-012). Esta atestação é, ela própria, a evidência
+/// auditável exigida pelo runbook §49 para os quatro critérios genuinamente processuais — inclui
+/// explicitamente "cliente aprovou relatório final" (ausência nunca vira aprovação implícita, escopo
+/// obrigatório item 8) e "janela de rollback/decommission definida" (registra APENAS a definição, nunca
+/// dispara ou representa execução de decommission/exclusão destrutiva, escopo obrigatório item 9 —
+/// STOP-THE-LINE).
 /// </summary>
 public sealed class SubmitMigrationCompletionCriterionAttestationUseCase(
     IMigrationCompletionCriterionAttestationStore attestations,
