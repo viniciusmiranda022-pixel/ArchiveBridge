@@ -1,12 +1,19 @@
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Contracts.Mapping;
 using ArchiveBridge.Contracts.ProductionReadiness;
 using ArchiveBridge.Contracts.Recovery;
 using ArchiveBridge.Contracts.Security;
+using ArchiveBridge.Contracts.TargetIngestion.Purview;
+using ArchiveBridge.Contracts.TargetIngestion.Purview.Upload;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.ProductionReadiness;
 using ArchiveBridge.Domain.Recovery;
 using ArchiveBridge.Domain.Security;
+using ArchiveBridge.Domain.TargetIngestion;
+using ArchiveBridge.Domain.TargetIngestion.Purview;
+using ArchiveBridge.Domain.TargetIngestion.Purview.Upload;
+using ArchiveBridge.Domain.Waves;
 
 namespace ArchiveBridge.Application.Tests.ProductionReadiness;
 
@@ -155,6 +162,135 @@ internal sealed class InMemoryRecoveryReadinessStore : IRecoveryReadinessStore
         var key = (scope.Tenant.Value, scope.Project.Value, exerciseType);
         return Task.FromResult<IReadOnlyList<RecoveryReadinessRecord>>(_history.TryGetValue(key, out var list) ? [.. list] : []);
     }
+}
+
+/// <summary>Store em memória do <see cref="CapabilityEvidence"/> (única, por rota — mesmo desenho do store SQL real).</summary>
+internal sealed class InMemoryCapabilityEvidenceStore : ICapabilityEvidenceStore
+{
+    private readonly Dictionary<(Guid, Guid, TargetProvider, string), CapabilityEvidence> _latest = [];
+
+    public void Seed(TenantScope scope, CapabilityEvidence evidence) =>
+        _latest[(scope.Tenant.Value, scope.Project.Value, evidence.Provider, evidence.Route.Value)] = evidence;
+
+    public Task<CapabilityEvidence?> GetLatestAsync(
+        TenantScope scope, TargetProvider provider, PurviewCapabilityRoute route, CancellationToken cancellationToken) =>
+        Task.FromResult(_latest.TryGetValue((scope.Tenant.Value, scope.Project.Value, provider, route.Value), out var evidence) ? evidence : null);
+
+    public Task<CapabilityEvidenceAppendResult> AppendAsync(CapabilityEvidence evidence, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de agregação.");
+}
+
+/// <summary>Store em memória do <see cref="MailboxPrecheckSnapshot"/> — <see cref="GetLatestAcrossMailboxesAsync"/> replica a semântica "mais recente por RecordedAtUtc, entre TODOS os mailboxes" do store SQL real.</summary>
+internal sealed class InMemoryMailboxPrecheckStore : IMailboxPrecheckStore
+{
+    private readonly Dictionary<(Guid, Guid), List<MailboxPrecheckSnapshot>> _byScope = [];
+
+    public void Seed(TenantScope scope, MailboxPrecheckSnapshot snapshot)
+    {
+        var key = (scope.Tenant.Value, scope.Project.Value);
+        if (!_byScope.TryGetValue(key, out var list))
+        {
+            list = [];
+            _byScope[key] = list;
+        }
+
+        list.Add(snapshot);
+    }
+
+    public Task<MailboxPrecheckSnapshot?> GetLatestAsync(TenantScope scope, TargetArchiveId mailbox, CancellationToken cancellationToken)
+    {
+        var key = (scope.Tenant.Value, scope.Project.Value);
+        var match = _byScope.TryGetValue(key, out var list)
+            ? list.Where(snapshot => snapshot.Mailbox.Identity.Equals(mailbox)).MaxBy(snapshot => snapshot.Version)
+            : null;
+        return Task.FromResult(match);
+    }
+
+    public Task<MailboxPrecheckSnapshot?> GetLatestAcrossMailboxesAsync(TenantScope scope, CancellationToken cancellationToken)
+    {
+        var key = (scope.Tenant.Value, scope.Project.Value);
+        var match = _byScope.TryGetValue(key, out var list) ? list.MaxBy(snapshot => snapshot.RecordedAtUtc) : null;
+        return Task.FromResult(match);
+    }
+
+    public Task<MailboxPrecheckAppendResult> AppendAsync(MailboxPrecheckSnapshot snapshot, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de agregação.");
+}
+
+/// <summary>Store em memória do <see cref="MappingValidationAttempt"/> — <see cref="GetLatestAsync(TenantScope,CancellationToken)"/> replica "mais recente por CreatedAtUtc, no tenant/projeto" do store SQL real.</summary>
+internal sealed class InMemoryMappingValidationStore : IMappingValidationStore
+{
+    private readonly Dictionary<(Guid, Guid), List<MappingValidationAttempt>> _byScope = [];
+
+    public void Seed(MappingValidationAttempt attempt)
+    {
+        var key = (attempt.Scope.Tenant.Value, attempt.Scope.Project.Value);
+        if (!_byScope.TryGetValue(key, out var list))
+        {
+            list = [];
+            _byScope[key] = list;
+        }
+
+        list.Add(attempt);
+    }
+
+    public Task<MappingValidationPersistResult> PersistAsync(MappingValidationAttempt attempt, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de agregação.");
+
+    public Task<MappingValidationAttempt?> GetAsync(TenantScope scope, Guid validationId, CancellationToken cancellationToken)
+    {
+        var key = (scope.Tenant.Value, scope.Project.Value);
+        var match = _byScope.TryGetValue(key, out var list) ? list.SingleOrDefault(attempt => attempt.ValidationId == validationId) : null;
+        return Task.FromResult(match);
+    }
+
+    public Task<MappingValidationAttempt?> GetLatestAsync(TenantScope scope, CancellationToken cancellationToken)
+    {
+        var key = (scope.Tenant.Value, scope.Project.Value);
+        var match = _byScope.TryGetValue(key, out var list) ? list.MaxBy(attempt => attempt.CreatedAtUtc) : null;
+        return Task.FromResult(match);
+    }
+}
+
+/// <summary>Store em memória do <see cref="PurviewUploadAttemptRecord"/> — <see cref="GetLatestAcrossRequestsAsync"/> replica "mais recente por CompletedAtUtc, entre TODOS os pedidos" do store SQL real.</summary>
+internal sealed class InMemoryPurviewUploadAttemptStore : IPurviewUploadAttemptStore
+{
+    private readonly Dictionary<(Guid, Guid), List<PurviewUploadAttemptRecord>> _byScope = [];
+
+    public void Seed(TenantScope scope, PurviewUploadAttemptRecord record)
+    {
+        var key = (scope.Tenant.Value, scope.Project.Value);
+        if (!_byScope.TryGetValue(key, out var list))
+        {
+            list = [];
+            _byScope[key] = list;
+        }
+
+        list.Add(record);
+    }
+
+    public Task AppendAsync(TenantScope scope, PurviewUploadAttemptRecord record, JobFence? fence, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de agregação.");
+
+    public Task<PurviewUploadAttemptRecord?> GetLatestAsync(TenantScope scope, PurviewUploadRequestId request, CancellationToken cancellationToken)
+    {
+        var key = (scope.Tenant.Value, scope.Project.Value);
+        var match = _byScope.TryGetValue(key, out var list)
+            ? list.Where(record => record.Request == request).MaxBy(record => record.AttemptNumber)
+            : null;
+        return Task.FromResult(match);
+    }
+
+    public Task<PurviewUploadAttemptRecord?> GetLatestAcrossRequestsAsync(TenantScope scope, CancellationToken cancellationToken)
+    {
+        var key = (scope.Tenant.Value, scope.Project.Value);
+        var match = _byScope.TryGetValue(key, out var list) ? list.MaxBy(record => record.CompletedAtUtc) : null;
+        return Task.FromResult(match);
+    }
+
+    public Task<IReadOnlyList<PurviewUploadAttemptRecord>> ListAttemptsAsync(
+        TenantScope scope, PurviewUploadRequestId request, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Não usado pelos testes de agregação.");
 }
 
 /// <summary>Store em memória do <see cref="ReadinessControlAttestation"/>.</summary>

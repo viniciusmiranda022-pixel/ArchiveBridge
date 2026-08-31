@@ -1,11 +1,18 @@
 using System.Globalization;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Contracts.Mapping;
 using ArchiveBridge.Contracts.Recovery;
 using ArchiveBridge.Contracts.Security;
+using ArchiveBridge.Contracts.TargetIngestion.Purview;
+using ArchiveBridge.Contracts.TargetIngestion.Purview.Upload;
 using ArchiveBridge.Domain.Common;
+using ArchiveBridge.Domain.Mapping;
 using ArchiveBridge.Domain.ProductionReadiness;
 using ArchiveBridge.Domain.Recovery;
 using ArchiveBridge.Domain.Security;
+using ArchiveBridge.Domain.TargetIngestion;
+using ArchiveBridge.Domain.TargetIngestion.Purview;
+using ArchiveBridge.Domain.TargetIngestion.Purview.Upload;
 
 namespace ArchiveBridge.Application.ProductionReadiness;
 
@@ -20,6 +27,42 @@ namespace ArchiveBridge.Application.ProductionReadiness;
 /// </summary>
 internal static class ReadinessGateEvidenceResolvers
 {
+    /// <summary>
+    /// Resolve <c>PolicyVersionFingerprint</c> do snapshot INTEIRAMENTE server-side (AB-I8-002 blocker 1) —
+    /// nunca aceito do caller. Nenhum registro dedicado de "policy version" existe hoje neste repositório
+    /// (nenhuma fonte canônica única); em vez de fabricar evidência para um registro inexistente, este
+    /// fingerprint é composto deterministicamente a partir de fontes que JÁ SÃO canônicas e JÁ SÃO resolvidas
+    /// server-side neste mesmo use case: a policy WDAC/App Control vigente do tenant/projeto (<see cref="IWdacPolicyEvidenceStore"/>,
+    /// mesma evidência usada por SEC.WDAC_DEFENDER_PATCHING) e os dois invariantes de policy M365 verificados
+    /// em runtime (<see cref="ProductionReadinessPolicyInvariants"/>). Qualquer mudança real em qualquer uma
+    /// dessas fontes muda este fingerprint, disparando supersession (AB-I8-001 escopo item 7) — nunca um
+    /// valor arbitrário alegado pelo caller.
+    /// </summary>
+    public static async Task<Sha256Hash> ResolvePolicyVersionFingerprintAsync(
+        IWdacPolicyEvidenceStore wdacStore,
+        TenantScope scope,
+        IReadOnlyList<ReadinessControlResult> policyInvariantResults,
+        CancellationToken cancellationToken)
+    {
+        var wdacPolicy = await wdacStore.GetLatestAsync(scope, cancellationToken).ConfigureAwait(false);
+        var parts = new List<string>
+        {
+            "archivebridge.production-readiness.policy-version-fingerprint.v1",
+            wdacPolicy is null ? "missing" : wdacPolicy.PolicyVersion.ToString(CultureInfo.InvariantCulture),
+            wdacPolicy?.ContentFingerprint.Value ?? "missing",
+        };
+
+        // Ordem fixa e determinística (nunca a ordem de entrada do chamador) — mesmo princípio de
+        // ProductionReadinessReviewSnapshot.ComputeReviewFingerprint.
+        foreach (var result in policyInvariantResults.OrderBy(result => result.ControlId.Value, StringComparer.Ordinal))
+        {
+            parts.Add(result.ControlId.Value);
+            parts.Add(result.Evidence.Fingerprint.Value);
+        }
+
+        return DeterministicHash.Compute(parts);
+    }
+
     /// <summary>SEC.PENTEST_NO_OPEN_CRITICAL_HIGH — <see cref="PenTestReadinessStatus"/> NUNCA possui um caso Pass/concluído (bloqueio estrutural do tipo, não deste resolver).</summary>
     public static async Task<ReadinessControlResult> ResolvePenTestAsync(
         IPenTestReadinessStore store, TenantScope scope, DateTimeOffset now, CancellationToken cancellationToken)
@@ -214,6 +257,170 @@ internal static class ReadinessGateEvidenceResolvers
         var controlId = new ReadinessControlId("DATA.HASHES_MANIFESTS_LINEAGE_WORM");
         var record = await store.GetLatestAsync(scope, RecoveryExerciseType.ArtifactEvidenceRecovery, cancellationToken).ConfigureAwait(false);
         return MapRecoveryRecord(record, controlId, ReadinessGateGroup.Data, "ARTIFACT_EVIDENCE_RECOVERY_NOT_EXERCISED", now);
+    }
+
+    /// <summary>Rotas de capability conhecidas por este agregador — hoje só a rota GA de PST import (I5); nenhuma rota é alegada além das já modeladas por <see cref="PurviewCapabilityRoutes"/>.</summary>
+    private static readonly IReadOnlyList<PurviewCapabilityRoute> KnownCapabilityRoutes = [PurviewCapabilityRoutes.PstImport];
+
+    /// <summary>ARCH.CAPABILITY_MATRIX_CURRENT — cada rota conhecida precisa de evidência <see cref="CapabilityUsabilityOutcome.Usable"/> (GA, dentro da janela de frescor); Unknown/Unsupported/Preview/Contractual/ausente/stale nunca é Pass (mesma política já usada pelo precheck gate real, AB-I5-001/<see cref="CapabilityEvidencePolicy"/>).</summary>
+    public static async Task<ReadinessControlResult> ResolveCapabilityMatrixAsync(
+        ICapabilityEvidenceStore store, TenantScope scope, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var controlId = new ReadinessControlId("ARCH.CAPABILITY_MATRIX_CURRENT");
+        var fingerprintParts = new List<string> { "archivebridge.production-readiness.capability-matrix.v1" };
+        var worstOutcome = CapabilityUsabilityOutcome.Usable;
+        DateTimeOffset? latestObservedAt = null;
+
+        foreach (var route in KnownCapabilityRoutes)
+        {
+            var latest = await store.GetLatestAsync(scope, TargetProvider.Purview, route, cancellationToken).ConfigureAwait(false);
+            var outcome = CapabilityEvidencePolicy.EnsureGeneralAvailability(latest, now, CapabilityEvidencePolicy.DefaultMaxAge);
+
+            fingerprintParts.Add(route.Value);
+            fingerprintParts.Add(outcome.ToString());
+            fingerprintParts.Add(latest?.EvidenceHash.Value ?? "missing");
+
+            if (latest is not null && (latestObservedAt is null || latest.RecordedAtUtc > latestObservedAt))
+            {
+                latestObservedAt = latest.RecordedAtUtc;
+            }
+
+            // Pior desfecho vence: uma rota Unknown/stale/não-GA já basta para bloquear o controle inteiro,
+            // mesmo que outras rotas estejam Usable — nunca "média" nem "melhor caso".
+            if (RankCapabilityOutcome(outcome) > RankCapabilityOutcome(worstOutcome))
+            {
+                worstOutcome = outcome;
+            }
+        }
+
+        var fingerprint = DeterministicHash.Compute(fingerprintParts);
+        var evidence = ReadinessEvidenceReference.SystemDerived(
+            fingerprint, $"capability-evidence:{KnownCapabilityRoutes.Count.ToString(CultureInfo.InvariantCulture)}-routes");
+        var observedAt = latestObservedAt ?? now;
+
+        return worstOutcome switch
+        {
+            CapabilityUsabilityOutcome.Usable =>
+                ReadinessControlResult.Create(controlId, ReadinessGateGroup.Architecture, ReadinessControlStatus.Pass, evidence, reasonCode: string.Empty, observedAt),
+            CapabilityUsabilityOutcome.NoEvidence =>
+                ReadinessControlResult.Create(controlId, ReadinessGateGroup.Architecture, ReadinessControlStatus.NotMeasured, evidence, "CAPABILITY_EVIDENCE_MISSING", observedAt),
+            CapabilityUsabilityOutcome.Stale =>
+                ReadinessControlResult.Create(controlId, ReadinessGateGroup.Architecture, ReadinessControlStatus.NotMeasured, evidence, "CAPABILITY_EVIDENCE_STALE", observedAt),
+            CapabilityUsabilityOutcome.Unsupported =>
+                ReadinessControlResult.Create(controlId, ReadinessGateGroup.Architecture, ReadinessControlStatus.Fail, evidence, "CAPABILITY_UNSUPPORTED", observedAt),
+            // Unknown (fail-closed default do CapabilityStatus) e NotGeneralAvailability (Preview/Contractual,
+            // nunca promovida implicitamente a GA) bloqueiam — nunca Pass por omissão (AB-I8-001 escopo item 6).
+            _ =>
+                ReadinessControlResult.Create(
+                    controlId, ReadinessGateGroup.Architecture, ReadinessControlStatus.Blocked,
+                    evidence, worstOutcome == CapabilityUsabilityOutcome.Unknown ? "CAPABILITY_STATUS_UNKNOWN" : "CAPABILITY_NOT_GENERAL_AVAILABILITY", observedAt),
+        };
+    }
+
+    // Ordem de severidade para "pior desfecho vence" — nunca reflete a ordem de declaração do enum, que é
+    // documental (CapabilityEvidencePolicy), não uma escala de risco.
+    private static int RankCapabilityOutcome(CapabilityUsabilityOutcome outcome) => outcome switch
+    {
+        CapabilityUsabilityOutcome.Usable => 0,
+        CapabilityUsabilityOutcome.NoEvidence => 1,
+        CapabilityUsabilityOutcome.Stale => 1,
+        CapabilityUsabilityOutcome.NotGeneralAvailability => 2,
+        CapabilityUsabilityOutcome.Unknown => 3,
+        CapabilityUsabilityOutcome.Unsupported => 4,
+        _ => 4,
+    };
+
+    /// <summary>
+    /// M365.TENANT_PRECHECK — precheck de mailbox mais recente já registrado em QUALQUER archive deste
+    /// tenant/projeto (o review não é escopado a uma onda/mailbox específica, AB-I8-002 blocker 2). Ausente
+    /// ou <see cref="MailboxArchiveStatus"/> diferente de <see cref="MailboxArchiveStatus.Active"/> nunca é Pass.
+    /// </summary>
+    public static async Task<ReadinessControlResult> ResolveTenantPrecheckAsync(
+        IMailboxPrecheckStore store, TenantScope scope, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var controlId = new ReadinessControlId("M365.TENANT_PRECHECK");
+        var snapshot = await store.GetLatestAcrossMailboxesAsync(scope, cancellationToken).ConfigureAwait(false);
+        if (snapshot is null)
+        {
+            return ReadinessControlResult.NotMeasured(controlId, ReadinessGateGroup.Microsoft365, "TENANT_PRECHECK_NOT_PERFORMED", now);
+        }
+
+        var evidence = ReadinessEvidenceReference.SystemDerived(snapshot.SnapshotHash, $"mailbox-precheck:{snapshot.Id.Value}");
+        if (snapshot.ArchiveStatus != MailboxArchiveStatus.Active)
+        {
+            return ReadinessControlResult.Create(
+                controlId, ReadinessGateGroup.Microsoft365, ReadinessControlStatus.Blocked, evidence,
+                "TENANT_PRECHECK_ARCHIVE_NOT_ACTIVE", snapshot.RecordedAtUtc);
+        }
+
+        return ReadinessControlResult.Create(
+            controlId, ReadinessGateGroup.Microsoft365, ReadinessControlStatus.Pass, evidence, reasonCode: string.Empty, snapshot.RecordedAtUtc);
+    }
+
+    /// <summary>
+    /// M365.MAPPING_VALIDATOR — tentativa de validação de mapping mais recente já registrada neste tenant/
+    /// projeto (não escopada a uma onda específica, AB-I8-002 blocker 2). Ausente, <see cref="MappingValidationAttemptOutcome.Invalid"/>
+    /// ou <see cref="MappingValidationAttemptOutcome.Rejected"/> nunca é Pass.
+    /// </summary>
+    public static async Task<ReadinessControlResult> ResolveMappingValidatorAsync(
+        IMappingValidationStore store, TenantScope scope, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var controlId = new ReadinessControlId("M365.MAPPING_VALIDATOR");
+        var attempt = await store.GetLatestAsync(scope, cancellationToken).ConfigureAwait(false);
+        if (attempt is null)
+        {
+            return ReadinessControlResult.NotMeasured(controlId, ReadinessGateGroup.Microsoft365, "MAPPING_VALIDATION_NOT_PERFORMED", now);
+        }
+
+        var evidence = ReadinessEvidenceReference.SystemDerived(attempt.ContentSha256, $"mapping-validation-attempt:{attempt.ValidationId}");
+        return attempt.Outcome switch
+        {
+            MappingValidationAttemptOutcome.Valid =>
+                ReadinessControlResult.Create(controlId, ReadinessGateGroup.Microsoft365, ReadinessControlStatus.Pass, evidence, reasonCode: string.Empty, attempt.CreatedAtUtc),
+            MappingValidationAttemptOutcome.Invalid =>
+                ReadinessControlResult.Create(controlId, ReadinessGateGroup.Microsoft365, ReadinessControlStatus.Fail, evidence, "MAPPING_VALIDATION_INVALID", attempt.CreatedAtUtc),
+            // Rejected = conteúdo recebido mas não validável semanticamente (encoding/BOM) — bloqueia, nunca
+            // um Fail definitivo (o problema pode estar no arquivo enviado, não necessariamente no mapping).
+            _ =>
+                ReadinessControlResult.Create(controlId, ReadinessGateGroup.Microsoft365, ReadinessControlStatus.Blocked, evidence, "MAPPING_VALIDATION_REJECTED", attempt.CreatedAtUtc),
+        };
+    }
+
+    /// <summary>
+    /// M365.AZCOPY_VERSION_HOMOLOGATED — tentativa de upload <see cref="PurviewUploadAttemptOutcome.Uploaded"/>
+    /// mais recente já registrada neste tenant/projeto (não escopada a uma onda/pedido específico, AB-I8-002
+    /// blocker 2), cruzando o binário observado contra <paramref name="homologatedBinaries"/> — mesma
+    /// verificação exata (versão E hash) já usada pelo executor real (<see cref="AzCopyHomologationCatalog.IsHomologated"/>).
+    /// Ausente ou binário desconhecido/divergente nunca é Pass.
+    /// </summary>
+    public static async Task<ReadinessControlResult> ResolveAzCopyHomologationAsync(
+        IPurviewUploadAttemptStore store, AzCopyHomologationCatalog homologatedBinaries, TenantScope scope, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var controlId = new ReadinessControlId("M365.AZCOPY_VERSION_HOMOLOGATED");
+        var record = await store.GetLatestAcrossRequestsAsync(scope, cancellationToken).ConfigureAwait(false);
+        if (record is null || record.Outcome != PurviewUploadAttemptOutcome.Uploaded || record.Evidence is not { } uploadEvidence)
+        {
+            return ReadinessControlResult.NotMeasured(controlId, ReadinessGateGroup.Microsoft365, "AZCOPY_UPLOAD_NOT_PERFORMED", now);
+        }
+
+        var fingerprint = DeterministicHash.Compute(
+        [
+            "archivebridge.production-readiness.azcopy-homologation.v1",
+            uploadEvidence.Binary.Version,
+            uploadEvidence.Binary.Sha256.Value,
+            uploadEvidence.ManifestHash.Value,
+        ]);
+        var evidence = ReadinessEvidenceReference.SystemDerived(fingerprint, $"purview-upload-attempt:{record.Attempt.Value}");
+
+        if (!homologatedBinaries.IsHomologated(uploadEvidence.Binary))
+        {
+            return ReadinessControlResult.Create(
+                controlId, ReadinessGateGroup.Microsoft365, ReadinessControlStatus.Blocked, evidence,
+                "AZCOPY_BINARY_NOT_HOMOLOGATED", record.CompletedAtUtc);
+        }
+
+        return ReadinessControlResult.Create(
+            controlId, ReadinessGateGroup.Microsoft365, ReadinessControlStatus.Pass, evidence, reasonCode: string.Empty, record.CompletedAtUtc);
     }
 
     private static async Task<ReadinessControlResult> ResolveRecoveryObjectiveAsync(

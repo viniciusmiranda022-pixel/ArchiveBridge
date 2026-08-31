@@ -21,15 +21,19 @@ public static class ReadinessControlCatalog
 
     private static readonly ReadinessControlDefinition[] Definitions =
     [
-        // §47.1 — Gate de arquitetura. Nenhum destes possui hoje um store de evidência automatizado
-        // (ADR/diagrama/capability-matrix/ownership são artefatos de processo/documentação) — todos
-        // Attested (AB-I8-001 escopo item 2).
+        // §47.1 — Gate de arquitetura. ADR/diagrama/ownership permanecem artefatos de processo/documentação
+        // sem store dedicado — Attested (AB-I8-001 escopo item 2). CAPABILITY_MATRIX_CURRENT tem fonte
+        // canônica real (AB-I8-002 blocker 1/catálogo revisado): ICapabilityEvidenceStore (I5) já persiste,
+        // por rota Purview conhecida, o CapabilityStatus documentado pelo fornecedor com tamper-evidence
+        // (EvidenceHash) — SystemDerived, resolvido via CapabilityEvidencePolicy.EnsureGeneralAvailability
+        // (mesma política já usada pelo precheck gate real, AB-I5-001).
         Define("ARCH.ADR_APPROVED", ReadinessGateGroup.Architecture, ReadinessControlEvidenceSource.Attested,
             "ADRs aprovados (§47.1)."),
         Define("ARCH.DATA_FLOW_DIAGRAMS_CURRENT", ReadinessGateGroup.Architecture, ReadinessControlEvidenceSource.Attested,
             "Diagramas e data flow atualizados (§47.1)."),
-        Define("ARCH.CAPABILITY_MATRIX_CURRENT", ReadinessGateGroup.Architecture, ReadinessControlEvidenceSource.Attested,
-            "Capability matrix atual (§47.1)."),
+        Define("ARCH.CAPABILITY_MATRIX_CURRENT", ReadinessGateGroup.Architecture, ReadinessControlEvidenceSource.SystemDerived,
+            "Capability matrix atual (§47.1) — resolvido a partir de ICapabilityEvidenceStore (I5) para cada rota " +
+            "Purview conhecida; Unknown/Unsupported/Preview/Contractual/ausente/stale nunca é promovido a Pass."),
         Define("ARCH.NO_PREVIEW_IN_GA_PATH", ReadinessGateGroup.Architecture, ReadinessControlEvidenceSource.Attested,
             "Nenhum preview no caminho GA (§47.1)."),
         Define("ARCH.SERVICE_OWNERSHIP_ASSIGNED", ReadinessGateGroup.Architecture, ReadinessControlEvidenceSource.Attested,
@@ -92,19 +96,29 @@ public static class ReadinessControlCatalog
 
         // §47.5 — Gate Microsoft 365. Os dois limites numéricos hard-coded no domínio (100 GB/500 linhas) e
         // a rejeição de target root "/" são invariantes de código verificáveis em runtime — SystemDerived
-        // via auto-checagem determinística (ProductionReadinessPolicyInvariants), nunca I/O externo. Os
-        // demais itens (roles, prechecks, licença/quota, AzCopy, mapping validator, treinamento) dependem de
-        // estado de tenant real/processo ainda sem store dedicado — Attested.
+        // via auto-checagem determinística (ProductionReadinessPolicyInvariants), nunca I/O externo.
+        // TENANT_PRECHECK/AZCOPY_VERSION_HOMOLOGATED/MAPPING_VALIDATOR (AB-I8-002 blocker 2/catálogo
+        // revisado) têm fonte canônica real produzida no I5: o snapshot mais recente do tenant/projeto —
+        // independentemente de qual mailbox/pedido/onda especificamente o produziu, já que este review não é
+        // escopado a uma onda — resolvido via IMailboxPrecheckStore/IPurviewUploadAttemptStore/
+        // IMappingValidationStore. ARCHIVE_LICENSE_QUOTA e MINIMUM_ROLES permanecem Attested: nenhum store de
+        // evidência de license/quota de archive existe hoje no repositório (nenhum tipo/tabela representa
+        // este conceito), e roles mínimas do tenant são checklist operacional sem store dedicado.
         Define("M365.MINIMUM_ROLES", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.Attested,
             "Roles mínimas (§47.5)."),
-        Define("M365.TENANT_PRECHECK", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.Attested,
-            "Tenant precheck (§47.5)."),
+        Define("M365.TENANT_PRECHECK", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.SystemDerived,
+            "Tenant precheck (§47.5) — resolvido a partir do precheck de mailbox mais recente já registrado no " +
+            "tenant/projeto (IMailboxPrecheckStore, I5); ausente/ArchiveStatus != Active nunca é Pass."),
         Define("M365.ARCHIVE_LICENSE_QUOTA", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.Attested,
-            "Archive/licença/quota (§47.5)."),
-        Define("M365.AZCOPY_VERSION_HOMOLOGATED", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.Attested,
-            "AzCopy version homologada (§47.5)."),
-        Define("M365.MAPPING_VALIDATOR", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.Attested,
-            "Mapping validator (§47.5)."),
+            "Archive/licença/quota (§47.5) — nenhum store de evidência de license/quota de archive existe hoje " +
+            "neste repositório; permanece Attested até um incremento futuro introduzir essa evidência canônica."),
+        Define("M365.AZCOPY_VERSION_HOMOLOGATED", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.SystemDerived,
+            "AzCopy version homologada (§47.5) — resolvido a partir da tentativa de upload Uploaded mais recente já " +
+            "registrada no tenant/projeto (IPurviewUploadAttemptStore, I5), cruzando o binário observado contra o " +
+            "catálogo de binários homologados (AzCopyHomologationCatalog); binário desconhecido/divergente nunca é Pass."),
+        Define("M365.MAPPING_VALIDATOR", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.SystemDerived,
+            "Mapping validator (§47.5) — resolvido a partir da tentativa de validação de mapping mais recente já " +
+            "registrada no tenant/projeto (IMappingValidationStore, Slice 4a); Invalid/Rejected/ausente nunca é Pass."),
         Define("M365.TARGET_ROOT_POLICY", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.SystemDerived,
             "Target root policy (§47.5) — resolvido verificando em runtime que TargetRootFolder rejeita a raiz \"/\"."),
         Define("M365.IMPORT_LIMITS_100GB_500ROWS", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.SystemDerived,

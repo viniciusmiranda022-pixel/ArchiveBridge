@@ -18,6 +18,14 @@ public interface IMailboxPrecheckStore
     Task<MailboxPrecheckSnapshot?> GetLatestAsync(TenantScope scope, TargetArchiveId mailbox, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Devolve o snapshot mais recente (por <see cref="MailboxPrecheckSnapshot.RecordedAtUtc"/>) dentre TODOS
+    /// os mailboxes/archives já prechecados neste tenant/projeto — <see langword="null"/> se nenhum precheck
+    /// existir. Usado pelo Production Readiness Review (AB-I8-002), que é escopado a tenant/projeto, não a um
+    /// mailbox específico; nunca filtra por mailbox.
+    /// </summary>
+    Task<MailboxPrecheckSnapshot?> GetLatestAcrossMailboxesAsync(TenantScope scope, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Persiste uma nova versão (append). Se a versão candidata já foi ocupada por outra submissão
     /// concorrente com o MESMO conteúdo lógico, converge (<see cref="MailboxPrecheckAppendResult.Created"/>
     /// = <see langword="false"/>); com conteúdo diferente, lança <see cref="ArchiveBridge.Domain.Common.ConcurrencyException"/>.

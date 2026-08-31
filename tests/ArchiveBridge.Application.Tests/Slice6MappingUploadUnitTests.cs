@@ -188,6 +188,9 @@ public sealed class Slice6MappingUploadUnitTests
 
         public Task<MappingValidationAttempt?> GetAsync(TenantScope scope, Guid validationId, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("GetAsync não deveria ter sido chamado.");
+
+        public Task<MappingValidationAttempt?> GetLatestAsync(TenantScope scope, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("GetLatestAsync não deveria ter sido chamado.");
     }
 
     private sealed class ThrowIfUsedWaveStore : IWaveStore

@@ -39,6 +39,14 @@ public interface IPurviewUploadAttemptStore
     /// <summary>Devolve a tentativa mais recente do pedido no escopo; <see langword="null"/> se nenhuma existir.</summary>
     Task<PurviewUploadAttemptRecord?> GetLatestAsync(TenantScope scope, PurviewUploadRequestId request, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Devolve a tentativa mais recente (por <see cref="PurviewUploadAttemptRecord.CompletedAtUtc"/>) dentre
+    /// TODOS os pedidos de upload já registrados neste tenant/projeto — <see langword="null"/> se nenhuma
+    /// tentativa existir. Usado pelo Production Readiness Review (AB-I8-002), que é escopado a tenant/
+    /// projeto, não a uma onda/pedido específico; nunca filtra por <see cref="PurviewUploadRequestId"/>.
+    /// </summary>
+    Task<PurviewUploadAttemptRecord?> GetLatestAcrossRequestsAsync(TenantScope scope, CancellationToken cancellationToken);
+
     /// <summary>Devolve TODA a história de tentativas do pedido, em ordem de <c>AttemptNumber</c> crescente (evidência/auditoria).</summary>
     Task<IReadOnlyList<PurviewUploadAttemptRecord>> ListAttemptsAsync(
         TenantScope scope, PurviewUploadRequestId request, CancellationToken cancellationToken);

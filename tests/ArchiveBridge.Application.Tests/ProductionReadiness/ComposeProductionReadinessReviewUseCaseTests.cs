@@ -4,6 +4,7 @@ using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.IdentityAndAccess;
 using ArchiveBridge.Domain.ProductionReadiness;
 using ArchiveBridge.Domain.Projects;
+using ArchiveBridge.Domain.TargetIngestion.Purview.Upload;
 using Xunit;
 
 namespace ArchiveBridge.Application.Tests.ProductionReadiness;
@@ -22,6 +23,9 @@ public sealed class ComposeProductionReadinessReviewUseCaseTests
 
     private static TenantScope NewScope() => new(new TenantId(Guid.NewGuid()), new ProjectId(Guid.NewGuid()));
 
+    private static readonly AzCopyHomologationCatalog HomologatedCatalog =
+        new([new AzCopyBinaryIdentity("10.25.0", new Sha256Hash(new string('b', 64)))]);
+
     private static ComposeProductionReadinessReviewUseCase BuildUseCase(
         Contracts.Abstractions.IAuthenticatedActorAccessor actorAccessor,
         InMemoryPenTestReadinessStore? penTestStore = null,
@@ -30,6 +34,11 @@ public sealed class ComposeProductionReadinessReviewUseCaseTests
         InMemoryIncidentResponseDrillStore? incidentStore = null,
         InMemoryBuildProvenanceStore? buildStore = null,
         InMemoryRecoveryReadinessStore? recoveryStore = null,
+        InMemoryCapabilityEvidenceStore? capabilityStore = null,
+        InMemoryMailboxPrecheckStore? mailboxPrecheckStore = null,
+        InMemoryMappingValidationStore? mappingValidationStore = null,
+        InMemoryPurviewUploadAttemptStore? uploadAttemptStore = null,
+        AzCopyHomologationCatalog? homologatedCatalog = null,
         InMemoryReadinessControlAttestationStore? attestationStore = null,
         InMemoryProductionReadinessReviewStore? reviewStore = null) =>
         new(
@@ -39,13 +48,18 @@ public sealed class ComposeProductionReadinessReviewUseCaseTests
             incidentStore ?? new InMemoryIncidentResponseDrillStore(),
             buildStore ?? new InMemoryBuildProvenanceStore(),
             recoveryStore ?? new InMemoryRecoveryReadinessStore(),
+            capabilityStore ?? new InMemoryCapabilityEvidenceStore(),
+            mailboxPrecheckStore ?? new InMemoryMailboxPrecheckStore(),
+            mappingValidationStore ?? new InMemoryMappingValidationStore(),
+            uploadAttemptStore ?? new InMemoryPurviewUploadAttemptStore(),
+            homologatedCatalog ?? HomologatedCatalog,
             attestationStore ?? new InMemoryReadinessControlAttestationStore(),
             reviewStore ?? new InMemoryProductionReadinessReviewStore(),
             new FixedClock(Now),
             actorAccessor);
 
     private static ComposeProductionReadinessReviewCommand Command(TenantScope scope) =>
-        new(scope, ValidCommitSha, SomeFingerprint, "ArchiveBridge.ControlPlane", SomeFingerprint, SomeFingerprint, CorrelationId.New());
+        new(scope, ValidCommitSha, SomeFingerprint, "ArchiveBridge.ControlPlane", CorrelationId.New());
 
     [Fact]
     public async Task AnonymousActorIsRejectedBeforeAnyScopedAccess()

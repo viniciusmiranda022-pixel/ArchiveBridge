@@ -393,6 +393,15 @@ internal sealed class FakeMailboxPrecheckStore : IMailboxPrecheckStore
         return Task.FromResult(latest);
     }
 
+    public Task<MailboxPrecheckSnapshot?> GetLatestAcrossMailboxesAsync(TenantScope scope, CancellationToken cancellationToken)
+    {
+        var latest = _snapshots
+            .Where(s => s.Tenant == scope.Tenant && s.Project == scope.Project)
+            .OrderByDescending(s => s.RecordedAtUtc)
+            .FirstOrDefault();
+        return Task.FromResult(latest);
+    }
+
     public Task<MailboxPrecheckAppendResult> AppendAsync(MailboxPrecheckSnapshot snapshot, CancellationToken cancellationToken)
     {
         var existing = _snapshots.FirstOrDefault(s =>

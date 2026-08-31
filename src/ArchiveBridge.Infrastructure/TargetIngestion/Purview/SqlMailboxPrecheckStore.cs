@@ -34,6 +34,18 @@ public sealed class SqlMailboxPrecheckStore(TenantConnectionFactory connectionFa
         ORDER BY version DESC;
         """;
 
+    private const string SelectLatestAcrossMailboxesSql =
+        """
+        SELECT TOP (1) snapshot_id, tenant_id, project_id, archive_identity, mailbox_display, version,
+               exchange_guid, archive_guid, archive_status, recipient_type_details,
+               auto_expanding_archive_enabled, litigation_hold_enabled, retention_hold_enabled,
+               archive_item_count, archive_total_size_bytes, observed_available_bytes, observed_at_utc,
+               correlation_id, recorded_at_utc, snapshot_hash
+        FROM dbo.purview_mailbox_prechecks
+        WHERE project_id = @project
+        ORDER BY recorded_at_utc DESC, version DESC;
+        """;
+
     private const string SelectByVersionSql =
         """
         SELECT snapshot_id, tenant_id, project_id, archive_identity, mailbox_display, version,
@@ -66,6 +78,15 @@ public sealed class SqlMailboxPrecheckStore(TenantConnectionFactory connectionFa
         await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
         await using var command = new SqlCommand(SelectLatestSql, tenant.Connection);
         AddScopeParameters(command, scope, mailbox);
+        return await ReadOneAsync(command, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<MailboxPrecheckSnapshot?> GetLatestAcrossMailboxesAsync(TenantScope scope, CancellationToken cancellationToken)
+    {
+        await using var tenant = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        await using var command = new SqlCommand(SelectLatestAcrossMailboxesSql, tenant.Connection);
+        command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
         return await ReadOneAsync(command, cancellationToken).ConfigureAwait(false);
     }
 

@@ -3,16 +3,28 @@ using ArchiveBridge.Application.ProductionReadiness;
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.ControlPlane;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Contracts.Mapping;
 using ArchiveBridge.Contracts.ProductionReadiness;
 using ArchiveBridge.Contracts.Recovery;
 using ArchiveBridge.Contracts.Security;
+using ArchiveBridge.Contracts.TargetIngestion.Purview;
+using ArchiveBridge.Contracts.TargetIngestion.Purview.Upload;
 using ArchiveBridge.Domain.Common;
+using ArchiveBridge.Domain.Mapping;
 using ArchiveBridge.Domain.ProductionReadiness;
+using ArchiveBridge.Domain.PstProcessing;
 using ArchiveBridge.Domain.Recovery;
 using ArchiveBridge.Domain.Security;
+using ArchiveBridge.Domain.TargetIngestion;
+using ArchiveBridge.Domain.TargetIngestion.Purview;
+using ArchiveBridge.Domain.TargetIngestion.Purview.Upload;
+using ArchiveBridge.Domain.Waves;
+using ArchiveBridge.Infrastructure.Mapping;
 using ArchiveBridge.Infrastructure.ProductionReadiness;
 using ArchiveBridge.Infrastructure.Recovery;
 using ArchiveBridge.Infrastructure.Security;
+using ArchiveBridge.Infrastructure.TargetIngestion.Purview;
+using ArchiveBridge.Infrastructure.TargetIngestion.Purview.Upload;
 using ArchiveBridge.Infrastructure.Time;
 using ArchiveBridge.Integration.Tests.Support;
 using Microsoft.Data.SqlClient;
@@ -55,15 +67,27 @@ public sealed class ProductionReadinessIntegrationTests(SqlServerFixture fixture
 
     private SqlRecoveryReadinessStore Recovery() => new(fixture.Factory);
 
+    private SqlCapabilityEvidenceStore Capability() => new(fixture.Factory);
+
+    private SqlMailboxPrecheckStore MailboxPrecheck() => new(fixture.Factory);
+
+    private SqlMappingValidationStore MappingValidation() => new(fixture.Factory);
+
+    private SqlPurviewUploadAttemptStore UploadAttempts() => new(fixture.Factory);
+
+    private static readonly AzCopyBinaryIdentity HomologatedBinary = new("10.25.0", new Sha256Hash(new string('d', 64)));
+    private static readonly AzCopyHomologationCatalog HomologatedCatalog = new([HomologatedBinary]);
+
     private ComposeProductionReadinessReviewUseCase ComposeUseCase(IAuthenticatedActorAccessor? actor = null) =>
-        new(PenTest(), Hardening(), Wdac(), IncidentResponse(), BuildProvenance(), Recovery(), Attestations(), Reviews(),
-            Clock, actor ?? ApproverActor);
+        new(
+            PenTest(), Hardening(), Wdac(), IncidentResponse(), BuildProvenance(), Recovery(), Capability(), MailboxPrecheck(),
+            MappingValidation(), UploadAttempts(), HomologatedCatalog, Attestations(), Reviews(), Clock, actor ?? ApproverActor);
 
     private SubmitReadinessControlAttestationUseCase SubmitUseCase(IAuthenticatedActorAccessor? actor = null) =>
         new(Attestations(), Clock, actor ?? ApproverActor);
 
     private static ComposeProductionReadinessReviewCommand ComposeCommand(TenantScope scope) =>
-        new(scope, ValidCommitSha, SomeFingerprint, "ArchiveBridge.ControlPlane", SomeFingerprint, SomeFingerprint, CorrelationId.New());
+        new(scope, ValidCommitSha, SomeFingerprint, "ArchiveBridge.ControlPlane", CorrelationId.New());
 
     private sealed class FakeAuthenticatedActorAccessor(string actorId, params string[] roles) : IAuthenticatedActorAccessor
     {
@@ -104,7 +128,10 @@ public sealed class ProductionReadinessIntegrationTests(SqlServerFixture fixture
         var scope = SqlServerFixture.NewScope();
         var now = Clock.UtcNow;
 
-        // Atesta TODOS os 22 controles Attested como Pass.
+        // Atesta TODOS os 18 controles Attested como Pass (AB-I8-002 reclassificou 4 controles para
+        // SystemDerived: ARCH.CAPABILITY_MATRIX_CURRENT/M365.TENANT_PRECHECK/M365.MAPPING_VALIDATOR/
+        // M365.AZCOPY_VERSION_HOMOLOGATED — nenhum destes é mais atestável, resolvidos abaixo a partir de
+        // evidência canônica real).
         foreach (var definition in ReadinessControlCatalog.AllControls.Where(d => d.EvidenceSource == ReadinessControlEvidenceSource.Attested))
         {
             await SubmitUseCase().ExecuteAsync(
@@ -159,13 +186,55 @@ public sealed class ProductionReadinessIntegrationTests(SqlServerFixture fixture
             "known-blocked", SomeFingerprint, "no independent tester contracted yet", "svc-security", "ServiceAccount",
             CorrelationId.New(), now, CancellationToken.None);
 
+        // ARCH.CAPABILITY_MATRIX_CURRENT (AB-I8-002): evidência real GA/fresca para a rota conhecida.
+        var capabilityEvidence = CapabilityEvidence.Record(
+            CapabilityEvidenceId.New(), scope.Tenant, scope.Project, TargetProvider.Purview, PurviewCapabilityRoutes.PstImport,
+            version: 1, CapabilityStatus.GeneralAvailability, "ADR-0006", null, null, now, CorrelationId.New(), now);
+        await Capability().AppendAsync(capabilityEvidence, CancellationToken.None);
+
+        // M365.TENANT_PRECHECK (AB-I8-002): precheck de mailbox real com archive Active.
+        var precheckSnapshot = MailboxPrecheckSnapshot.Observe(
+            PrecheckSnapshotId.New(), scope.Tenant, scope.Project,
+            new ArchiveRef("readiness-review@contoso.example", TargetArchiveId.FromMailbox("readiness-review@contoso.example")),
+            version: 1, exchangeGuid: Guid.NewGuid(), archiveGuid: Guid.NewGuid(), MailboxArchiveStatus.Active, "UserMailbox",
+            autoExpandingArchiveEnabled: false, litigationHoldEnabled: false, retentionHoldEnabled: false,
+            archiveItemCount: 10, archiveTotalSizeBytes: 4096, observedAvailableBytes: 100_000_000_000, now, CorrelationId.New(), now);
+        await MailboxPrecheck().AppendAsync(precheckSnapshot, CancellationToken.None);
+
         var snapshot = await ComposeUseCase().ExecuteAsync(ComposeCommand(scope), CancellationToken.None);
 
-        // Mesmo com TODOS os demais 30 controles em Pass, pen-test (e RPO, nunca exercitado) seguram o
-        // outcome em NotReady — prova executável das acceptance criteria 2/3/4.
+        // Mesmo com TODOS os demais controles resolvíveis em Pass, pen-test (e RPO, nunca exercitado) seguram
+        // o outcome em NotReady — prova executável das acceptance criteria 2/3/4. M365.MAPPING_VALIDATOR e
+        // M365.AZCOPY_VERSION_HOMOLOGATED (AB-I8-002) não são seedados aqui (cobertos em testes dedicados
+        // abaixo, que exigem uma onda/pedido de upload reais) — permanecem NotMeasured, também bloqueando.
         Assert.Equal(ProductionReadinessOutcome.NotReady, snapshot.Outcome);
         Assert.Contains(snapshot.Blockers, b => b.ControlId.Value == "SEC.PENTEST_NO_OPEN_CRITICAL_HIGH");
         Assert.Contains(snapshot.Blockers, b => b.ControlId.Value == "OPS.RPO_EXERCISED");
+        Assert.DoesNotContain(snapshot.Blockers, b => b.ControlId.Value == "ARCH.CAPABILITY_MATRIX_CURRENT");
+        Assert.DoesNotContain(snapshot.Blockers, b => b.ControlId.Value == "M365.TENANT_PRECHECK");
+    }
+
+    [Fact]
+    public async Task MappingValidatorResolvesToPassFromARealValidatedMappingAttempt()
+    {
+        var scope = SqlServerFixture.NewScope();
+        await Slice2Support.ProjectStore(fixture).AddAsync(Slice2Support.NewProject(scope), CorrelationId.New(), CancellationToken.None);
+        var wave = Slice2Support.Approve(Slice2Support.NewWave(scope, new WaveSelection([Slice2Support.Entry("a.pst", "u@contoso.com", 10)])));
+        var waveStore = Slice2Support.WaveStore(fixture);
+        await waveStore.AddAsync(wave, CorrelationId.New(), CancellationToken.None);
+        await waveStore.SaveStatusAsync(wave, CorrelationId.New(), CancellationToken.None);
+
+        var attempt = new MappingValidationAttempt(
+            Guid.NewGuid(), scope, wave.Id, wave.Version.Value, wave.ConfigurationHash, wave.SelectionHash,
+            MappingSchema.Version, MappingPolicy.Default.Version, new ContentCodePage(1252), SomeFingerprint,
+            SizeBytes: 128, RowCount: 1, MappingValidationAttemptOutcome.Valid, IssueCount: 0, IssuesTruncated: false,
+            "mapping.csv", Guid.NewGuid(), "operator", CorrelationId.New(), Guid.NewGuid(), Clock.UtcNow, []);
+        await MappingValidation().PersistAsync(attempt, CancellationToken.None);
+
+        var snapshot = await ComposeUseCase().ExecuteAsync(ComposeCommand(scope), CancellationToken.None);
+
+        var result = snapshot.ControlResults.Single(r => r.ControlId.Value == "M365.MAPPING_VALIDATOR");
+        Assert.Equal(ReadinessControlStatus.Pass, result.Status);
     }
 
     [Fact]

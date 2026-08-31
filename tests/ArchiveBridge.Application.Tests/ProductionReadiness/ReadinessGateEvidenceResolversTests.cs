@@ -1,11 +1,19 @@
 using ArchiveBridge.Application.ProductionReadiness;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Contracts.Mapping;
+using ArchiveBridge.Contracts.TargetIngestion.Purview.Upload;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.IdentityAndAccess;
+using ArchiveBridge.Domain.Mapping;
 using ArchiveBridge.Domain.ProductionReadiness;
+using ArchiveBridge.Domain.PstProcessing;
 using ArchiveBridge.Domain.Projects;
 using ArchiveBridge.Domain.Recovery;
 using ArchiveBridge.Domain.Security;
+using ArchiveBridge.Domain.TargetIngestion;
+using ArchiveBridge.Domain.TargetIngestion.Purview;
+using ArchiveBridge.Domain.TargetIngestion.Purview.Upload;
+using ArchiveBridge.Domain.Waves;
 using Xunit;
 
 namespace ArchiveBridge.Application.Tests.ProductionReadiness;
@@ -212,5 +220,266 @@ public sealed class ReadinessGateEvidenceResolversTests
         var result = await ReadinessGateEvidenceResolvers.ResolveIncidentResponseAsync(store, scope, Now, CancellationToken.None);
 
         Assert.Equal(ReadinessControlStatus.NotMeasured, result.Status);
+    }
+
+    // ---- AB-I8-002 blocker 1: capability matrix (ARCH.CAPABILITY_MATRIX_CURRENT) ----
+
+    [Fact]
+    public async Task CapabilityMatrixIsNotMeasuredWhenNoEvidenceWasEverRecorded()
+    {
+        var scope = NewScope();
+        var store = new InMemoryCapabilityEvidenceStore();
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveCapabilityMatrixAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.NotMeasured, result.Status);
+    }
+
+    [Fact]
+    public async Task CapabilityMatrixIsBlockedWhenTheCanonicalStatusIsUnknownEvenThoughEvidenceExists()
+    {
+        // CapabilityStatus.Unknown é o default fail-closed do tipo — a evidência EXISTE (não é NoEvidence),
+        // mas o status documentado é Unknown; nunca promovido a Pass por omissão (AB-I8-001 escopo item 6).
+        var scope = NewScope();
+        var store = new InMemoryCapabilityEvidenceStore();
+        var evidence = CapabilityEvidence.Record(
+            CapabilityEvidenceId.New(), scope.Tenant, scope.Project, TargetProvider.Purview, PurviewCapabilityRoutes.PstImport,
+            version: 1, CapabilityStatus.Unknown, sourceReference: null, documentationVersion: null, capabilityVersionLabel: null,
+            Now, Correlation, Now);
+        store.Seed(scope, evidence);
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveCapabilityMatrixAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.Blocked, result.Status);
+        Assert.NotEqual(ReadinessControlStatus.Pass, result.Status);
+    }
+
+    [Fact]
+    public async Task CapabilityMatrixIsBlockedWhenEvidenceIsOlderThanTheFreshnessWindow()
+    {
+        var scope = NewScope();
+        var store = new InMemoryCapabilityEvidenceStore();
+        var recordedLongAgo = Now - CapabilityEvidencePolicy.DefaultMaxAge - TimeSpan.FromDays(1);
+        var evidence = CapabilityEvidence.Record(
+            CapabilityEvidenceId.New(), scope.Tenant, scope.Project, TargetProvider.Purview, PurviewCapabilityRoutes.PstImport,
+            version: 1, CapabilityStatus.GeneralAvailability, "ADR-0006", null, null, recordedLongAgo, Correlation, recordedLongAgo);
+        store.Seed(scope, evidence);
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveCapabilityMatrixAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.NotMeasured, result.Status);
+        Assert.Equal("CAPABILITY_EVIDENCE_STALE", result.ReasonCode);
+    }
+
+    [Fact]
+    public async Task CapabilityMatrixPassesWhenEveryKnownRouteIsGeneralAvailabilityAndFresh()
+    {
+        var scope = NewScope();
+        var store = new InMemoryCapabilityEvidenceStore();
+        var evidence = CapabilityEvidence.Record(
+            CapabilityEvidenceId.New(), scope.Tenant, scope.Project, TargetProvider.Purview, PurviewCapabilityRoutes.PstImport,
+            version: 1, CapabilityStatus.GeneralAvailability, "ADR-0006", null, null, Now, Correlation, Now);
+        store.Seed(scope, evidence);
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveCapabilityMatrixAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.Pass, result.Status);
+    }
+
+    // ---- AB-I8-002 blocker 2: M365.TENANT_PRECHECK ----
+
+    [Fact]
+    public async Task TenantPrecheckIsNotMeasuredWhenNoMailboxWasEverPrechecked()
+    {
+        var scope = NewScope();
+        var store = new InMemoryMailboxPrecheckStore();
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveTenantPrecheckAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.NotMeasured, result.Status);
+    }
+
+    [Fact]
+    public async Task TenantPrecheckIsBlockedWhenTheMostRecentPrecheckIsNotActive()
+    {
+        var scope = NewScope();
+        var store = new InMemoryMailboxPrecheckStore();
+        var snapshot = MailboxPrecheckSnapshot.Observe(
+            PrecheckSnapshotId.New(), scope.Tenant, scope.Project, new ArchiveRef("mailbox-a@tenant.example", TargetArchiveId.FromMailbox("mailbox-a@tenant.example")),
+            version: 1, exchangeGuid: null, archiveGuid: null, MailboxArchiveStatus.Disabled, recipientTypeDetails: null,
+            autoExpandingArchiveEnabled: false, litigationHoldEnabled: false, retentionHoldEnabled: false,
+            archiveItemCount: null, archiveTotalSizeBytes: null, observedAvailableBytes: null, Now, Correlation, Now);
+        store.Seed(scope, snapshot);
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveTenantPrecheckAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.Blocked, result.Status);
+        Assert.NotEqual(ReadinessControlStatus.Pass, result.Status);
+    }
+
+    [Fact]
+    public async Task TenantPrecheckPassesWhenTheMostRecentPrecheckIsActive()
+    {
+        var scope = NewScope();
+        var store = new InMemoryMailboxPrecheckStore();
+        var snapshot = MailboxPrecheckSnapshot.Observe(
+            PrecheckSnapshotId.New(), scope.Tenant, scope.Project, new ArchiveRef("mailbox-a@tenant.example", TargetArchiveId.FromMailbox("mailbox-a@tenant.example")),
+            version: 1, exchangeGuid: Guid.NewGuid(), archiveGuid: Guid.NewGuid(), MailboxArchiveStatus.Active, "UserMailbox",
+            autoExpandingArchiveEnabled: false, litigationHoldEnabled: false, retentionHoldEnabled: false,
+            archiveItemCount: 10, archiveTotalSizeBytes: 4096, observedAvailableBytes: 100_000_000_000, Now, Correlation, Now);
+        store.Seed(scope, snapshot);
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveTenantPrecheckAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.Pass, result.Status);
+    }
+
+    // ---- AB-I8-002 blocker 2: M365.MAPPING_VALIDATOR ----
+
+    [Fact]
+    public async Task MappingValidatorIsNotMeasuredWhenNoAttemptWasEverRecorded()
+    {
+        var scope = NewScope();
+        var store = new InMemoryMappingValidationStore();
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveMappingValidatorAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.NotMeasured, result.Status);
+    }
+
+    [Fact]
+    public async Task MappingValidatorFailsWhenTheMostRecentAttemptIsInvalid()
+    {
+        var scope = NewScope();
+        var store = new InMemoryMappingValidationStore();
+        store.Seed(MappingAttempt(scope, MappingValidationAttemptOutcome.Invalid));
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveMappingValidatorAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.Fail, result.Status);
+        Assert.NotEqual(ReadinessControlStatus.Pass, result.Status);
+    }
+
+    [Fact]
+    public async Task MappingValidatorIsBlockedWhenTheMostRecentAttemptIsRejected()
+    {
+        var scope = NewScope();
+        var store = new InMemoryMappingValidationStore();
+        store.Seed(MappingAttempt(scope, MappingValidationAttemptOutcome.Rejected));
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveMappingValidatorAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.Blocked, result.Status);
+        Assert.NotEqual(ReadinessControlStatus.Pass, result.Status);
+    }
+
+    [Fact]
+    public async Task MappingValidatorPassesWhenTheMostRecentAttemptIsValid()
+    {
+        var scope = NewScope();
+        var store = new InMemoryMappingValidationStore();
+        store.Seed(MappingAttempt(scope, MappingValidationAttemptOutcome.Valid));
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveMappingValidatorAsync(store, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.Pass, result.Status);
+    }
+
+    private static MappingValidationAttempt MappingAttempt(TenantScope scope, MappingValidationAttemptOutcome outcome) =>
+        new(
+            Guid.NewGuid(), scope, WaveId.New(), WaveVersion: 1, SomeFingerprint, SomeFingerprint,
+            MappingSchemaVersion: 1, MappingPolicyVersion: 1, new ContentCodePage(65001), SomeFingerprint, SizeBytes: 128,
+            RowCount: 10, outcome, IssueCount: outcome == MappingValidationAttemptOutcome.Valid ? 0 : 1, IssuesTruncated: false,
+            DisplayFileName: "mapping.csv", UserId: Guid.NewGuid(), RequestedBy: "alice", Correlation, IdempotencyKey: Guid.NewGuid(),
+            Now, Issues: []);
+
+    // ---- AB-I8-002 blocker 2: M365.AZCOPY_VERSION_HOMOLOGATED ----
+
+    private static readonly AzCopyBinaryIdentity HomologatedBinary = new("10.25.0", new Sha256Hash(new string('b', 64)));
+    private static readonly AzCopyHomologationCatalog HomologatedCatalog = new([HomologatedBinary]);
+
+    [Fact]
+    public async Task AzCopyHomologationIsNotMeasuredWhenNoAttemptWasEverUploaded()
+    {
+        var scope = NewScope();
+        var store = new InMemoryPurviewUploadAttemptStore();
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveAzCopyHomologationAsync(
+            store, HomologatedCatalog, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.NotMeasured, result.Status);
+    }
+
+    [Fact]
+    public async Task AzCopyHomologationIsBlockedWhenTheObservedBinaryDoesNotMatchTheCatalog()
+    {
+        var scope = NewScope();
+        var store = new InMemoryPurviewUploadAttemptStore();
+        var driftedBinary = new AzCopyBinaryIdentity("10.25.0", new Sha256Hash(new string('c', 64)));
+        store.Seed(scope, UploadedAttempt(scope, driftedBinary));
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveAzCopyHomologationAsync(
+            store, HomologatedCatalog, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.Blocked, result.Status);
+        Assert.Equal("AZCOPY_BINARY_NOT_HOMOLOGATED", result.ReasonCode);
+    }
+
+    [Fact]
+    public async Task AzCopyHomologationPassesWhenTheObservedBinaryMatchesTheCatalogExactly()
+    {
+        var scope = NewScope();
+        var store = new InMemoryPurviewUploadAttemptStore();
+        store.Seed(scope, UploadedAttempt(scope, HomologatedBinary));
+
+        var result = await ReadinessGateEvidenceResolvers.ResolveAzCopyHomologationAsync(
+            store, HomologatedCatalog, scope, Now, CancellationToken.None);
+
+        Assert.Equal(ReadinessControlStatus.Pass, result.Status);
+    }
+
+    private static PurviewUploadAttemptRecord UploadedAttempt(TenantScope scope, AzCopyBinaryIdentity binary)
+    {
+        var execution = PartitionExecutionId.New();
+        var manifest = new[] { new PurviewUploadFileManifestItem(execution, PurviewRemotePstName.ForPart(ArtifactId.New(), 1), SomeFingerprint, 4096) };
+        var prefix = PurviewRemoteUploadPrefix.ForWave(scope.Tenant, scope.Project, WaveId.New());
+        var evidence = new PurviewUploadEvidence(binary, prefix, manifest);
+        return new PurviewUploadAttemptRecord(
+            PurviewUploadRequestId.New(), PurviewUploadAttemptId.New(), AttemptNumber: 1, SomeFingerprint,
+            PurviewUploadAttemptOutcome.Uploaded, BlockingReason: null, evidence, ProcessExitCode: 0, Now, Now);
+    }
+
+    // ---- AB-I8-002 blocker 1: policy version fingerprint (nunca aceito do caller) ----
+
+    [Fact]
+    public async Task PolicyVersionFingerprintIsDeterministicForTheSameCanonicalEvidence()
+    {
+        var scope = NewScope();
+        var wdacStore = new InMemoryWdacPolicyEvidenceStore();
+        var entry = WdacAllowlistEntry.Create(publisher: null, sha256: SomeFingerprint, pathRule: null);
+        var policy = WdacPolicyEvidence.Record(scope.Tenant, scope.Project, policyVersion: 1, [entry], "svc-hardening", "ServiceAccount", Correlation, Now);
+        wdacStore.Seed(scope, policy);
+        var invariants = ProductionReadinessPolicyInvariants.Evaluate(Now);
+
+        var first = await ReadinessGateEvidenceResolvers.ResolvePolicyVersionFingerprintAsync(wdacStore, scope, invariants, CancellationToken.None);
+        var second = await ReadinessGateEvidenceResolvers.ResolvePolicyVersionFingerprintAsync(wdacStore, scope, invariants, CancellationToken.None);
+
+        Assert.Equal(first, second);
+    }
+
+    [Fact]
+    public async Task PolicyVersionFingerprintChangesWhenTheWdacPolicyChanges()
+    {
+        var scope = NewScope();
+        var wdacStore = new InMemoryWdacPolicyEvidenceStore();
+        var invariants = ProductionReadinessPolicyInvariants.Evaluate(Now);
+        var before = await ReadinessGateEvidenceResolvers.ResolvePolicyVersionFingerprintAsync(wdacStore, scope, invariants, CancellationToken.None);
+
+        var entry = WdacAllowlistEntry.Create(publisher: null, sha256: SomeFingerprint, pathRule: null);
+        var policy = WdacPolicyEvidence.Record(scope.Tenant, scope.Project, policyVersion: 1, [entry], "svc-hardening", "ServiceAccount", Correlation, Now);
+        wdacStore.Seed(scope, policy);
+        var after = await ReadinessGateEvidenceResolvers.ResolvePolicyVersionFingerprintAsync(wdacStore, scope, invariants, CancellationToken.None);
+
+        Assert.NotEqual(before, after);
     }
 }

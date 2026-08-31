@@ -28,4 +28,12 @@ public interface IMappingValidationStore
     /// (<see langword="null"/> se inexistente ou de outro tenant/projeto). Para testes e futuro Portal.
     /// </summary>
     Task<MappingValidationAttempt?> GetAsync(TenantScope scope, Guid validationId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Devolve a tentativa mais recente (por <see cref="MappingValidationAttempt.CreatedAtUtc"/>) já
+    /// persistida neste tenant/projeto — <see langword="null"/> se nenhuma existir. Usado pelo Production
+    /// Readiness Review (AB-I8-002), que é escopado a tenant/projeto, não a uma onda específica; nunca filtra
+    /// por <see cref="MappingValidationAttempt.WaveId"/>.
+    /// </summary>
+    Task<MappingValidationAttempt?> GetLatestAsync(TenantScope scope, CancellationToken cancellationToken);
 }

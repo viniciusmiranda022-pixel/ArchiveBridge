@@ -74,6 +74,15 @@ public sealed class SqlMappingValidationStore(TenantConnectionFactory connection
         WHERE validation_id = @validationId AND project_id = @project;
         """;
 
+    private const string GetLatestValidationIdSql =
+        """
+        SET NOCOUNT ON;
+        SELECT TOP (1) validation_id
+        FROM dbo.mapping_validation_attempts
+        WHERE tenant_id = @tenant AND project_id = @project
+        ORDER BY created_at_utc DESC;
+        """;
+
     private const string GetIssuesSql =
         """
         SET NOCOUNT ON;
@@ -159,6 +168,31 @@ public sealed class SqlMappingValidationStore(TenantConnectionFactory connection
         TenantScope scope, Guid validationId, CancellationToken cancellationToken)
     {
         await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+        return await ReadAttemptAsync(connection.Connection, transaction: null, scope, validationId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<MappingValidationAttempt?> GetLatestAsync(TenantScope scope, CancellationToken cancellationToken)
+    {
+        await using var connection = await _connectionFactory.OpenForTenantAsync(scope, cancellationToken).ConfigureAwait(false);
+
+        Guid? latestId = null;
+        await using (var command = new SqlCommand(GetLatestValidationIdSql, connection.Connection))
+        {
+            command.Parameters.Add(new SqlParameter("@tenant", SqlDbType.UniqueIdentifier) { Value = scope.Tenant.Value });
+            command.Parameters.Add(new SqlParameter("@project", SqlDbType.UniqueIdentifier) { Value = scope.Project.Value });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                latestId = reader.GetGuid(0);
+            }
+        }
+
+        if (latestId is not { } validationId)
+        {
+            return null;
+        }
+
         return await ReadAttemptAsync(connection.Connection, transaction: null, scope, validationId, cancellationToken).ConfigureAwait(false);
     }
 

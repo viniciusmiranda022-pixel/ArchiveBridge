@@ -1,28 +1,33 @@
 using ArchiveBridge.Contracts.Abstractions;
 using ArchiveBridge.Contracts.Jobs;
+using ArchiveBridge.Contracts.Mapping;
 using ArchiveBridge.Contracts.ProductionReadiness;
 using ArchiveBridge.Contracts.Recovery;
 using ArchiveBridge.Contracts.Security;
+using ArchiveBridge.Contracts.TargetIngestion.Purview;
+using ArchiveBridge.Contracts.TargetIngestion.Purview.Upload;
 using ArchiveBridge.Domain.Common;
 using ArchiveBridge.Domain.ProductionReadiness;
+using ArchiveBridge.Domain.TargetIngestion.Purview.Upload;
 
 namespace ArchiveBridge.Application.ProductionReadiness;
 
 /// <summary>
 /// Comando de composição de UM novo Production Readiness Review (AB-I8-001). O caller fornece SOMENTE
-/// identificadores opacos do build/policy/capability sob revisão (item 2, mesmo princípio de
-/// <c>IssueReconciliationCertificateCommand</c>) — toda evidência de controle é sempre resolvida server-side
-/// no <see cref="TenantScope"/> autorizado a partir dos stores canônicos existentes. Nunca carrega
-/// ator/papel: identidade e papéis efetivos são sempre resolvidos server-side pelo use case a partir de
-/// <see cref="IAuthenticatedActorAccessor"/>.
+/// identificadores opacos do build sob revisão (item 2, mesmo princípio de
+/// <c>IssueReconciliationCertificateCommand</c>) — toda evidência de controle, incluindo policy version e
+/// capability matrix, é sempre resolvida server-side no <see cref="TenantScope"/> autorizado a partir dos
+/// stores canônicos existentes (AB-I8-002 blocker 1: nenhum fingerprint arbitrário do caller é aceito como
+/// evidência canônica — por isso este comando NUNCA carrega <c>PolicyVersionFingerprint</c>/
+/// <c>CapabilityMatrixFingerprint</c>; ambos são computados por <see cref="ComposeProductionReadinessReviewUseCase"/>).
+/// Nunca carrega ator/papel: identidade e papéis efetivos são sempre resolvidos server-side pelo use case a
+/// partir de <see cref="IAuthenticatedActorAccessor"/>.
 /// </summary>
 public sealed record ComposeProductionReadinessReviewCommand(
     TenantScope Scope,
     string BuildCommitSha,
     Sha256Hash BuildArtifactDigest,
     string ReviewedArtifactName,
-    Sha256Hash PolicyVersionFingerprint,
-    Sha256Hash CapabilityMatrixFingerprint,
     CorrelationId Correlation);
 
 /// <summary>
@@ -43,6 +48,11 @@ public sealed class ComposeProductionReadinessReviewUseCase(
     IIncidentResponseDrillStore incidentResponseStore,
     IBuildProvenanceStore buildProvenanceStore,
     IRecoveryReadinessStore recoveryReadinessStore,
+    ICapabilityEvidenceStore capabilityEvidenceStore,
+    IMailboxPrecheckStore mailboxPrecheckStore,
+    IMappingValidationStore mappingValidationStore,
+    IPurviewUploadAttemptStore uploadAttemptStore,
+    AzCopyHomologationCatalog homologatedBinaries,
     IReadinessControlAttestationStore attestationStore,
     IProductionReadinessReviewStore reviewStore,
     IClock clock,
@@ -78,12 +88,29 @@ public sealed class ComposeProductionReadinessReviewUseCase(
         Add(await ReadinessGateEvidenceResolvers.ResolveRpoAsync(recoveryReadinessStore, command.Scope, now, cancellationToken).ConfigureAwait(false));
         Add(await ReadinessGateEvidenceResolvers.ResolveBackupRestoreAsync(recoveryReadinessStore, command.Scope, now, cancellationToken).ConfigureAwait(false));
         Add(await ReadinessGateEvidenceResolvers.ResolveHashesManifestsLineageAsync(recoveryReadinessStore, command.Scope, now, cancellationToken).ConfigureAwait(false));
+        Add(await ReadinessGateEvidenceResolvers.ResolveTenantPrecheckAsync(mailboxPrecheckStore, command.Scope, now, cancellationToken).ConfigureAwait(false));
+        Add(await ReadinessGateEvidenceResolvers.ResolveMappingValidatorAsync(mappingValidationStore, command.Scope, now, cancellationToken).ConfigureAwait(false));
+        Add(await ReadinessGateEvidenceResolvers.ResolveAzCopyHomologationAsync(
+            uploadAttemptStore, homologatedBinaries, command.Scope, now, cancellationToken).ConfigureAwait(false));
+
+        var capabilityMatrixResult = await ReadinessGateEvidenceResolvers.ResolveCapabilityMatrixAsync(
+            capabilityEvidenceStore, command.Scope, now, cancellationToken).ConfigureAwait(false);
+        Add(capabilityMatrixResult);
 
         // SystemDerived por auto-checagem pura (sem I/O) — os dois invariantes de policy M365.
-        foreach (var invariantResult in ProductionReadinessPolicyInvariants.Evaluate(now))
+        var policyInvariantResults = ProductionReadinessPolicyInvariants.Evaluate(now);
+        foreach (var invariantResult in policyInvariantResults)
         {
             Add(invariantResult);
         }
+
+        // PolicyVersionFingerprint/CapabilityMatrixFingerprint (AB-I8-002 blocker 1) — NUNCA aceitos do
+        // caller; sempre resolvidos server-side aqui, a partir de evidência canônica JÁ resolvida acima
+        // nesta mesma execução (o fingerprint da capability matrix é o mesmo já computado para o controle
+        // ARCH.CAPABILITY_MATRIX_CURRENT — nunca uma segunda leitura/lógica divergente).
+        var policyVersionFingerprint = await ReadinessGateEvidenceResolvers.ResolvePolicyVersionFingerprintAsync(
+            wdacPolicyStore, command.Scope, policyInvariantResults, cancellationToken).ConfigureAwait(false);
+        var capabilityMatrixFingerprint = capabilityMatrixResult.Evidence.Fingerprint;
 
         // Attested — atestação manual vigente de cada controle já atestado; ausente permanece NotMeasured
         // por default no avaliador (nunca fabricado aqui).
@@ -111,8 +138,8 @@ public sealed class ComposeProductionReadinessReviewUseCase(
             command.Scope,
             command.BuildCommitSha,
             command.BuildArtifactDigest,
-            command.PolicyVersionFingerprint,
-            command.CapabilityMatrixFingerprint,
+            policyVersionFingerprint,
+            capabilityMatrixFingerprint,
             resolved,
             actor,
             role,
