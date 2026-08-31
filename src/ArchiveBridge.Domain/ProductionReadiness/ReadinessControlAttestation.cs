@@ -13,11 +13,13 @@ namespace ArchiveBridge.Domain.ProductionReadiness;
 /// server-side sobre um controle que ainda não possui evidência automatizada (ex.: "ADR aprovado").
 /// <para>
 /// Bloqueio estrutural (AB-I8-001 STOP-THE-LINE): <see cref="Create"/> RECUSA qualquer
-/// <see cref="ReadinessControlId"/> cuja <see cref="ReadinessControlEvidenceSource"/> no catálogo seja
-/// <see cref="ReadinessControlEvidenceSource.SystemDerived"/> — pen-test, RTO/RPO, SBOM/assinaturas,
+/// <see cref="ReadinessControlId"/> cuja <see cref="ReadinessControlEvidenceSource"/> no catálogo NÃO seja
+/// <see cref="ReadinessControlEvidenceSource.Attested"/> — pen-test, RTO/RPO, SBOM/assinaturas,
 /// WDAC/Defender/patching, incident response, hashes/manifests/lineage, backup/restore e as duas
-/// invariantes de policy M365 NUNCA podem ser "aprovados" por alegação humana, mesmo por um ator com o
-/// papel mais privilegiado.
+/// invariantes de policy M365 (<see cref="ReadinessControlEvidenceSource.SystemDerived"/>), assim como
+/// archive/licença/quota (<see cref="ReadinessControlEvidenceSource.EvidenceUnavailable"/>, AB-I8-003
+/// blocker 1) NUNCA podem ser "aprovados" por alegação humana, mesmo por um ator com o papel mais
+/// privilegiado.
 /// </para>
 /// <para>
 /// A persistência é fronteira NÃO CONFIÁVEL: <see cref="Rehydrate"/> recomputa <see cref="RecordHash"/> a
@@ -104,7 +106,7 @@ public sealed record ReadinessControlAttestation
     public Sha256Hash RecordHash { get; }
 
     /// <summary>Cria uma nova atestação.</summary>
-    /// <exception cref="ProductionReadinessAttestationNotAllowedException"><paramref name="controlId"/> é <see cref="ReadinessControlEvidenceSource.SystemDerived"/> no catálogo, ou desconhecido.</exception>
+    /// <exception cref="ProductionReadinessAttestationNotAllowedException"><paramref name="controlId"/> não é <see cref="ReadinessControlEvidenceSource.Attested"/> no catálogo (SystemDerived/EvidenceUnavailable), ou é desconhecido.</exception>
     /// <exception cref="ArgumentException"><paramref name="submittedBy"/>/<paramref name="submittedByRole"/> vazios, ou o texto tem aparência de segredo/PII.</exception>
     public static ReadinessControlAttestation Create(
         TenantId tenant,
@@ -189,8 +191,12 @@ public sealed record ReadinessControlAttestation
             correlation, submittedAtUtc, schemaVersion, persistedContentFingerprint, persistedRecordHash);
     }
 
-    /// <summary>Recusa fail-closed qualquer controle desconhecido ou <see cref="ReadinessControlEvidenceSource.SystemDerived"/> — a ÚNICA barreira que impede atestação manual de sobrescrever evidência automatizada.</summary>
-    /// <exception cref="ProductionReadinessAttestationNotAllowedException"><paramref name="controlId"/> desconhecido ou SystemDerived.</exception>
+    /// <summary>
+    /// Recusa fail-closed qualquer controle desconhecido ou que não seja <see cref="ReadinessControlEvidenceSource.Attested"/>
+    /// (SystemDerived ou EvidenceUnavailable) — a ÚNICA barreira que impede atestação manual de sobrescrever
+    /// evidência automatizada, ou de "aprovar" um controle para o qual nenhuma fonte canônica existe.
+    /// </summary>
+    /// <exception cref="ProductionReadinessAttestationNotAllowedException"><paramref name="controlId"/> desconhecido, SystemDerived ou EvidenceUnavailable.</exception>
     public static void RequireAttestable(ReadinessControlId controlId)
     {
         if (!ReadinessControlCatalog.IsKnown(controlId))
@@ -202,9 +208,12 @@ public sealed record ReadinessControlAttestation
         var definition = ReadinessControlCatalog.Definition(controlId);
         if (definition.EvidenceSource != ReadinessControlEvidenceSource.Attested)
         {
+            var reason = definition.EvidenceSource == ReadinessControlEvidenceSource.EvidenceUnavailable
+                ? "nenhuma fonte canônica capaz de comprová-lo existe hoje neste repositório — a ausência de evidência " +
+                  "nunca vira um checklist documental aprovável por alegação humana (AB-I8-003 blocker 1)"
+                : "é SystemDerived — nunca pode ser aprovado por atestação manual (bloqueio estrutural do work order AB-I8-001)";
             throw new ProductionReadinessAttestationNotAllowedException(
-                $"O controle {controlId.Value} é SystemDerived — nunca pode ser aprovado por atestação manual " +
-                "(bloqueio estrutural do work order AB-I8-001).");
+                $"O controle {controlId.Value} {reason}.");
         }
     }
 

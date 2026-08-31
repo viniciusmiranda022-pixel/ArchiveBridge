@@ -93,6 +93,10 @@ public sealed class ComposeProductionReadinessReviewUseCase(
         Add(await ReadinessGateEvidenceResolvers.ResolveAzCopyHomologationAsync(
             uploadAttemptStore, homologatedBinaries, command.Scope, now, cancellationToken).ConfigureAwait(false));
 
+        // EvidenceUnavailable — sem I/O, nenhuma fonte canônica existe para este controle (AB-I8-003 blocker
+        // 1); resolvido deterministicamente para Blocked, nunca deixado ausente/omitido do dicionário.
+        Add(ReadinessGateEvidenceResolvers.ResolveArchiveLicenseQuota(now));
+
         var capabilityMatrixResult = await ReadinessGateEvidenceResolvers.ResolveCapabilityMatrixAsync(
             capabilityEvidenceStore, command.Scope, now, cancellationToken).ConfigureAwait(false);
         Add(capabilityMatrixResult);

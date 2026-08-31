@@ -81,6 +81,19 @@ public sealed class SubmitReadinessControlAttestationUseCaseTests
     }
 
     [Fact]
+    public async Task EvenAnAdministratorCannotAttestArchiveLicenseQuotaBecauseNoCanonicalSourceExists()
+    {
+        // AB-I8-003 blocker 1: EvidenceUnavailable, não SystemDerived — nenhuma fonte canônica existe hoje,
+        // mas a ausência de evidência ainda assim nunca é "aprovável" por alegação humana.
+        var useCase = BuildUseCase(new FakeAuthenticatedActorAccessor("root-admin", "Administrator"));
+        var command = new SubmitReadinessControlAttestationCommand(
+            NewScope(), new ReadinessControlId("M365.ARCHIVE_LICENSE_QUOTA"), ReadinessControlStatus.Pass,
+            "I am confident this passed", ReasonCode: string.Empty, CorrelationId.New());
+
+        await Assert.ThrowsAsync<ProductionReadinessAttestationNotAllowedException>(() => useCase.ExecuteAsync(command, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task IdenticalAttestationsConvergeToTheSameVersion()
     {
         var store = new InMemoryReadinessControlAttestationStore();

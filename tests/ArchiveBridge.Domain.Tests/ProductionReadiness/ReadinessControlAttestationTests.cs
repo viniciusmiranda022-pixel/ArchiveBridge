@@ -41,6 +41,18 @@ public sealed class ReadinessControlAttestationTests
     }
 
     [Fact]
+    public void CreatingAnAttestationForArchiveLicenseQuotaIsStructurallyRejectedEvenThoughNoCanonicalSourceExists()
+    {
+        // AB-I8-003 blocker 1: diferente dos controles SystemDerived (evidência automatizada JÁ existe),
+        // M365.ARCHIVE_LICENSE_QUOTA não tem NENHUMA fonte canônica hoje — mesmo assim, a ausência de
+        // evidência nunca vira um checklist documental aprovável por atestação humana.
+        Assert.Throws<ProductionReadinessAttestationNotAllowedException>(() =>
+            ReadinessControlAttestation.Create(
+                Tenant, Project, new ReadinessControlId("M365.ARCHIVE_LICENSE_QUOTA"), attestationVersion: 1, ReadinessControlStatus.Pass,
+                SomeEvidence, reasonCode: string.Empty, "human-approver", "Approver", Correlation, Now));
+    }
+
+    [Fact]
     public void CreatingAnAttestationForAnUnknownControlIsRejected()
     {
         Assert.Throws<ProductionReadinessAttestationNotAllowedException>(() =>

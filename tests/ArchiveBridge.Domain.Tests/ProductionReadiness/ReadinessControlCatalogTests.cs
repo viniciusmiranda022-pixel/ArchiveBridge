@@ -3,7 +3,7 @@ using Xunit;
 
 namespace ArchiveBridge.Domain.Tests.ProductionReadiness;
 
-/// <summary>AB-I8-001 — <see cref="ReadinessControlCatalog"/>: identidade estável, cobertura fixa por grupo, e a classificação SystemDerived/Attested.</summary>
+/// <summary>AB-I8-001/AB-I8-003 — <see cref="ReadinessControlCatalog"/>: identidade estável, cobertura fixa por grupo, e a classificação SystemDerived/Attested/EvidenceUnavailable.</summary>
 public sealed class ReadinessControlCatalogTests
 {
     [Fact]
@@ -80,15 +80,21 @@ public sealed class ReadinessControlCatalogTests
     [InlineData("OPS.CAPACITY_FINOPS")]
     [InlineData("OPS.SUPPORT_PACKAGE_AUTOMATION")]
     [InlineData("M365.MINIMUM_ROLES")]
-    [InlineData("M365.ARCHIVE_LICENSE_QUOTA")]
     [InlineData("M365.PORTAL_OPERATOR_TRAINED")]
-    public void TheRemainingEighteenControlsStayAttested(string controlId)
+    public void TheRemainingSeventeenControlsStayAttested(string controlId)
     {
-        // ARCHIVE_LICENSE_QUOTA em particular (AB-I8-002 blocker 2): nenhum store de evidência de
-        // license/quota de archive existe hoje neste repositório — permanece Attested por ausência de fonte
-        // canônica, não por omissão do catálogo.
         var definition = ReadinessControlCatalog.Definition(new ReadinessControlId(controlId));
         Assert.Equal(ReadinessControlEvidenceSource.Attested, definition.EvidenceSource);
+    }
+
+    [Fact]
+    public void ArchiveLicenseQuotaIsClassifiedEvidenceUnavailableRatherThanAttested()
+    {
+        // AB-I8-003 blocker 1: nenhum store de evidência de license/quota de archive existe hoje neste
+        // repositório — a AUSÊNCIA dessa fonte nunca vira um checklist documental "aprovável" por atestação
+        // humana; o controle é bloqueado deterministicamente, não deixado atestável por omissão.
+        var definition = ReadinessControlCatalog.Definition(new ReadinessControlId("M365.ARCHIVE_LICENSE_QUOTA"));
+        Assert.Equal(ReadinessControlEvidenceSource.EvidenceUnavailable, definition.EvidenceSource);
     }
 
     [Fact]
@@ -97,6 +103,14 @@ public sealed class ReadinessControlCatalogTests
         var systemDerivedCount = ReadinessControlCatalog.AllControls.Count(
             definition => definition.EvidenceSource == ReadinessControlEvidenceSource.SystemDerived);
         Assert.Equal(14, systemDerivedCount);
+    }
+
+    [Fact]
+    public void ExactlyOneControlIsEvidenceUnavailable()
+    {
+        var evidenceUnavailableCount = ReadinessControlCatalog.AllControls.Count(
+            definition => definition.EvidenceSource == ReadinessControlEvidenceSource.EvidenceUnavailable);
+        Assert.Equal(1, evidenceUnavailableCount);
     }
 
     [Fact]

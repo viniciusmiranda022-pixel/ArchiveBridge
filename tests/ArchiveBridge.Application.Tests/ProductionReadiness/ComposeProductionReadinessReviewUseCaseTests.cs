@@ -1,3 +1,4 @@
+using System.Globalization;
 using ArchiveBridge.Application.ProductionReadiness;
 using ArchiveBridge.Contracts.Jobs;
 using ArchiveBridge.Domain.Common;
@@ -134,6 +135,88 @@ public sealed class ComposeProductionReadinessReviewUseCaseTests
         Assert.Equal(first.ReviewFingerprint, second.ReviewFingerprint);
         Assert.Equal(2, reviewStore.RecordCallCount);
         Assert.Single(await reviewStore.GetHistoryAsync(scope, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ArchiveLicenseQuotaResolvesToBlockedWithNoAttestationAtAll()
+    {
+        // AB-I8-003 blocker 1: sem nenhuma atestação seedada, o controle nunca "some" do relatório nem fica
+        // NotMeasured por omissão — o resolver o resolve explicitamente para Blocked.
+        var useCase = BuildUseCase(new FakeAuthenticatedActorAccessor("alice", "Approver"));
+
+        var snapshot = await useCase.ExecuteAsync(Command(NewScope()), CancellationToken.None);
+
+        var result = snapshot.ControlResults.Single(r => r.ControlId.Value == "M365.ARCHIVE_LICENSE_QUOTA");
+        Assert.Equal(ReadinessControlStatus.Blocked, result.Status);
+        Assert.Equal("ARCHIVE_LICENSE_QUOTA_EVIDENCE_UNAVAILABLE", result.ReasonCode);
+    }
+
+    [Fact]
+    public async Task AHistoricalManualAttestationForArchiveLicenseQuotaNeverOverridesTheBlockedResult()
+    {
+        // Simula uma atestação PERSISTIDA antes deste incremento reclassificar M365.ARCHIVE_LICENSE_QUOTA
+        // para EvidenceUnavailable — ReadinessControlAttestation.Create() já recusa isto estruturalmente hoje
+        // (AB-I8-003 blocker 1), então usamos Rehydrate (reconstrução de dado já persistido, não uma nova
+        // decisão) para simular exatamente esse dado legado sem enfraquecer a validação de Create().
+        var scope = NewScope();
+        var attestationStore = new InMemoryReadinessControlAttestationStore();
+        var legacyAttestation = BuildLegacyArchiveLicenseQuotaAttestation(scope, Now);
+        attestationStore.SeedBypassingUseCase(scope, legacyAttestation);
+
+        var useCase = BuildUseCase(new FakeAuthenticatedActorAccessor("alice", "Approver"), attestationStore: attestationStore);
+        var snapshot = await useCase.ExecuteAsync(Command(scope), CancellationToken.None);
+
+        var result = snapshot.ControlResults.Single(r => r.ControlId.Value == "M365.ARCHIVE_LICENSE_QUOTA");
+        Assert.Equal(ReadinessControlStatus.Blocked, result.Status);
+        Assert.Equal("ARCHIVE_LICENSE_QUOTA_EVIDENCE_UNAVAILABLE", result.ReasonCode);
+        Assert.NotEqual(ReadinessControlStatus.Pass, result.Status);
+    }
+
+    /// <summary>
+    /// Reconstrói (via <see cref="ReadinessControlAttestation.Rehydrate"/>, nunca <c>Create</c>) uma atestação
+    /// Pass "legada" de M365.ARCHIVE_LICENSE_QUOTA — replica deliberadamente a MESMA fórmula de fingerprint/
+    /// hash de <see cref="ReadinessControlAttestation"/> (ambas usam apenas <c>DeterministicHash.Compute</c>,
+    /// já público) para produzir um registro internamente consistente sem tocar em nenhuma API de produção.
+    /// </summary>
+    private static ReadinessControlAttestation BuildLegacyArchiveLicenseQuotaAttestation(TenantScope scope, DateTimeOffset submittedAtUtc)
+    {
+        var controlId = new ReadinessControlId("M365.ARCHIVE_LICENSE_QUOTA");
+        var evidence = ReadinessEvidenceReference.Attested(SomeFingerprint, "legacy-manual-approval-before-ab-i8-003");
+        const string reasonCode = "";
+        const string submittedBy = "human-approver";
+        const string submittedByRole = "Approver";
+        var correlation = CorrelationId.New();
+        const int attestationVersion = 1;
+        const string schemaVersion = ReadinessControlAttestation.CurrentSchemaVersion;
+
+        var contentFingerprint = DeterministicHash.Compute(
+        [
+            "archivebridge.production-readiness.control-attestation-fingerprint.v1",
+            ((int)ReadinessControlStatus.Pass).ToString(CultureInfo.InvariantCulture),
+            ((int)evidence.Kind).ToString(CultureInfo.InvariantCulture),
+            evidence.Fingerprint.Value,
+            evidence.Locator,
+            reasonCode,
+        ]);
+
+        var recordHash = DeterministicHash.Compute(
+        [
+            nameof(ReadinessControlAttestation),
+            schemaVersion,
+            scope.Tenant.Value.ToString("N"),
+            scope.Project.Value.ToString("N"),
+            controlId.Value,
+            attestationVersion.ToString(CultureInfo.InvariantCulture),
+            contentFingerprint.Value,
+            submittedBy,
+            submittedByRole,
+            correlation.Value.ToString("N"),
+            submittedAtUtc.UtcTicks.ToString(CultureInfo.InvariantCulture),
+        ]);
+
+        return ReadinessControlAttestation.Rehydrate(
+            scope.Tenant, scope.Project, controlId, attestationVersion, ReadinessControlStatus.Pass, evidence, reasonCode,
+            submittedBy, submittedByRole, correlation, submittedAtUtc, schemaVersion, contentFingerprint, recordHash);
     }
 
     [Fact]

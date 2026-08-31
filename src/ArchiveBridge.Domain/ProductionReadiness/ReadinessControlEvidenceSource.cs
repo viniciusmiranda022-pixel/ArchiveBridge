@@ -20,4 +20,16 @@ public enum ReadinessControlEvidenceSource : byte
     /// evidência automatizado para este controle (ex.: ADR aprovado, capacity/FinOps).
     /// </summary>
     Attested = 1,
+
+    /// <summary>
+    /// Resolvido AUTOMATICAMENTE pelo agregador como um bloqueio determinístico, sem I/O — nenhuma fonte
+    /// canônica capaz de comprovar este controle existe hoje neste repositório (nenhum tipo/tabela representa
+    /// o conceito), e a AUSÊNCIA dessa fonte NUNCA vira um checklist documental resolvível por atestação
+    /// manual (AB-I8-003 blocker 1: "se não existir hoje uma fonte canônica capaz de provar determinada
+    /// evidência, ela não pode satisfazer readiness por alegação do caller; o gate deve permanecer
+    /// bloqueado"). Atestação manual NUNCA é aceita para um controle desta classe — mesmo bloqueio estrutural
+    /// de <see cref="SystemDerived"/>, mas por ausência de evidência em vez de evidência automatizada
+    /// existente.
+    /// </summary>
+    EvidenceUnavailable = 2,
 }

@@ -482,4 +482,124 @@ public sealed class ReadinessGateEvidenceResolversTests
 
         Assert.NotEqual(before, after);
     }
+
+    // ---- AB-I8-003 blocker 1: M365.ARCHIVE_LICENSE_QUOTA (nenhuma fonte canônica existe) ----
+
+    [Fact]
+    public void ArchiveLicenseQuotaAlwaysResolvesToBlockedWithNoCanonicalSourceReasonCode()
+    {
+        var result = ReadinessGateEvidenceResolvers.ResolveArchiveLicenseQuota(Now);
+
+        Assert.Equal(ReadinessControlStatus.Blocked, result.Status);
+        Assert.Equal("ARCHIVE_LICENSE_QUOTA_EVIDENCE_UNAVAILABLE", result.ReasonCode);
+        Assert.NotEqual(ReadinessControlStatus.Pass, result.Status);
+    }
+
+    [Fact]
+    public void ArchiveLicenseQuotaIsDeterministicAcrossCalls()
+    {
+        var first = ReadinessGateEvidenceResolvers.ResolveArchiveLicenseQuota(Now);
+        var second = ReadinessGateEvidenceResolvers.ResolveArchiveLicenseQuota(Now + TimeSpan.FromDays(30));
+
+        Assert.Equal(first.Evidence.Fingerprint, second.Evidence.Fingerprint);
+        Assert.Equal(first.Status, second.Status);
+    }
+
+    // ---- AB-I8-003 blocker 2: OPS.RPO_EXERCISED must aggregate BOTH objectives fail-closed ----
+
+    private static ReadinessControlResult RpoObjectiveResult(ReadinessControlStatus status, string locatorSuffix) =>
+        ReadinessControlResult.Create(
+            new ReadinessControlId("OPS.RPO_EXERCISED"), ReadinessGateGroup.Operations, status,
+            status == ReadinessControlStatus.NotMeasured
+                ? ReadinessEvidenceReference.None
+                : ReadinessEvidenceReference.SystemDerived(SomeFingerprint, $"recovery-readiness:{locatorSuffix}"),
+            reasonCode: status == ReadinessControlStatus.Pass ? string.Empty : "RPO_NOT_EXERCISED", Now);
+
+    [Fact]
+    public void RpoAggregationIsNotMeasuredWhenBothObjectivesAreAbsent()
+    {
+        var controlPlane = RpoObjectiveResult(ReadinessControlStatus.NotMeasured, "control-plane");
+        var evidenceLogical = RpoObjectiveResult(ReadinessControlStatus.NotMeasured, "evidence-logical");
+
+        var aggregated = ReadinessGateEvidenceResolvers.AggregateRpoObjectives(controlPlane, evidenceLogical);
+
+        Assert.Equal(ReadinessControlStatus.NotMeasured, aggregated.Status);
+    }
+
+    [Fact]
+    public void RpoAggregationIsBlockedWhenOnlyControlPlaneIsBlockedAndEvidenceLogicalIsAbsent()
+    {
+        var controlPlane = RpoObjectiveResult(ReadinessControlStatus.Blocked, "control-plane");
+        var evidenceLogical = RpoObjectiveResult(ReadinessControlStatus.NotMeasured, "evidence-logical");
+
+        var aggregated = ReadinessGateEvidenceResolvers.AggregateRpoObjectives(controlPlane, evidenceLogical);
+
+        Assert.Equal(ReadinessControlStatus.Blocked, aggregated.Status);
+    }
+
+    [Fact]
+    public void RpoAggregationIsBlockedWhenOnlyEvidenceLogicalIsBlockedAndControlPlaneIsAbsent()
+    {
+        var controlPlane = RpoObjectiveResult(ReadinessControlStatus.NotMeasured, "control-plane");
+        var evidenceLogical = RpoObjectiveResult(ReadinessControlStatus.Blocked, "evidence-logical");
+
+        var aggregated = ReadinessGateEvidenceResolvers.AggregateRpoObjectives(controlPlane, evidenceLogical);
+
+        Assert.Equal(ReadinessControlStatus.Blocked, aggregated.Status);
+    }
+
+    [Fact]
+    public void RpoAggregationStaysNotMeasuredWhenOnePassesAndTheOtherIsNotMeasured()
+    {
+        // Prova a correção do AB-I8-003 blocker 2: um único objetivo Pass NUNCA promove o controle inteiro —
+        // antes desta correção, ResolveRpoAsync retornava o segundo resultado diretamente quando o primeiro
+        // era NotMeasured, o que teria fabricado Pass aqui.
+        var controlPlane = RpoObjectiveResult(ReadinessControlStatus.Pass, "control-plane");
+        var evidenceLogical = RpoObjectiveResult(ReadinessControlStatus.NotMeasured, "evidence-logical");
+
+        var aggregated = ReadinessGateEvidenceResolvers.AggregateRpoObjectives(controlPlane, evidenceLogical);
+
+        Assert.Equal(ReadinessControlStatus.NotMeasured, aggregated.Status);
+        Assert.NotEqual(ReadinessControlStatus.Pass, aggregated.Status);
+    }
+
+    [Fact]
+    public void RpoAggregationIsBlockedWhenOneObjectiveIsBlockedEvenIfTheOtherPassed()
+    {
+        var controlPlane = RpoObjectiveResult(ReadinessControlStatus.Pass, "control-plane");
+        var evidenceLogical = RpoObjectiveResult(ReadinessControlStatus.Blocked, "evidence-logical");
+
+        var aggregated = ReadinessGateEvidenceResolvers.AggregateRpoObjectives(controlPlane, evidenceLogical);
+
+        Assert.Equal(ReadinessControlStatus.Blocked, aggregated.Status);
+        Assert.NotEqual(ReadinessControlStatus.Pass, aggregated.Status);
+    }
+
+    [Fact]
+    public void RpoAggregationPassesOnlyWhenBothObjectivesGenuinelyPass()
+    {
+        // RecoveryReadinessRecord.Pass() estruturalmente nunca produz Pass para ControlPlaneRpo/
+        // EvidenceLogicalRpo nesta baseline (AB-I7-007 item 2) — este teste exercita a AGREGAÇÃO pura com
+        // doubles de domínio, sem enfraquecer aquela restrição de produção (nenhum caminho real do sistema
+        // consegue produzir os dois ReadinessControlResult Pass usados aqui a partir de evidência genuína).
+        var controlPlane = RpoObjectiveResult(ReadinessControlStatus.Pass, "control-plane");
+        var evidenceLogical = RpoObjectiveResult(ReadinessControlStatus.Pass, "evidence-logical");
+
+        var aggregated = ReadinessGateEvidenceResolvers.AggregateRpoObjectives(controlPlane, evidenceLogical);
+
+        Assert.Equal(ReadinessControlStatus.Pass, aggregated.Status);
+    }
+
+    [Fact]
+    public void RpoAggregationFingerprintChangesWhenEitherObjectiveChanges()
+    {
+        var controlPlane = RpoObjectiveResult(ReadinessControlStatus.Blocked, "control-plane");
+        var evidenceLogicalBefore = RpoObjectiveResult(ReadinessControlStatus.NotMeasured, "evidence-logical");
+        var evidenceLogicalAfter = RpoObjectiveResult(ReadinessControlStatus.Blocked, "evidence-logical");
+
+        var before = ReadinessGateEvidenceResolvers.AggregateRpoObjectives(controlPlane, evidenceLogicalBefore);
+        var after = ReadinessGateEvidenceResolvers.AggregateRpoObjectives(controlPlane, evidenceLogicalAfter);
+
+        Assert.NotEqual(before.Evidence.Fingerprint, after.Evidence.Fingerprint);
+    }
 }

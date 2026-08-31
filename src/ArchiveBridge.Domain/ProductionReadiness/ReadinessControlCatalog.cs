@@ -101,17 +101,21 @@ public static class ReadinessControlCatalog
         // revisado) têm fonte canônica real produzida no I5: o snapshot mais recente do tenant/projeto —
         // independentemente de qual mailbox/pedido/onda especificamente o produziu, já que este review não é
         // escopado a uma onda — resolvido via IMailboxPrecheckStore/IPurviewUploadAttemptStore/
-        // IMappingValidationStore. ARCHIVE_LICENSE_QUOTA e MINIMUM_ROLES permanecem Attested: nenhum store de
+        // IMappingValidationStore. MINIMUM_ROLES permanece Attested: roles mínimas do tenant são checklist
+        // operacional sem store dedicado. ARCHIVE_LICENSE_QUOTA (AB-I8-003 blocker 1): nenhum store de
         // evidência de license/quota de archive existe hoje no repositório (nenhum tipo/tabela representa
-        // este conceito), e roles mínimas do tenant são checklist operacional sem store dedicado.
+        // este conceito) — a ausência dessa fonte NUNCA vira um checklist documental "aprovável" por
+        // atestação humana (revisão independente do AB-I8-002 apontou exatamente essa falha); classificado
+        // EvidenceUnavailable, resolvido deterministicamente para Blocked por ReadinessGateEvidenceResolvers.
         Define("M365.MINIMUM_ROLES", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.Attested,
             "Roles mínimas (§47.5)."),
         Define("M365.TENANT_PRECHECK", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.SystemDerived,
             "Tenant precheck (§47.5) — resolvido a partir do precheck de mailbox mais recente já registrado no " +
             "tenant/projeto (IMailboxPrecheckStore, I5); ausente/ArchiveStatus != Active nunca é Pass."),
-        Define("M365.ARCHIVE_LICENSE_QUOTA", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.Attested,
+        Define("M365.ARCHIVE_LICENSE_QUOTA", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.EvidenceUnavailable,
             "Archive/licença/quota (§47.5) — nenhum store de evidência de license/quota de archive existe hoje " +
-            "neste repositório; permanece Attested até um incremento futuro introduzir essa evidência canônica."),
+            "neste repositório; bloqueado deterministicamente (nunca aprovável por atestação) até um incremento " +
+            "futuro introduzir essa evidência canônica."),
         Define("M365.AZCOPY_VERSION_HOMOLOGATED", ReadinessGateGroup.Microsoft365, ReadinessControlEvidenceSource.SystemDerived,
             "AzCopy version homologada (§47.5) — resolvido a partir da tentativa de upload Uploaded mais recente já " +
             "registrada no tenant/projeto (IPurviewUploadAttemptStore, I5), cruzando o binário observado contra o " +

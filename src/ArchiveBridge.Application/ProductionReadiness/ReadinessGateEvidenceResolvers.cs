@@ -217,10 +217,12 @@ internal static class ReadinessGateEvidenceResolvers
 
     /// <summary>
     /// OPS.RPO_EXERCISED — verifica os dois objetivos de RPO (ControlPlaneRpo via RestoreDrill,
-    /// EvidenceLogicalRpo via ArtifactEvidenceRecovery). <see cref="RecoveryReadinessRecord.Pass"/> lança
-    /// para ambos nesta baseline (AB-I7-007 item 2) — este controle é estruturalmente incapaz de ser
-    /// <see cref="ReadinessControlStatus.Pass"/> até um incremento futuro introduzir um drill de
-    /// failure-boundary real.
+    /// EvidenceLogicalRpo via ArtifactEvidenceRecovery) e agrega fail-closed (AB-I8-003 blocker 2): resolve
+    /// AMBOS os objetivos sempre (nunca retorna cedo assim que um deles resolve), para que um futuro
+    /// <see cref="ReadinessControlStatus.Pass"/> em apenas um dos dois lados nunca seja promovido ao controle
+    /// inteiro por si só. <see cref="RecoveryReadinessRecord.Pass"/> lança para ambos nesta baseline
+    /// (AB-I7-007 item 2) — este controle é estruturalmente incapaz de ser <see cref="ReadinessControlStatus.Pass"/>
+    /// até um incremento futuro introduzir um drill de failure-boundary real para os DOIS objetivos.
     /// </summary>
     public static async Task<ReadinessControlResult> ResolveRpoAsync(
         IRecoveryReadinessStore store, TenantScope scope, DateTimeOffset now, CancellationToken cancellationToken)
@@ -230,15 +232,77 @@ internal static class ReadinessGateEvidenceResolvers
             RecoveryExerciseType.RestoreDrill, RecoveryObjective.ControlPlaneRpo, "RPO_NOT_EXERCISED", now, cancellationToken)
             .ConfigureAwait(false);
 
-        if (controlPlaneRpo.Status != ReadinessControlStatus.NotMeasured)
-        {
-            return controlPlaneRpo;
-        }
-
-        return await ResolveRecoveryObjectiveAsync(
+        var evidenceLogicalRpo = await ResolveRecoveryObjectiveAsync(
             store, scope, new ReadinessControlId("OPS.RPO_EXERCISED"), ReadinessGateGroup.Operations,
             RecoveryExerciseType.ArtifactEvidenceRecovery, RecoveryObjective.EvidenceLogicalRpo, "RPO_NOT_EXERCISED", now, cancellationToken)
             .ConfigureAwait(false);
+
+        return AggregateRpoObjectives(controlPlaneRpo, evidenceLogicalRpo);
+    }
+
+    /// <summary>
+    /// Agrega fail-closed os DOIS objetivos já resolvidos de OPS.RPO_EXERCISED (AB-I8-003 blocker 2):
+    /// <see cref="ReadinessControlStatus.Pass"/> exige que <paramref name="controlPlaneRpo"/> E
+    /// <paramref name="evidenceLogicalRpo"/> estejam AMBOS comprovadamente Pass; qualquer
+    /// <see cref="ReadinessControlStatus.Fail"/>/<see cref="ReadinessControlStatus.Blocked"/> em qualquer
+    /// lado bloqueia/falha o controle inteiro; caso contrário (nenhum Fail/Blocked, mas pelo menos um lado
+    /// ainda não-Pass) o controle permanece <see cref="ReadinessControlStatus.NotMeasured"/> — nunca Pass
+    /// "por um objetivo só". O fingerprint agregado cobre deterministicamente os dois lados, para que uma
+    /// mudança real em qualquer um deles dispare supersession do snapshot.
+    /// <para>
+    /// Exposto como membro interno (não apenas privado) para que o teste de agregação possa provar o caso
+    /// "ambos Pass" com doubles de domínio — <see cref="RecoveryReadinessRecord.Pass"/> nunca produz Pass
+    /// para nenhum dos dois objetivos de RPO nesta baseline, então este método é a única forma de exercitar
+    /// essa combinação sem enfraquecer a restrição real de produção.
+    /// </para>
+    /// </summary>
+    internal static ReadinessControlResult AggregateRpoObjectives(ReadinessControlResult controlPlaneRpo, ReadinessControlResult evidenceLogicalRpo)
+    {
+        var controlId = controlPlaneRpo.ControlId;
+        var fingerprint = DeterministicHash.Compute(
+        [
+            "archivebridge.production-readiness.rpo-exercised.v1",
+            controlPlaneRpo.Evidence.Fingerprint.Value,
+            evidenceLogicalRpo.Evidence.Fingerprint.Value,
+        ]);
+        var evidence = ReadinessEvidenceReference.SystemDerived(fingerprint, "recovery-readiness:rpo:control-plane+evidence-logical");
+        var observedAt = controlPlaneRpo.ObservedAtUtc > evidenceLogicalRpo.ObservedAtUtc ? controlPlaneRpo.ObservedAtUtc : evidenceLogicalRpo.ObservedAtUtc;
+
+        if (controlPlaneRpo.Status == ReadinessControlStatus.Fail || evidenceLogicalRpo.Status == ReadinessControlStatus.Fail)
+        {
+            return ReadinessControlResult.Create(controlId, ReadinessGateGroup.Operations, ReadinessControlStatus.Fail, evidence, "RPO_OBJECTIVE_FAILED", observedAt);
+        }
+
+        if (controlPlaneRpo.Status == ReadinessControlStatus.Blocked || evidenceLogicalRpo.Status == ReadinessControlStatus.Blocked)
+        {
+            return ReadinessControlResult.Create(controlId, ReadinessGateGroup.Operations, ReadinessControlStatus.Blocked, evidence, "RPO_OBJECTIVE_BLOCKED", observedAt);
+        }
+
+        if (controlPlaneRpo.Status != ReadinessControlStatus.Pass || evidenceLogicalRpo.Status != ReadinessControlStatus.Pass)
+        {
+            return ReadinessControlResult.Create(controlId, ReadinessGateGroup.Operations, ReadinessControlStatus.NotMeasured, evidence, "RPO_NOT_EXERCISED", observedAt);
+        }
+
+        return ReadinessControlResult.Create(controlId, ReadinessGateGroup.Operations, ReadinessControlStatus.Pass, evidence, reasonCode: string.Empty, observedAt);
+    }
+
+    /// <summary>
+    /// M365.ARCHIVE_LICENSE_QUOTA (AB-I8-003 blocker 1) — nenhuma fonte canônica de license/quota de archive
+    /// existe hoje neste repositório (nenhum tipo/tabela representa esse conceito); em vez de deixar uma
+    /// atestação manual "aprovar" um estado técnico que o sistema não pode provar, este controle é resolvido
+    /// DETERMINISTICAMENTE e SEM I/O para <see cref="ReadinessControlStatus.Blocked"/> — nunca Pass por
+    /// omissão nem por alegação humana (o catálogo classifica este controle como
+    /// <see cref="ReadinessControlEvidenceSource.EvidenceUnavailable"/>, que <see cref="ReadinessControlAttestation.RequireAttestable"/>
+    /// já recusa estruturalmente para qualquer atestação, inclusive uma histórica injetada diretamente na store).
+    /// </summary>
+    public static ReadinessControlResult ResolveArchiveLicenseQuota(DateTimeOffset now)
+    {
+        var controlId = new ReadinessControlId("M365.ARCHIVE_LICENSE_QUOTA");
+        var fingerprint = DeterministicHash.Compute(["archivebridge.production-readiness.archive-license-quota.no-canonical-source.v1"]);
+        var evidence = ReadinessEvidenceReference.SystemDerived(fingerprint, "archive-license-quota:no-canonical-source");
+        return ReadinessControlResult.Create(
+            controlId, ReadinessGateGroup.Microsoft365, ReadinessControlStatus.Blocked, evidence,
+            "ARCHIVE_LICENSE_QUOTA_EVIDENCE_UNAVAILABLE", now);
     }
 
     /// <summary>DATA.BACKUP_RESTORE_TESTED — qualquer restore drill vigente, independentemente do objetivo específico medido.</summary>
