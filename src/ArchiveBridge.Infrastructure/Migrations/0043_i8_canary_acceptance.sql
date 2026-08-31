@@ -97,12 +97,16 @@ CREATE TABLE dbo.canary_scenario_results
         REFERENCES dbo.canary_plans (tenant_id, project_id, plan_version),
     CONSTRAINT CK_canary_scenario_results_status CHECK (status BETWEEN 0 AND 5),
     CONSTRAINT CK_canary_scenario_results_evidence_kind CHECK (evidence_kind BETWEEN 0 AND 3),
-    -- Defesa em profundidade (mesmo padrão de CK_prca_evidence_kind_never_none/0042): um resultado SEMPRE
-    -- carrega evidência real (nunca None=0), mesmo padrão de CanaryScenarioResult.Create.
-    CONSTRAINT CK_canary_scenario_results_evidence_kind_never_none CHECK (evidence_kind <> 0),
-    -- Defesa em profundidade equivalente a CK_prrcr_pass_requires_evidence/0042: Pass (5) exige evidência
-    -- real (evidence_kind <> None/0) — mesmo um INSERT direto/adulterado fora da store nunca conseguiria
-    -- persistir um resultado Pass sem evidência.
+    -- AB-I8-009: esta tabela é o análogo estrutural de dbo.production_readiness_review_control_results/0042
+    -- (resultados RESOLVIDOS de um cenário — Pending/NotPerformed/Blocked/Fail/Pass —, nunca uma tabela de
+    -- atestações puras como dbo.production_readiness_control_attestations/0042). CanaryEvidenceReference.None
+    -- é o valor fail-closed INTENCIONAL para NotPerformed/Blocked quando nenhuma evidência canônica existe
+    -- ainda (CanaryScenarioEvidenceResolvers, CanaryEvidenceReference.None: "default fail-closed quando um
+    -- cenário nunca foi observado") — um CHECK que proibisse evidence_kind=None para qualquer status
+    -- rejeitaria esse resultado legítimo. Por isso, ao contrário de CK_prca_evidence_kind_never_none/0042
+    -- (que se aplica a uma tabela só-de-atestação), aqui — como em CK_prrcr_pass_requires_evidence/0042 —
+    -- só Pass (5) exige evidência real (evidence_kind <> None/0); mesmo um INSERT direto/adulterado fora da
+    -- store nunca conseguiria persistir um resultado Pass sem evidência.
     CONSTRAINT CK_canary_scenario_results_pass_requires_evidence CHECK (status <> 5 OR evidence_kind <> 0),
     CONSTRAINT CK_canary_scenario_results_version CHECK (result_version >= 1)
 );
