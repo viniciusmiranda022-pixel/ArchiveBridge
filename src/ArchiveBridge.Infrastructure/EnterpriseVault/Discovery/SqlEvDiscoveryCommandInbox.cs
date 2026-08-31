@@ -193,6 +193,16 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
     // tentativa inteira numa transação nova é o remédio padrão documentado pelo próprio SQL Server; não
     // fabrica efeito duplicado (mesma chave → mesmo Job, convergência via FindByKeyAsync/backstop) e não
     // mascara nenhuma outra falha (só o número de erro 1205 é retido).
+    //
+    // A MESMA vitimização por deadlock também pode chegar ao cliente sob uma forma diferente: quando o
+    // SQL Server encerra a transação no servidor enquanto o driver ainda processa o resultado assíncrono
+    // pendente de FindByKeyAsync, o SqlException 1205 original não chega a se propagar nessa chamada — o
+    // driver só percebe a transação zumbi no próximo uso explícito dela (o Commit em
+    // EnqueueIdempotentAttemptAsync), que falha com InvalidOperationException("This SqlTransaction has
+    // completed; it is no longer usable.") em vez do erro 1205. É a MESMA condição transiente de
+    // contenção descrita acima, apenas exposta por outro tipo de exceção pelo driver — não uma falha do
+    // invariante de idempotência — e recebe o MESMO remédio: repetir a tentativa inteira numa transação
+    // nova.
     private const int MaxDeadlockAttempts = 5;
 
     /// <inheritdoc />
@@ -220,8 +230,22 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
                 // Vítima de deadlock: a transação já foi encerrada pelo servidor. Nova tentativa, nova
                 // conexão/transação — sem retry de teste, sem enfraquecer nenhum invariante.
             }
+            catch (InvalidOperationException ex) when (attempt < MaxDeadlockAttempts && IsZombieTransactionAfterServerSideAbort(ex))
+            {
+                // Mesma vitimização por deadlock acima, só que percebida pelo driver no Commit em vez do
+                // SELECT original (ver comentário de MaxDeadlockAttempts). Nova tentativa, nova
+                // conexão/transação — sem retry de teste, sem enfraquecer nenhum invariante.
+            }
         }
     }
+
+    // Reconhece especificamente a exceção que o Microsoft.Data.SqlClient lança quando o SqlTransaction já
+    // foi encerrado no servidor (vítima de deadlock) e o driver só detecta isso no próximo uso explícito
+    // do objeto de transação. Não intercepta InvalidOperationException por qualquer outro motivo (ex.:
+    // erro de programação) — só esta condição transiente específica é retentável.
+    private static bool IsZombieTransactionAfterServerSideAbort(InvalidOperationException ex) =>
+        ex.Message.Contains("SqlTransaction", StringComparison.Ordinal)
+        && ex.Message.Contains("completed", StringComparison.Ordinal);
 
     private async Task<EvDiscoveryEnqueueResult> EnqueueIdempotentAttemptAsync(
         EvDiscoveryCommand command, Guid idempotencyKey, CancellationToken cancellationToken)
