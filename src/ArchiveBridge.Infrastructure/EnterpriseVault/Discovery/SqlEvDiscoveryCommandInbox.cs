@@ -185,6 +185,16 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
         }
     }
 
+    // Sob concorrência real (N requisições simultâneas com a MESMA chave), o SELECT com UPDLOCK+HOLDLOCK
+    // de FindByKeyAsync serializa as transações — mas o SQL Server pode escolher uma delas como vítima de
+    // deadlock (erro 1205) e, nesse caso, reverte a transação inteira NO SERVIDOR antes mesmo de o cliente
+    // ver o erro. Isso é uma condição TRANSIENTE normal em qualquer RDBMS sob contenção (não uma falha do
+    // invariante de idempotência: o backstop de índice único permanece a garantia de unicidade). Repetir a
+    // tentativa inteira numa transação nova é o remédio padrão documentado pelo próprio SQL Server; não
+    // fabrica efeito duplicado (mesma chave → mesmo Job, convergência via FindByKeyAsync/backstop) e não
+    // mascara nenhuma outra falha (só o número de erro 1205 é retido).
+    private const int MaxDeadlockAttempts = 5;
+
     /// <inheritdoc />
     public async Task<EvDiscoveryEnqueueResult> EnqueueIdempotentAsync(
         EvDiscoveryCommand command, Guid idempotencyKey, CancellationToken cancellationToken)
@@ -198,6 +208,24 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
         }
 
         EvDiscoveryCommandValidation.EnsureValid(command);
+
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await EnqueueIdempotentAttemptAsync(command, idempotencyKey, cancellationToken).ConfigureAwait(false);
+            }
+            catch (SqlException sql) when (sql.Number == 1205 && attempt < MaxDeadlockAttempts)
+            {
+                // Vítima de deadlock: a transação já foi encerrada pelo servidor. Nova tentativa, nova
+                // conexão/transação — sem retry de teste, sem enfraquecer nenhum invariante.
+            }
+        }
+    }
+
+    private async Task<EvDiscoveryEnqueueResult> EnqueueIdempotentAttemptAsync(
+        EvDiscoveryCommand command, Guid idempotencyKey, CancellationToken cancellationToken)
+    {
         var now = SqlJobMapping.ToDbUtc(_clock.UtcNow);
         var scope = command.Scope;
 
@@ -240,7 +268,16 @@ public sealed class SqlEvDiscoveryCommandInbox(TenantConnectionFactory connectio
         }
         catch
         {
-            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException)
+            {
+                // O SQL Server já encerrou a transação no servidor (ex.: vítima de deadlock) antes do
+                // rollback explícito — nada a reverter. Nunca mascare a exceção original com esta.
+            }
+
             throw;
         }
     }
